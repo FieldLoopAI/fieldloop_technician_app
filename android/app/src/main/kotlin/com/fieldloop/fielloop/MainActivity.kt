@@ -1,0 +1,5 @@
+package com.fieldloop.fielloop
+
+import io.flutter.embedding.android.FlutterActivity
+
+class MainActivity : FlutterActivity()
