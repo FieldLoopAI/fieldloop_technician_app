@@ -5,20 +5,30 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/job_photo.dart';
+import '../providers/global_voice_service_provider.dart';
 import '../providers/job_photos_provider.dart';
+import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
 import '../providers/permission_providers.dart';
+import '../providers/safe_ref_disposal.dart';
+import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
 import '../widgets/error_banner.dart';
 import '../widgets/permission_card.dart';
 import '../widgets/tap_scale.dart';
+import '../widgets/voice_listening_indicator.dart';
+import 'estimate_screen.dart';
 import 'photo_preview_screen.dart';
+import 'voice_command_registrar_mixin.dart';
 
-/// Real camera capture flow. Voice would normally drive "Photos" / "Next
-/// Picture" / "No More Photos" during a capture session — the capture
-/// button and "No More Photos" button here are the tap-equivalent
-/// failsafe for that.
+/// Real camera capture flow. Voice drives "Capture"/"Take Photo"/"Next
+/// Picture"/"No More Photos" during a capture session — the capture button
+/// and "No More Photos" button here are the tap-equivalent failsafe for
+/// that, calling the exact same [_capture] / [_finishCapturing] functions
+/// the registered voice commands call (see [buildVoiceCommands]). This
+/// screen never touches the recognizer itself — only the shared command
+/// registry, via `VoiceCommandRegistrarMixin`.
 class PhotoCaptureScreen extends ConsumerStatefulWidget {
   const PhotoCaptureScreen({super.key, required this.jobId});
 
@@ -28,7 +38,11 @@ class PhotoCaptureScreen extends ConsumerStatefulWidget {
   ConsumerState<PhotoCaptureScreen> createState() => _PhotoCaptureScreenState();
 }
 
-class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen> with WidgetsBindingObserver {
+class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
+    with
+        WidgetsBindingObserver,
+        SafeRefDisposal<PhotoCaptureScreen>,
+        VoiceCommandRegistrarMixin<PhotoCaptureScreen> {
   bool _flash = false;
   bool _capturing = false;
   String? _error;
@@ -47,6 +61,48 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen> with Wi
     WidgetsBinding.instance.removeObserver(this);
     _cameraController?.dispose();
     super.dispose();
+  }
+
+  @override
+  List<VoiceCommand> buildVoiceCommands() {
+    return [
+      VoiceCommand(
+        id: 'next_picture',
+        matches: (t) => t.contains('next picture') || t.contains('next photo'),
+        handler: (_) => _capture(),
+      ),
+      VoiceCommand(
+        id: 'capture_photo',
+        matches: (t) => t.contains('capture') || t.contains('take photo'),
+        handler: (_) async {
+          await _capture();
+          await ref
+              .read(globalVoiceServiceProvider.notifier)
+              .speak('Photo captured, say confirm or retake');
+        },
+      ),
+      VoiceCommand(
+        id: 'no_more_photos',
+        matches: (t) => t.contains('no more photo'),
+        handler: (_) async {
+          _finishCapturing();
+          await ref.read(globalVoiceServiceProvider.notifier).speak('Finishing photos');
+        },
+      ),
+      prepareEstimateVoiceCommand(
+        ref: ref,
+        jobId: widget.jobId,
+        navigate: () => Navigator.of(
+          context,
+        ).push(FadeSlidePageRoute(builder: (_) => EstimateScreen(jobId: widget.jobId))),
+      ),
+      ...jobLifecycleVoiceCommands(ref, widget.jobId),
+    ];
+  }
+
+  void _finishCapturing() {
+    if (!mounted) return;
+    Navigator.of(context).pop();
   }
 
   @override
@@ -112,7 +168,10 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen> with Wi
       final rawFile = await controller.takePicture();
       if (mounted) {
         await Future.delayed(const Duration(milliseconds: 100));
-        setState(() => _flash = false);
+        // Re-check: the 100ms delay above is itself an async gap, and the
+        // `mounted` check that gated entry into this block is now stale —
+        // `setState` after real disposal throws.
+        if (mounted) setState(() => _flash = false);
       }
 
       if (!mounted) return;
@@ -134,7 +193,7 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen> with Wi
     }
   }
 
-  Widget _buildPreviewArea(CameraMicState cameraMic, bool askShown) {
+  Widget _buildPreviewArea(CameraMicState cameraMic, bool askShown, double maxPreviewHeight) {
     final showCombinedAsk = cameraMic.checked && !cameraMic.allGranted && !askShown;
     if (showCombinedAsk) {
       final copy = cameraMicAskCopy(cameraMic);
@@ -146,6 +205,9 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen> with Wi
         actionIcon: Icons.arrow_forward_rounded,
         onAction: () async {
           await ref.read(cameraMicProvider.notifier).request();
+          // The permission request is async — this widget (and its `ref`)
+          // can be gone by the time it resolves.
+          if (!mounted) return;
           ref.read(cameraMicAskShownProvider.notifier).state = true;
         },
       );
@@ -176,6 +238,7 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen> with Wi
       flash: _flash,
       busy: _capturing,
       onCapture: _capture,
+      maxHeight: maxPreviewHeight,
     );
   }
 
@@ -187,6 +250,12 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen> with Wi
     final cameraMic = ref.watch(cameraMicProvider);
     final askShown = ref.watch(cameraMicAskShownProvider);
 
+    // The recognizer itself is a single global service, started once at
+    // RootShell (see GlobalVoiceService) — this screen only watches its
+    // state for the indicator and offers its own commands while active
+    // (see buildVoiceCommands).
+    final voiceSession = ref.watch(globalVoiceServiceProvider);
+
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
@@ -194,18 +263,37 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen> with Wi
         backgroundColor: AppColors.surface,
         foregroundColor: AppColors.textDark,
         elevation: 0,
+        actions: [
+          if (cameraMic.micGranted)
+            Padding(
+              padding: const EdgeInsets.only(right: 14),
+              child: Center(
+                child: VoiceListeningIndicator(
+                  phase: voiceSession.phase,
+                  showRings: false,
+                  coreSize: 34,
+                  iconSize: 16,
+                ),
+              ),
+            ),
+        ],
       ),
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
             final isTablet = constraints.maxWidth > 600;
             final horizontalPadding = isTablet ? constraints.maxWidth * 0.12 : 16.0;
+            // Bounds the preview by available height as well as width so a
+            // wide/short viewport (tablets especially — a 4:3 preview at
+            // full tablet width can be taller than the whole screen) can
+            // never push the rest of the column into overflow.
+            final maxPreviewHeight = (constraints.maxHeight * 0.42).clamp(180.0, 520.0).toDouble();
 
             return Column(
               children: [
                 Padding(
                   padding: EdgeInsets.fromLTRB(horizontalPadding, 16, horizontalPadding, 0),
-                  child: _buildPreviewArea(cameraMic, askShown),
+                  child: _buildPreviewArea(cameraMic, askShown, maxPreviewHeight),
                 ),
                 if (_error != null)
                   Padding(
@@ -240,7 +328,7 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen> with Wi
                   child: SizedBox(
                     width: double.infinity,
                     child: OutlinedButton.icon(
-                      onPressed: () => Navigator.of(context).pop(),
+                      onPressed: _finishCapturing,
                       icon: const Icon(Icons.check_rounded),
                       label: const Text('No More Photos'),
                       style: OutlinedButton.styleFrom(
@@ -268,12 +356,19 @@ class _CameraPreview extends StatelessWidget {
     required this.flash,
     required this.busy,
     required this.onCapture,
+    required this.maxHeight,
   });
 
   final CameraController? controller;
   final bool flash;
   final bool busy;
   final VoidCallback onCapture;
+
+  /// Height budget handed down from the screen's own [LayoutBuilder] — the
+  /// preview must never grow taller than this, even on a wide tablet where
+  /// a 4:3 preview at full available width would otherwise be taller than
+  /// the screen itself.
+  final double maxHeight;
 
   @override
   Widget build(BuildContext context) {
@@ -291,13 +386,22 @@ class _CameraPreview extends StatelessWidget {
       }
     }
 
-    return SizedBox(
-      width: double.infinity,
-      child: AspectRatio(
-        aspectRatio: previewRatio,
-        child: Stack(
-          alignment: Alignment.bottomCenter,
-          children: [
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // Size from the available width first, then clamp to the height
+        // budget — whichever is tighter wins, and the other dimension is
+        // derived from it so the aspect ratio is always preserved.
+        final heightFromWidth = constraints.maxWidth * previewRatio;
+        final previewHeight = heightFromWidth > maxHeight ? maxHeight : heightFromWidth;
+        final previewWidth = previewHeight / previewRatio;
+
+        return Center(
+          child: SizedBox(
+            width: previewWidth,
+            height: previewHeight,
+            child: Stack(
+              alignment: Alignment.bottomCenter,
+              children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(20),
               child: Container(
@@ -360,9 +464,11 @@ class _CameraPreview extends StatelessWidget {
                 ),
               ),
             ),
-          ],
-        ),
-      ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }

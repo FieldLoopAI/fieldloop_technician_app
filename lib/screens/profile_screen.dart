@@ -3,6 +3,7 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../providers/auth_provider.dart';
+import '../providers/global_voice_service_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
 import '../widgets/tap_scale.dart';
@@ -38,6 +39,7 @@ class ProfileScreen extends ConsumerWidget {
     if (!context.mounted) return;
 
     ref.read(authControllerProvider.notifier).logout();
+    ref.read(globalVoiceServiceProvider.notifier).stopForLogout();
 
     Navigator.of(
       context,

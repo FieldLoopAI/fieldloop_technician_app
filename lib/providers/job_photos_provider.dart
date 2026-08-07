@@ -26,7 +26,9 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
   final String jobId;
 
   Future<void> _loadUploaded() async {
-    state = await AsyncValue.guard(_fetchUploaded);
+    final result = await AsyncValue.guard(_fetchUploaded);
+    if (!mounted) return;
+    state = result;
   }
 
   Future<List<JobPhoto>> _fetchUploaded() async {
@@ -62,13 +64,22 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
   /// or never made it, and shouldn't be dropped from the grid on refresh.
   Future<void> refresh() async {
     final inFlight = state.valueOrNull?.where((p) => p.status != JobPhotoStatus.uploaded).toList() ?? const [];
-    state = await AsyncValue.guard(() async {
+    final result = await AsyncValue.guard(() async {
       final uploaded = await _fetchUploaded();
       return [...uploaded, ...inFlight];
     });
+    if (!mounted) return;
+    state = result;
   }
 
+  /// Single choke point for every `state = AsyncData(...)` write — several
+  /// of [uploadPhoto]'s steps call this after an `await` (the upload-url
+  /// request, the S3 PUT, the `field_events` status update), and the
+  /// screen watching this provider can be gone by the time any of them
+  /// resolve, so every write funnels through this one guard rather than
+  /// repeating it at each call site.
   void _upsert(JobPhoto photo) {
+    if (!mounted) return;
     final current = state.valueOrNull ?? const [];
     final idx = current.indexWhere((p) => p.id == photo.id);
     final next = [...current];

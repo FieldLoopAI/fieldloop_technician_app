@@ -7,10 +7,15 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../providers/global_voice_service_provider.dart';
 import '../providers/job_photos_provider.dart';
+import '../providers/job_voice_commands.dart';
+import '../providers/safe_ref_disposal.dart';
+import '../providers/voice_command_registry_provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/error_banner.dart';
 import '../widgets/primary_button.dart';
+import 'voice_command_registrar_mixin.dart';
 
 const int _maxPhotoBytes = 300 * 1024;
 
@@ -19,6 +24,11 @@ const int _maxPhotoBytes = 300 * 1024;
 /// camera with no upload or `field_events` write having happened; "Confirm"
 /// runs compression (under [_maxPhotoBytes], EXIF-corrected) then the
 /// existing upload flow, and only then pops back to the capture screen.
+///
+/// Voice "confirm"/"retake" while this screen is showing call the exact
+/// same [_confirm]/[_retake] the buttons do — registered via
+/// `VoiceCommandRegistrarMixin` exactly while this screen is the active
+/// one, same as every other job-scoped screen.
 class PhotoPreviewScreen extends ConsumerStatefulWidget {
   const PhotoPreviewScreen({super.key, required this.jobId, required this.imagePath});
 
@@ -29,9 +39,39 @@ class PhotoPreviewScreen extends ConsumerStatefulWidget {
   ConsumerState<PhotoPreviewScreen> createState() => _PhotoPreviewScreenState();
 }
 
-class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen> {
+class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
+    with SafeRefDisposal<PhotoPreviewScreen>, VoiceCommandRegistrarMixin<PhotoPreviewScreen> {
   bool _uploading = false;
   String? _error;
+
+  @override
+  List<VoiceCommand> buildVoiceCommands() {
+    return [
+      VoiceCommand(
+        id: 'confirm_photo',
+        matches: (t) => t.contains('confirm'),
+        handler: (_) async {
+          final service = ref.read(globalVoiceServiceProvider.notifier);
+          await service.speak('Uploading photo');
+          final success = await _confirm();
+          if (success) {
+            await service.speak('Photo saved');
+          } else {
+            await service.speak("Sorry, the photo couldn't be saved");
+          }
+        },
+      ),
+      VoiceCommand(
+        id: 'retake_photo',
+        matches: (t) => t.contains('retake'),
+        handler: (_) async {
+          await _retake();
+          await ref.read(globalVoiceServiceProvider.notifier).speak('Retaking photo');
+        },
+      ),
+      ...jobLifecycleVoiceCommands(ref, widget.jobId),
+    ];
+  }
 
   Future<Uint8List> _compressImage(String path) async {
     var quality = 85;
@@ -57,8 +97,8 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen> {
     return result;
   }
 
-  Future<void> _confirm() async {
-    if (_uploading) return;
+  Future<bool> _confirm() async {
+    if (_uploading) return false;
     setState(() {
       _uploading = true;
       _error = null;
@@ -78,9 +118,11 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen> {
       unawaited(File(widget.imagePath).delete().catchError((_) => File(widget.imagePath)));
 
       if (mounted) Navigator.of(context).pop(true);
+      return true;
     } catch (e, stackTrace) {
       debugPrint('PHOTO CONFIRM ERROR: $e\n$stackTrace');
       if (mounted) setState(() => _error = e.toString());
+      return false;
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
@@ -110,10 +152,18 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen> {
           automaticallyImplyLeading: false,
         ),
         body: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              children: [
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              // Same tablet-aware treatment as the capture screen — on a
+              // wide viewport, full-bleed padding stretches the image and
+              // buttons uncomfortably wide.
+              final isTablet = constraints.maxWidth > 600;
+              final horizontalPadding = isTablet ? constraints.maxWidth * 0.12 : 16.0;
+
+              return Padding(
+                padding: EdgeInsets.fromLTRB(horizontalPadding, 16, horizontalPadding, 16),
+                child: Column(
+                  children: [
                 Expanded(
                   child:
                       ClipRRect(
@@ -167,8 +217,10 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen> {
                     ),
                   ],
                 ),
-              ],
-            ),
+                  ],
+                ),
+              );
+            },
           ),
         ),
       ),

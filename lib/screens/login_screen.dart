@@ -8,6 +8,7 @@ import '../providers/permission_providers.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
 import '../widgets/primary_button.dart';
+import 'complete_setup_screen.dart';
 import 'permissions_setup_screen.dart';
 import 'root_shell.dart';
 
@@ -20,7 +21,7 @@ class LoginScreen extends ConsumerStatefulWidget {
 
 class _LoginScreenState extends ConsumerState<LoginScreen> with SingleTickerProviderStateMixin {
   final _formKey = GlobalKey<FormState>();
-  final _emailController = TextEditingController();
+  final _identifierController = TextEditingController();
   final _passwordController = TextEditingController();
   final _passwordFocusNode = FocusNode();
 
@@ -41,7 +42,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> with SingleTickerProv
 
   @override
   void dispose() {
-    _emailController.dispose();
+    _identifierController.dispose();
     _passwordController.dispose();
     _passwordFocusNode.dispose();
     _shakeController.dispose();
@@ -54,7 +55,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> with SingleTickerProv
     try {
       await ref
           .read(authControllerProvider.notifier)
-          .login(email: _emailController.text.trim(), password: _passwordController.text);
+          .login(identifier: _identifierController.text.trim(), password: _passwordController.text);
     } catch (e, stackTrace) {
       debugPrint('LOGIN ERROR: $e\n$stackTrace');
     }
@@ -218,21 +219,20 @@ class _LoginScreenState extends ConsumerState<LoginScreen> with SingleTickerProv
                   ),
                   const SizedBox(height: 24),
                   TextFormField(
-                    controller: _emailController,
+                    controller: _identifierController,
                     keyboardType: TextInputType.emailAddress,
                     textInputAction: TextInputAction.next,
                     autocorrect: false,
                     enabled: !isLoading,
                     onFieldSubmitted: (_) => _passwordFocusNode.requestFocus(),
                     decoration: const InputDecoration(
-                      labelText: 'Email',
-                      prefixIcon: Icon(Icons.mail_outline_rounded),
+                      labelText: 'Phone or Email',
+                      prefixIcon: Icon(Icons.person_outline_rounded),
                     ),
                     validator: (value) {
                       if (value == null || value.trim().isEmpty) {
-                        return 'Enter your email';
+                        return 'Enter your phone or email';
                       }
-                      if (!value.contains('@')) return 'Enter a valid email';
                       return null;
                     },
                   ),
@@ -306,6 +306,17 @@ class _LoginScreenState extends ConsumerState<LoginScreen> with SingleTickerProv
           end: 0,
           duration: 400.ms,
           curve: Curves.easeOut,
+        ),
+        const SizedBox(height: 16),
+        Center(
+          child: TextButton(
+            onPressed: isLoading
+                ? null
+                : () => Navigator.of(
+                    context,
+                  ).push(FadeSlidePageRoute(builder: (_) => const CompleteSetupScreen())),
+            child: const Text('Have a setup code?'),
+          ),
         ),
       ],
     );

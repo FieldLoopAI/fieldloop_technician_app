@@ -52,6 +52,8 @@ dependencies:
   http: ^1.6.0
   # Local flag storage (e.g. "already shown the first-login permissions setup").
   shared_preferences: ^2.5.5
+  speech_to_text: ^7.4.0
+  flutter_tts: ^4.2.5
 
 dev_dependencies:
   flutter_test:

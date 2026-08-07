@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'providers/permission_providers.dart';
+import 'routing/voice_route_observer.dart';
 import 'screens/login_screen.dart';
 import 'theme/app_theme.dart';
 
@@ -43,6 +44,7 @@ class _FieldLoopAppState extends ConsumerState<FieldLoopApp> with WidgetsBinding
       title: 'FieldLoop AI',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light,
+      navigatorObservers: [voiceRouteObserver],
       home: const LoginScreen(),
     );
   }

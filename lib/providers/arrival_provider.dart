@@ -49,7 +49,7 @@ class ArrivalActionController extends StateNotifier<AsyncValue<void>> {
   /// told apart later.
   Future<void> markArrived({required String technicianId, String source = 'manual'}) async {
     state = const AsyncLoading();
-    state = await AsyncValue.guard(() async {
+    final result = await AsyncValue.guard(() async {
       final supabase = Supabase.instance.client;
       final now = DateTime.now();
 
@@ -75,5 +75,7 @@ class ArrivalActionController extends StateNotifier<AsyncValue<void>> {
       _ref.read(jobRuntimeProvider(jobId).notifier).setArrived(now);
       _ref.invalidate(arrivalEventProvider(jobId));
     });
+    if (!mounted) return;
+    state = result;
   }
 }

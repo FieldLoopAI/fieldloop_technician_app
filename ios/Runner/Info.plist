@@ -30,6 +30,8 @@
 	<string>FieldLoop uses your camera to photograph job site conditions and completed work, so technicians and customers have an accurate record for estimates, invoices, and job history.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>FieldLoop uses your microphone so you can control the app hands-free with voice commands (like starting an estimate or logging a note) while your hands are busy on the job.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>FieldLoop converts your spoken commands to text on-device so you can control the app hands-free, like saying "FieldLoop, take a photo" while your hands are busy on the job.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>FieldLoop uses your location while you're on a job to automatically detect your arrival and departure at the job site, so labor time is tracked accurately without manual clock-ins.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>

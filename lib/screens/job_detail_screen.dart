@@ -14,10 +14,14 @@ import '../models/mock_line_item.dart';
 import '../providers/arrival_provider.dart';
 import '../providers/auth_provider.dart';
 import '../providers/estimate_invoice_providers.dart';
+import '../providers/global_voice_service_provider.dart';
 import '../providers/job_photos_provider.dart';
 import '../providers/job_runtime_provider.dart';
+import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
 import '../providers/permission_providers.dart';
+import '../providers/safe_ref_disposal.dart';
+import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
 import '../widgets/job_history_timeline.dart';
@@ -25,11 +29,13 @@ import '../widgets/permission_card.dart';
 import '../widgets/primary_button.dart';
 import '../widgets/status_pill.dart';
 import '../widgets/tap_scale.dart';
+import '../widgets/voice_listening_indicator.dart';
 import 'estimate_screen.dart';
 import 'invoice_screen.dart';
 import 'job_history_screen.dart';
 import 'photo_capture_screen.dart';
 import 'voice_assistant_screen.dart';
+import 'voice_command_registrar_mixin.dart';
 
 enum _DetailTab { estimate, changeOrders, invoice, history }
 
@@ -63,10 +69,22 @@ class JobDetailScreen extends ConsumerStatefulWidget {
 /// Geofence radius for automatic arrival detection: 150 feet, in meters.
 const double _geofenceRadiusMeters = 45.0;
 
-class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
+class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
+    with SafeRefDisposal<JobDetailScreen>, VoiceCommandRegistrarMixin<JobDetailScreen> {
   _DetailTab _tab = _DetailTab.estimate;
   Timer? _ticker;
   StreamSubscription<Position>? _positionSub;
+
+  // Belt-and-suspenders alongside `mounted`: set synchronously as the very
+  // first thing dispose() does, so every guard below reads it consistently
+  // even if something re-enters mid-teardown. `mounted` alone is the same
+  // check Flutter itself uses for "has dispose() run", but the geofencing
+  // chain below crosses several real async gaps (network calls, a geolocator
+  // permission check, a native position-stream callback that can fire after
+  // cancellation was requested but before it's taken effect) — cheap enough
+  // to double up the check at each one rather than trust a single check
+  // taken several lines/awaits earlier.
+  bool _disposed = false;
 
   @override
   void initState() {
@@ -75,27 +93,58 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
     });
-    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeStartGeofencing());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _disposed) return;
+      _maybeStartGeofencing();
+    });
   }
 
   @override
   void dispose() {
+    _disposed = true;
     _ticker?.cancel();
     _positionSub?.cancel();
     super.dispose();
+  }
+
+  /// This screen never starts/stops the recognizer (see `RootShell` /
+  /// `GlobalVoiceService`) — it only offers these commands while it's the
+  /// active/visible screen (handled by `VoiceCommandRegistrarMixin`).
+  @override
+  List<VoiceCommand> buildVoiceCommands() {
+    return [
+      openCameraVoiceCommand(
+        ref: ref,
+        jobId: widget.jobId,
+        navigate: () => Navigator.of(
+          context,
+        ).push(FadeSlidePageRoute(builder: (_) => PhotoCaptureScreen(jobId: widget.jobId))),
+      ),
+      prepareEstimateVoiceCommand(
+        ref: ref,
+        jobId: widget.jobId,
+        navigate: () => Navigator.of(
+          context,
+        ).push(FadeSlidePageRoute(builder: (_) => EstimateScreen(jobId: widget.jobId))),
+      ),
+      ...jobLifecycleVoiceCommands(ref, widget.jobId),
+    ];
   }
 
   /// Kicks off automatic GPS arrival detection for this job, unless it's
   /// already been arrived at (manually or automatically) — checked against
   /// `field_events`, the same source of truth the "not arrived" card uses.
   Future<void> _maybeStartGeofencing() async {
-    if (!mounted) return;
+    if (!mounted || _disposed) return;
     final job = ref.read(jobByIdProvider(widget.jobId));
     if (job == null) return;
 
     debugPrint('GEOFENCE: checking for an existing gps_arrive event for job ${job.id}...');
     final alreadyArrivedAt = await ref.read(arrivalEventProvider(job.id).future);
-    if (!mounted) return;
+    // Real async gap above (a Supabase query) — re-check immediately before
+    // the next thing that touches `ref`/this screen's state, not just at
+    // the top of this method.
+    if (!mounted || _disposed) return;
     if (alreadyArrivedAt != null) {
       debugPrint('GEOFENCE: job ${job.id} already arrived, skipping automatic detection');
       return;
@@ -105,10 +154,14 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
   }
 
   Future<void> _startGeofencing(MockJob job) async {
-    if (!mounted || _positionSub != null) return;
+    if (!mounted || _disposed || _positionSub != null) return;
 
     debugPrint('GEOFENCE: checking location permission for job ${job.id}...');
     final permission = await Geolocator.checkPermission();
+    // Real async gap above (a platform channel round-trip) — re-check
+    // before anything further, even though nothing between here and the
+    // listen() call below touches `ref` directly.
+    if (!mounted || _disposed) return;
     debugPrint('GEOFENCE: permission status is $permission for job ${job.id}');
 
     if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
@@ -128,7 +181,6 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
       return;
     }
 
-    if (!mounted) return;
     debugPrint('GEOFENCE: starting position stream for job ${job.id} (accuracy=high, distanceFilter=10m)...');
     _positionSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 10),
@@ -146,46 +198,63 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
     await sub.cancel();
   }
 
+  /// Called from the position stream's own callback — a native platform
+  /// event that can already be in flight when `dispose()` requests
+  /// cancellation (`StreamSubscription.cancel()` doesn't retroactively stop
+  /// an event that already started delivering), so every `ref` touch below
+  /// is guarded fresh rather than trusting the single check at the top. The
+  /// whole body is additionally wrapped in try/catch: `ref.read()` throws a
+  /// clean, catchable `StateError` if this widget is ever truly gone by the
+  /// time a guarded line runs (a native callback's timing relative to
+  /// Flutter's own frame pipeline isn't something this code controls) —
+  /// this is the backstop so that throws as a silent, logged no-op instead
+  /// of an unhandled Future error.
   Future<void> _onPositionUpdate(MockJob job, Position position) async {
-    debugPrint(
-      'GEOFENCE: position update received '
-      '(${position.latitude.toStringAsFixed(6)}, ${position.longitude.toStringAsFixed(6)}) for job ${job.id}',
-    );
+    if (!mounted || _disposed) return;
+    try {
+      debugPrint(
+        'GEOFENCE: position update received '
+        '(${position.latitude.toStringAsFixed(6)}, ${position.longitude.toStringAsFixed(6)}) for job ${job.id}',
+      );
 
-    final distanceMeters = Geolocator.distanceBetween(
-      position.latitude,
-      position.longitude,
-      job.serviceLat!,
-      job.serviceLng!,
-    );
-    debugPrint('GEOFENCE: distance to job site is ${distanceMeters.toStringAsFixed(1)}m for job ${job.id}');
+      final distanceMeters = Geolocator.distanceBetween(
+        position.latitude,
+        position.longitude,
+        job.serviceLat!,
+        job.serviceLng!,
+      );
+      debugPrint('GEOFENCE: distance to job site is ${distanceMeters.toStringAsFixed(1)}m for job ${job.id}');
 
-    if (distanceMeters > _geofenceRadiusMeters) return;
+      if (distanceMeters > _geofenceRadiusMeters) return;
 
-    debugPrint(
-      'GEOFENCE: within ${_geofenceRadiusMeters.toStringAsFixed(0)}m geofence, triggering automatic arrival for job ${job.id}',
-    );
-    // Stop first so a second position update arriving while the arrival
-    // write is in flight can't fire a duplicate trigger.
-    await _stopGeofencing();
-    if (!mounted) return;
+      debugPrint(
+        'GEOFENCE: within ${_geofenceRadiusMeters.toStringAsFixed(0)}m geofence, triggering automatic arrival for job ${job.id}',
+      );
+      // Stop first so a second position update arriving while the arrival
+      // write is in flight can't fire a duplicate trigger.
+      await _stopGeofencing();
+      if (!mounted || _disposed) return;
 
-    final alreadyArrivedAt = await ref.read(arrivalEventProvider(job.id).future);
-    if (!mounted) return;
-    if (alreadyArrivedAt != null) {
-      debugPrint('GEOFENCE: job ${job.id} already has a gps_arrive event, skipping automatic trigger');
-      return;
+      final alreadyArrivedAt = await ref.read(arrivalEventProvider(job.id).future);
+      if (!mounted || _disposed) return;
+      if (alreadyArrivedAt != null) {
+        debugPrint('GEOFENCE: job ${job.id} already has a gps_arrive event, skipping automatic trigger');
+        return;
+      }
+
+      final technicianId = ref.read(authControllerProvider).value?.id;
+      if (technicianId == null) {
+        debugPrint('GEOFENCE ERROR: no signed-in technician id, cannot log automatic arrival for job ${job.id}');
+        return;
+      }
+
+      if (!mounted || _disposed) return;
+      await ref
+          .read(arrivalActionProvider(job.id).notifier)
+          .markArrived(technicianId: technicianId, source: 'automatic');
+    } catch (e, stackTrace) {
+      debugPrint('GEOFENCE ERROR (position update) for job ${job.id}: $e\n$stackTrace');
     }
-
-    final technicianId = ref.read(authControllerProvider).value?.id;
-    if (technicianId == null) {
-      debugPrint('GEOFENCE ERROR: no signed-in technician id, cannot log automatic arrival for job ${job.id}');
-      return;
-    }
-
-    await ref
-        .read(arrivalActionProvider(job.id).notifier)
-        .markArrived(technicianId: technicianId, source: 'automatic');
   }
 
   @override
@@ -205,6 +274,13 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
       if (next.valueOrNull != null) _stopGeofencing();
     });
 
+    // Voice commands are active on this screen too, not just the dedicated
+    // Voice Assistant screen — the recognizer itself is a single global
+    // service (see RootShell/GlobalVoiceService); this screen only offers
+    // its own commands (see buildVoiceCommands) while it's active.
+    final cameraMic = ref.watch(cameraMicProvider);
+    final voiceSession = ref.watch(globalVoiceServiceProvider);
+
     final runtime = ref.watch(jobRuntimeProvider(widget.jobId));
     final photos = ref.watch(jobPhotosProvider(widget.jobId)).valueOrNull ?? const [];
     final estimateItems = ref.watch(estimateLineItemsProvider(widget.jobId));
@@ -221,6 +297,20 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
         backgroundColor: AppColors.surface,
         foregroundColor: AppColors.textDark,
         elevation: 0,
+        actions: [
+          if (cameraMic.micGranted)
+            Padding(
+              padding: const EdgeInsets.only(right: 14),
+              child: Center(
+                child: VoiceListeningIndicator(
+                  phase: voiceSession.phase,
+                  showRings: false,
+                  coreSize: 34,
+                  iconSize: 16,
+                ),
+              ),
+            ),
+        ],
       ),
       body: SafeArea(
         child: LayoutBuilder(
@@ -505,6 +595,10 @@ class _NotArrivedCard extends ConsumerWidget {
         actionIcon: Icons.arrow_forward_rounded,
         onAction: () async {
           await ref.read(locationProvider.notifier).requestForeground();
+          // The permission request is async — this widget (and its `ref`)
+          // can be gone by the time it resolves if the technician navigated
+          // away mid-request.
+          if (!context.mounted) return;
           ref.read(locationAskShownProvider.notifier).state = true;
         },
       );

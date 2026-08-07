@@ -19,14 +19,18 @@ class AuthController extends AsyncNotifier<MockTechnician?> {
   @override
   FutureOr<MockTechnician?> build() => null;
 
-  Future<void> login({required String email, required String password}) async {
+  /// [identifier] may be either a phone number or an email address — both
+  /// are valid technician sign-in identifiers against the same backend.
+  Future<void> login({required String identifier, required String password}) async {
     state = const AsyncLoading();
     state = await AsyncValue.guard(() async {
       final supabase = Supabase.instance.client;
 
-      debugPrint('LOGIN: calling auth.signInWithPassword...');
+      final isEmail = identifier.contains('@');
+      debugPrint('LOGIN: calling auth.signInWithPassword (identifier is ${isEmail ? 'email' : 'phone'})...');
       final authResponse = await supabase.auth.signInWithPassword(
-        email: email,
+        email: isEmail ? identifier : null,
+        phone: isEmail ? null : identifier,
         password: password,
       );
       debugPrint('LOGIN: auth.signInWithPassword succeeded (user id: ${authResponse.user?.id})');

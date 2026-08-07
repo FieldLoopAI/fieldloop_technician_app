@@ -54,5 +54,11 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- Required on Android 11+ (API 30+) package visibility rules so
+             speech_to_text can find the on-device recognition service; without
+             this, SpeechToText.initialize() silently reports unavailable. -->
+        <intent>
+            <action android:name="android.speech.RecognitionService"/>
+        </intent>
     </queries>
 </manifest>

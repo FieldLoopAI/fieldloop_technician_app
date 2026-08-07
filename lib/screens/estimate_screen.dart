@@ -4,12 +4,20 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/mock_line_item.dart';
 import '../providers/estimate_invoice_providers.dart';
+import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
+import '../providers/safe_ref_disposal.dart';
+import '../providers/voice_command_registry_provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/primary_button.dart';
+import 'voice_command_registrar_mixin.dart';
 
 /// A single itemized estimate — deliberately one proposal, not a
-/// Good/Better/Best comparison.
+/// Good/Better/Best comparison. Also a job-scoped screen for voice purposes
+/// — see [buildVoiceCommands] — even though it has no estimate-specific
+/// voice commands of its own yet; it registers the same job-lifecycle set
+/// (arrived/job complete/site condition/troubleshoot) every other job
+/// screen does, so voice keeps working here too.
 class EstimateScreen extends ConsumerStatefulWidget {
   const EstimateScreen({super.key, required this.jobId});
 
@@ -19,15 +27,19 @@ class EstimateScreen extends ConsumerStatefulWidget {
   ConsumerState<EstimateScreen> createState() => _EstimateScreenState();
 }
 
-class _EstimateScreenState extends ConsumerState<EstimateScreen> {
+class _EstimateScreenState extends ConsumerState<EstimateScreen>
+    with SafeRefDisposal<EstimateScreen>, VoiceCommandRegistrarMixin<EstimateScreen> {
   bool _sending = false;
   bool _showConfirmation = false;
+
+  @override
+  List<VoiceCommand> buildVoiceCommands() => jobLifecycleVoiceCommands(ref, widget.jobId);
 
   Future<void> _sendToCustomer() async {
     setState(() => _sending = true);
     await Future.delayed(const Duration(milliseconds: 800));
+    safeWrite(() => ref.read(estimateStatusProvider(widget.jobId).notifier).state = EstimateStatus.sent);
     if (!mounted) return;
-    ref.read(estimateStatusProvider(widget.jobId).notifier).state = EstimateStatus.sent;
     setState(() {
       _sending = false;
       _showConfirmation = true;

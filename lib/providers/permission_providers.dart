@@ -41,6 +41,11 @@ class CameraMicController extends StateNotifier<CameraMicState> {
   Future<void> refresh() async {
     final camera = await Permission.camera.status;
     final microphone = await Permission.microphone.status;
+    // The permission check is async — by the time it resolves, whatever
+    // widget triggered this (or the app itself) may have gone away. Setting
+    // state after that notifies listeners tied to an already-disposed
+    // Element and crashes.
+    if (!mounted) return;
     state = state.copyWith(camera: camera, microphone: microphone, checked: true);
   }
 
@@ -53,6 +58,7 @@ class CameraMicController extends StateNotifier<CameraMicState> {
     ];
     if (toRequest.isEmpty) return;
     final results = await toRequest.request();
+    if (!mounted) return;
     state = state.copyWith(
       camera: results[Permission.camera] ?? state.camera,
       microphone: results[Permission.microphone] ?? state.microphone,
@@ -145,6 +151,7 @@ class LocationController extends StateNotifier<LocationState> {
   Future<void> refresh() async {
     final whenInUse = await Permission.locationWhenInUse.status;
     final always = await Permission.locationAlways.status;
+    if (!mounted) return;
     state = state.copyWith(whenInUse: whenInUse, always: always, checked: true);
   }
 
@@ -152,6 +159,7 @@ class LocationController extends StateNotifier<LocationState> {
   /// at all while the app is open.
   Future<void> requestForeground() async {
     final result = await Permission.locationWhenInUse.request();
+    if (!mounted) return;
     state = state.copyWith(whenInUse: result);
     // A foreground grant can sometimes also resolve background status
     // (platform/permission-combination dependent), so re-sync both.
@@ -165,6 +173,7 @@ class LocationController extends StateNotifier<LocationState> {
   /// bundled with the foreground request.
   Future<void> requestBackground() async {
     final result = await Permission.locationAlways.request();
+    if (!mounted) return;
     state = state.copyWith(always: result);
     await refresh();
   }

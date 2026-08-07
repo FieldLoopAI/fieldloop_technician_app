@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(flutter analyze *)"
+      "PowerShell(flutter analyze *)",
+      "Bash(flutter analyze *)",
+      "Bash(flutter test *)",
+      "Bash(flutter devices *)",
+      "Bash(adb devices *)",
+      "Bash(flutter build *)"
     ]
   }
 }
