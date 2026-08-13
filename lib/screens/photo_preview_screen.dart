@@ -19,6 +19,14 @@ import 'voice_command_registrar_mixin.dart';
 
 const int _maxPhotoBytes = 300 * 1024;
 
+/// Result of [_PhotoPreviewScreenState._confirm], and what this screen pops
+/// with — `null` means "retaken, no outcome." [queuedOffline] is still a
+/// success from the technician's perspective (see [_confirm]): the photo is
+/// safely saved locally and will upload automatically, so this screen still
+/// navigates back normally, just with a different confirmation message than
+/// [uploaded]. Only [failed] leaves this screen open with an on-screen error.
+enum PhotoConfirmOutcome { uploaded, queuedOffline, failed }
+
 /// Shown right after the shutter fires, before anything is compressed or
 /// uploaded. "Retake" discards the captured file and returns to the live
 /// camera with no upload or `field_events` write having happened; "Confirm"
@@ -50,20 +58,30 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
       VoiceCommand(
         id: 'confirm_photo',
         matches: (t) => t.contains('confirm'),
+        // Short, single-word vocabulary — finalizes on a much shorter
+        // silence window than the shared default (tuned for multi-word
+        // phrases like "job complete"), so the technician isn't left
+        // waiting ~2s after just saying "confirm". See
+        // VoiceCommand.pauseWindow.
+        pauseWindow: shortCommandPauseWindow,
         handler: (_) async {
           final service = ref.read(globalVoiceServiceProvider.notifier);
           await service.speak('Uploading photo');
-          final success = await _confirm();
-          if (success) {
-            await service.speak('Photo saved');
-          } else {
-            await service.speak("Sorry, the photo couldn't be saved");
+          final outcome = await _confirm();
+          switch (outcome) {
+            case PhotoConfirmOutcome.uploaded:
+              await service.speak('Photo saved');
+            case PhotoConfirmOutcome.queuedOffline:
+              await service.speak("Saved — will upload when you're back online");
+            case PhotoConfirmOutcome.failed:
+              await service.speak("Sorry, the photo couldn't be saved");
           }
         },
       ),
       VoiceCommand(
         id: 'retake_photo',
         matches: (t) => t.contains('retake'),
+        pauseWindow: shortCommandPauseWindow,
         handler: (_) async {
           await _retake();
           await ref.read(globalVoiceServiceProvider.notifier).speak('Retaking photo');
@@ -97,8 +115,8 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
     return result;
   }
 
-  Future<bool> _confirm() async {
-    if (_uploading) return false;
+  Future<PhotoConfirmOutcome> _confirm() async {
+    if (_uploading) return PhotoConfirmOutcome.failed;
     setState(() {
       _uploading = true;
       _error = null;
@@ -113,16 +131,28 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
         rethrow;
       }
 
-      await ref.read(jobPhotosProvider(widget.jobId).notifier).uploadPhoto(compressed);
+      // `uploadPhoto` itself decides whether this is an immediate upload or
+      // a network failure that gets queued locally instead — either way it
+      // does NOT throw, so from here on this is the success path for both.
+      final result = await ref.read(jobPhotosProvider(widget.jobId).notifier).uploadPhoto(compressed);
 
       unawaited(File(widget.imagePath).delete().catchError((_) => File(widget.imagePath)));
 
-      if (mounted) Navigator.of(context).pop(true);
-      return true;
+      final outcome = result == PhotoUploadResult.queuedOffline
+          ? PhotoConfirmOutcome.queuedOffline
+          : PhotoConfirmOutcome.uploaded;
+
+      // The friendly "saved — will upload later" message is shown as a
+      // SnackBar on PhotoCaptureScreen (the screen this pops back to) once
+      // this route is gone, not here — a SnackBar queued on this screen
+      // right before popping it would be torn down with the route before
+      // it's visible. See PhotoCaptureScreen._capture.
+      if (mounted) Navigator.of(context).pop(outcome);
+      return outcome;
     } catch (e, stackTrace) {
       debugPrint('PHOTO CONFIRM ERROR: $e\n$stackTrace');
       if (mounted) setState(() => _error = e.toString());
-      return false;
+      return PhotoConfirmOutcome.failed;
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
@@ -135,7 +165,7 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
     } catch (e) {
       debugPrint('PHOTOS: could not delete discarded photo file: $e');
     }
-    if (mounted) Navigator.of(context).pop(false);
+    if (mounted) Navigator.of(context).pop();
   }
 
   @override

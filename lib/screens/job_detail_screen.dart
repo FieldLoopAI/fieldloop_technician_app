@@ -25,6 +25,8 @@ import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
 import '../widgets/job_history_timeline.dart';
+import '../widgets/job_photo_thumbnail.dart';
+import '../widgets/pending_upload_badge.dart';
 import '../widgets/permission_card.dart';
 import '../widgets/primary_button.dart';
 import '../widgets/status_pill.dart';
@@ -34,6 +36,7 @@ import 'estimate_screen.dart';
 import 'invoice_screen.dart';
 import 'job_history_screen.dart';
 import 'photo_capture_screen.dart';
+import 'photo_viewer_screen.dart';
 import 'voice_assistant_screen.dart';
 import 'voice_command_registrar_mixin.dart';
 
@@ -75,6 +78,11 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
   Timer? _ticker;
   StreamSubscription<Position>? _positionSub;
 
+  // Captured in initState (see SafeRefDisposal) rather than read fresh in
+  // dispose() — by the time dispose() runs this widget's Element is already
+  // detached, so a fresh ref.read() there isn't safe.
+  late final GlobalVoiceService _voiceService;
+
   // Belt-and-suspenders alongside `mounted`: set synchronously as the very
   // first thing dispose() does, so every guard below reads it consistently
   // even if something re-enters mid-teardown. `mounted` alone is the same
@@ -89,12 +97,22 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
   @override
   void initState() {
     super.initState();
+    _voiceService = capture((ref) => ref.read(globalVoiceServiceProvider.notifier));
     // Ticks the labor-clock display once a second while the card is visible.
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || _disposed) return;
+      // Job Detail is the single entry point of "a job is open" — it stays
+      // mounted (just covered) for as long as the technician is anywhere
+      // inside this job (Photo Capture, Estimate, ...), so its own
+      // initState/dispose is what brackets when the wake-word mic should
+      // actually be listening. Deferred to a post-frame callback for the
+      // same reason VoiceCommandRegistrarMixin._registerCommands() is:
+      // writing provider state synchronously from initState() is unsafe
+      // while the widget tree is still building.
+      _voiceService.enterJobScope();
       _maybeStartGeofencing();
     });
   }
@@ -104,11 +122,32 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
     _disposed = true;
     _ticker?.cancel();
     _positionSub?.cancel();
+    _voiceService.exitJobScope();
     super.dispose();
   }
 
-  /// This screen never starts/stops the recognizer (see `RootShell` /
-  /// `GlobalVoiceService`) — it only offers these commands while it's the
+  /// `didPopNext` (from `VoiceCommandRegistrarMixin`'s `RouteAware`
+  /// conformance, already subscribed for voice-command registration) also
+  /// fires the moment this screen becomes visible again after whatever was
+  /// covering it (Photo Capture, Estimate, ...) gets popped — the exact
+  /// signal needed to know when to check whether this job's photo URLs
+  /// (signed for 1 hour, see `/photos/for-job`) might have gone stale
+  /// while the technician was elsewhere. `super.didPopNext()` still runs
+  /// the mixin's own voice-command re-registration; this only adds the
+  /// photo refresh alongside it.
+  @override
+  void didPopNext() {
+    super.didPopNext();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _disposed) return;
+      ref.read(jobPhotosProvider(widget.jobId).notifier).refreshIfStale();
+    });
+  }
+
+  /// This screen never starts the recognizer, only the wake-word LOOP
+  /// itself (see `enterJobScope`/`exitJobScope` above) — see `RootShell` /
+  /// `GlobalVoiceService` for recognizer initialization. Independently of
+  /// that, it only offers these commands while it's the
   /// active/visible screen (handled by `VoiceCommandRegistrarMixin`).
   @override
   List<VoiceCommand> buildVoiceCommands() {
@@ -821,20 +860,26 @@ class _VoiceSessionButton extends StatelessWidget {
   }
 }
 
-class _PhotoStrip extends StatelessWidget {
+class _PhotoStrip extends ConsumerWidget {
   const _PhotoStrip({required this.jobId, required this.photos});
 
   final String jobId;
   final List<JobPhoto> photos;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          'Photos (${photos.length})',
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.textDark),
+        Row(
+          children: [
+            Text(
+              'Photos (${photos.length})',
+              style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.textDark),
+            ),
+            const Spacer(),
+            PendingUploadBadge(jobId: jobId),
+          ],
         ),
         const SizedBox(height: 10),
         SizedBox(
@@ -873,38 +918,42 @@ class _PhotoStrip extends StatelessWidget {
               }
 
               final photo = photos[index];
-              return ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: SizedBox(
-                  width: 84,
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      if (photo.localBytes != null)
-                        Image.memory(photo.localBytes!, fit: BoxFit.cover)
-                      else
-                        Container(
-                          color: AppColors.borderGrey,
-                          alignment: Alignment.center,
-                          child: const Icon(Icons.check_circle_rounded, color: AppColors.primaryGreen, size: 22),
-                        ),
-                      if (photo.status == JobPhotoStatus.uploading)
-                        Container(
-                          color: Colors.black.withValues(alpha: 0.35),
-                          alignment: Alignment.center,
-                          child: const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+              return TapScale(
+                onTap: () => Navigator.of(
+                  context,
+                ).push(FadeSlidePageRoute(builder: (_) => PhotoViewerScreen(photo: photo))),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: SizedBox(
+                    width: 84,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        JobPhotoThumbnail(photo: photo),
+                        if (photo.status == JobPhotoStatus.uploading)
+                          Container(
+                            color: Colors.black.withValues(alpha: 0.35),
+                            alignment: Alignment.center,
+                            child: const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            ),
                           ),
-                        ),
-                      if (photo.status == JobPhotoStatus.failed)
-                        Container(
-                          color: Colors.black.withValues(alpha: 0.45),
-                          alignment: Alignment.center,
-                          child: const Icon(Icons.error_outline_rounded, color: Colors.white, size: 20),
-                        ),
-                    ],
+                        if (photo.status == JobPhotoStatus.failed)
+                          Container(
+                            color: Colors.black.withValues(alpha: 0.45),
+                            alignment: Alignment.center,
+                            child: const Icon(Icons.error_outline_rounded, color: Colors.white, size: 20),
+                          ),
+                        if (photo.status == JobPhotoStatus.queuedOffline)
+                          Container(
+                            color: Colors.black.withValues(alpha: 0.35),
+                            alignment: Alignment.center,
+                            child: const Icon(Icons.cloud_upload_outlined, color: Colors.white, size: 18),
+                          ),
+                      ],
+                    ),
                   ),
                 ),
               ).animate(delay: (60 * index).ms).fadeIn(duration: 300.ms).scale(begin: const Offset(0.9, 0.9), end: const Offset(1, 1));

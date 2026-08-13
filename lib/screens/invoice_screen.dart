@@ -1,13 +1,23 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/mock_line_item.dart';
 import '../providers/estimate_invoice_providers.dart';
+import '../providers/global_voice_service_provider.dart';
+import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
+import '../providers/safe_ref_disposal.dart';
+import '../providers/voice_command_registry_provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/primary_button.dart';
+import 'voice_command_registrar_mixin.dart';
 
+/// Job-scoped screen for voice purposes (see [buildVoiceCommands]) — same
+/// `VoiceCommandRegistrarMixin` pattern as Job Detail/Estimate, plus its own
+/// "generate invoice" command mirroring the on-screen button.
 class InvoiceScreen extends ConsumerStatefulWidget {
   const InvoiceScreen({super.key, required this.jobId});
 
@@ -17,8 +27,34 @@ class InvoiceScreen extends ConsumerStatefulWidget {
   ConsumerState<InvoiceScreen> createState() => _InvoiceScreenState();
 }
 
-class _InvoiceScreenState extends ConsumerState<InvoiceScreen> {
+class _InvoiceScreenState extends ConsumerState<InvoiceScreen>
+    with SafeRefDisposal<InvoiceScreen>, VoiceCommandRegistrarMixin<InvoiceScreen> {
   bool _generating = false;
+
+  @override
+  List<VoiceCommand> buildVoiceCommands() {
+    return [
+      VoiceCommand(
+        id: 'generate_invoice',
+        matches: (t) => t.contains('generate invoice'),
+        handler: (_) async {
+          final service = ref.read(globalVoiceServiceProvider.notifier);
+          // Mirrors the exact same gating `_buildAction`'s button uses.
+          final canGenerate =
+              ref.read(estimateStatusProvider(widget.jobId)) == EstimateStatus.signed &&
+              ref.read(invoiceStatusProvider(widget.jobId)) == InvoiceStatus.notYetInvoiced;
+          if (!canGenerate) {
+            debugPrint('VOICE: "generate invoice" not ready for job ${widget.jobId}');
+            unawaited(service.speak('Sign the estimate before invoicing'));
+            return;
+          }
+          await _generateAndSend();
+          unawaited(service.speak('Invoice generated and sent'));
+        },
+      ),
+      ...jobLifecycleVoiceCommands(ref, widget.jobId),
+    ];
+  }
 
   Future<void> _generateAndSend() async {
     setState(() => _generating = true);

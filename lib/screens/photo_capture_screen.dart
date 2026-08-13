@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
@@ -15,11 +17,14 @@ import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
 import '../widgets/error_banner.dart';
+import '../widgets/job_photo_thumbnail.dart';
 import '../widgets/permission_card.dart';
+import '../widgets/pending_upload_badge.dart';
 import '../widgets/tap_scale.dart';
 import '../widgets/voice_listening_indicator.dart';
 import 'estimate_screen.dart';
 import 'photo_preview_screen.dart';
+import 'photo_viewer_screen.dart';
 import 'voice_command_registrar_mixin.dart';
 
 /// Real camera capture flow. Voice drives "Capture"/"Take Photo"/"Next
@@ -105,6 +110,24 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
     Navigator.of(context).pop();
   }
 
+  /// `didPopNext` (from `VoiceCommandRegistrarMixin`'s `RouteAware`
+  /// conformance, already subscribed for voice-command registration) also
+  /// fires the moment this screen becomes visible again after whatever was
+  /// covering it (Photo Preview, Estimate, ...) gets popped — used here to
+  /// check whether this job's photo URLs (signed for 1 hour, see
+  /// `/photos/for-job`) might have gone stale while the technician was
+  /// elsewhere. `super.didPopNext()` still runs the mixin's own
+  /// voice-command re-registration; this only adds the photo refresh
+  /// alongside it.
+  @override
+  void didPopNext() {
+    super.didPopNext();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ref.read(jobPhotosProvider(widget.jobId).notifier).refreshIfStale();
+    });
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final controller = _cameraController;
@@ -153,6 +176,23 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
   /// stays true (keeping the shutter button's busy state, hidden behind the
   /// pushed route) until that screen is popped, so a second tap can't sneak
   /// in mid-review.
+  ///
+  /// Deliberately returns as soon as the photo is taken and navigation to
+  /// Photo Preview is TRIGGERED — it does NOT await that screen's eventual
+  /// confirm/retake outcome. This used to be one straight-line `await`
+  /// chain all the way through the pop, which meant the `capture_photo`
+  /// voice command handler (the only caller that `await`s this from
+  /// [buildVoiceCommands]) never reported itself "finished" to
+  /// `GlobalVoiceService` until the technician backed all the way out of
+  /// Photo Preview — up to 28+ seconds later in the field. Since the voice
+  /// service only starts listening again once the current handler's Future
+  /// completes (see `_dispatchCommand` in global_voice_service_provider.dart),
+  /// the recognizer sat dead the entire time Photo Preview was on screen,
+  /// so its own registered commands (`confirm_photo`/`retake_photo`) never
+  /// got a chance to be heard. The push + outcome-handling now runs in
+  /// [_awaitPreviewOutcome], fired-and-forgotten from here, so it keeps
+  /// running (and still owns resetting `_capturing`) without blocking
+  /// whichever caller — voice handler or tap — is awaiting this method.
   Future<void> _capture() async {
     final controller = _cameraController;
     if (controller == null || !controller.value.isInitialized || _capturing) return;
@@ -175,14 +215,53 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
       }
 
       if (!mounted) return;
-      await Navigator.of(context).push(
-        FadeSlidePageRoute(
-          builder: (_) => PhotoPreviewScreen(jobId: widget.jobId, imagePath: rawFile.path),
+      debugPrint(
+        'CAMERA: photo captured, navigating to Photo Preview — capture_photo handler (if any) '
+        'is done as of here, NOT waiting for the confirm/retake outcome',
+      );
+      unawaited(
+        _awaitPreviewOutcome(
+          Navigator.of(context).push<PhotoConfirmOutcome>(
+            FadeSlidePageRoute(
+              builder: (_) => PhotoPreviewScreen(jobId: widget.jobId, imagePath: rawFile.path),
+            ),
+          ),
         ),
       );
     } catch (e, stackTrace) {
       debugPrint('CAMERA ERROR (capture): $e\n$stackTrace');
-      if (mounted) setState(() => _error = e.toString());
+      if (mounted) {
+        setState(() {
+          _error = e.toString();
+          _capturing = false;
+          _flash = false;
+        });
+      }
+    }
+  }
+
+  /// The rest of the capture flow that used to block [_capture] itself:
+  /// waits for Photo Preview to actually be popped (confirm, retake, or the
+  /// technician backing out) and only then resets `_capturing`/`_flash` and
+  /// shows the queued-offline SnackBar. Split out so [_capture] can return
+  /// — and let the voice handler that called it report "finished" — the
+  /// moment navigation is triggered, while this keeps running underneath.
+  Future<void> _awaitPreviewOutcome(Future<PhotoConfirmOutcome?> outcomeFuture) async {
+    try {
+      final outcome = await outcomeFuture;
+      debugPrint(
+        'CAMERA: Photo Preview flow actually completed (outcome=$outcome) — this is the real '
+        'end of the work capture_photo kicked off, separate from (and later than) the voice '
+        'handler already having reported itself finished',
+      );
+      // Shown here (after the pop), not on PhotoPreviewScreen itself — a
+      // SnackBar queued right before that screen pops would be torn down
+      // with the route before it's ever visible.
+      if (outcome == PhotoConfirmOutcome.queuedOffline && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text("Saved — will upload when you're back online")));
+      }
     } finally {
       if (mounted) {
         setState(() {
@@ -303,16 +382,19 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
                 const SizedBox(height: 20),
                 Padding(
                   padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
-                  child: Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      'Captured photos (${photos.length})',
-                      style: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w700,
-                        color: AppColors.textDark,
+                  child: Row(
+                    children: [
+                      Text(
+                        'Captured photos (${photos.length})',
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                          color: AppColors.textDark,
+                        ),
                       ),
-                    ),
+                      const Spacer(),
+                      PendingUploadBadge(jobId: widget.jobId),
+                    ],
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -517,36 +599,40 @@ class _PhotoGrid extends StatelessWidget {
           itemCount: photos.length,
           itemBuilder: (context, index) {
             final photo = photos[index];
-            return ClipRRect(
-              borderRadius: BorderRadius.circular(14),
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  if (photo.localBytes != null)
-                    Image.memory(photo.localBytes!, fit: BoxFit.cover)
-                  else
-                    Container(
-                      color: AppColors.borderGrey,
-                      alignment: Alignment.center,
-                      child: const Icon(Icons.check_circle_rounded, color: AppColors.primaryGreen, size: 28),
-                    ),
-                  if (photo.status == JobPhotoStatus.uploading)
-                    Container(
-                      color: Colors.black.withValues(alpha: 0.35),
-                      alignment: Alignment.center,
-                      child: const SizedBox(
-                        width: 26,
-                        height: 26,
-                        child: CircularProgressIndicator(strokeWidth: 2.6, color: Colors.white),
+            return TapScale(
+              onTap: () => Navigator.of(
+                context,
+              ).push(FadeSlidePageRoute(builder: (_) => PhotoViewerScreen(photo: photo))),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(14),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    JobPhotoThumbnail(photo: photo, iconSize: 28),
+                    if (photo.status == JobPhotoStatus.uploading)
+                      Container(
+                        color: Colors.black.withValues(alpha: 0.35),
+                        alignment: Alignment.center,
+                        child: const SizedBox(
+                          width: 26,
+                          height: 26,
+                          child: CircularProgressIndicator(strokeWidth: 2.6, color: Colors.white),
+                        ),
                       ),
-                    ),
-                  if (photo.status == JobPhotoStatus.failed)
-                    Container(
-                      color: Colors.black.withValues(alpha: 0.45),
-                      alignment: Alignment.center,
-                      child: const Icon(Icons.error_outline_rounded, color: Colors.white, size: 28),
-                    ),
-                ],
+                    if (photo.status == JobPhotoStatus.failed)
+                      Container(
+                        color: Colors.black.withValues(alpha: 0.45),
+                        alignment: Alignment.center,
+                        child: const Icon(Icons.error_outline_rounded, color: Colors.white, size: 28),
+                      ),
+                    if (photo.status == JobPhotoStatus.queuedOffline)
+                      Container(
+                        color: Colors.black.withValues(alpha: 0.35),
+                        alignment: Alignment.center,
+                        child: const Icon(Icons.cloud_upload_outlined, color: Colors.white, size: 26),
+                      ),
+                  ],
+                ),
               ),
             ).animate(delay: (40 * index).ms).fadeIn(duration: 250.ms).scale(begin: const Offset(0.9, 0.9), end: const Offset(1, 1));
           },

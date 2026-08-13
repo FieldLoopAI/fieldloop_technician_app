@@ -1,13 +1,16 @@
 import 'dart:typed_data';
 
-enum JobPhotoStatus { uploading, uploaded, failed }
+enum JobPhotoStatus { uploading, uploaded, failed, queuedOffline }
 
 /// A job-site photo captured via the device camera. [localBytes] holds the
-/// compressed JPEG bytes for photos captured this session — kept around so
-/// the thumbnail can show the real image without needing a way to fetch it
-/// back from S3. Photos loaded from `field_events` on screen open (captured
-/// in an earlier session) only have [s3Key]/[status], since no local bytes
-/// exist for those.
+/// compressed JPEG bytes for photos captured THIS session — kept around so
+/// the thumbnail can show the real image immediately without waiting on a
+/// network round-trip. [url] is a temporary (1-hour) signed S3 link
+/// returned by `GET /photos/for-job` for photos loaded from the backend
+/// (this job's full history, not just this session) — used to render the
+/// thumbnail/full-size view via `CachedNetworkImage` whenever [localBytes]
+/// isn't available. A photo can have neither (still loading) or both
+/// (captured this session, since re-synced from the backend).
 class JobPhoto {
   const JobPhoto({
     required this.id,
@@ -16,6 +19,7 @@ class JobPhoto {
     this.s3Key,
     this.localBytes,
     this.error,
+    this.url,
   });
 
   final String id;
@@ -24,12 +28,14 @@ class JobPhoto {
   final String? s3Key;
   final Uint8List? localBytes;
   final String? error;
+  final String? url;
 
   JobPhoto copyWith({
     JobPhotoStatus? status,
     String? s3Key,
     Uint8List? localBytes,
     String? error,
+    String? url,
   }) {
     return JobPhoto(
       id: id,
@@ -38,6 +44,7 @@ class JobPhoto {
       s3Key: s3Key ?? this.s3Key,
       localBytes: localBytes ?? this.localBytes,
       error: error ?? this.error,
+      url: url ?? this.url,
     );
   }
 }

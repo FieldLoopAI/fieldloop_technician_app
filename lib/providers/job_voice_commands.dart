@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -79,7 +80,10 @@ VoiceCommand openCameraVoiceCommand({
       try {
         debugPrint('VOICE ACTION: opening camera for job $jobId');
         navigate();
-        await ref.read(globalVoiceServiceProvider.notifier).speak('Opening camera');
+        // FIX 3: don't block the handler (and therefore the next
+        // wake-word cycle) on the confirmation finishing playback — it
+        // speaks concurrently with the navigation that already started.
+        unawaited(ref.read(globalVoiceServiceProvider.notifier).speak('Opening camera'));
       } catch (e, stackTrace) {
         debugPrint('VOICE ERROR (open camera): $e\n$stackTrace');
       }
@@ -101,7 +105,7 @@ VoiceCommand prepareEstimateVoiceCommand({
       try {
         debugPrint('VOICE ACTION: opening estimate for job $jobId');
         navigate();
-        await ref.read(globalVoiceServiceProvider.notifier).speak('Opening estimate');
+        unawaited(ref.read(globalVoiceServiceProvider.notifier).speak('Opening estimate'));
       } catch (e, stackTrace) {
         debugPrint('VOICE ERROR (open estimate): $e\n$stackTrace');
       }
@@ -119,25 +123,28 @@ Future<void> _handleArrived(WidgetRef ref, String jobId) async {
     final alreadyArrivedAt = await ref.read(arrivalEventProvider(jobId).future);
     if (alreadyArrivedAt != null) {
       debugPrint('VOICE: arrival already logged for job $jobId');
-      await service.speak('Arrival already logged');
+      unawaited(service.speak('Arrival already logged'));
       return;
     }
 
     final technicianId = ref.read(authControllerProvider).value?.id;
     if (technicianId == null) {
       debugPrint('VOICE ERROR: no signed-in technician id, cannot log arrival for job $jobId');
-      await service.speak("Sorry, I didn't catch that");
+      unawaited(service.speak("Sorry, I didn't catch that"));
       return;
     }
 
+    // The write itself must finish before we know which confirmation to
+    // speak, so this part stays sequential — FIX 3 only applies to not
+    // blocking on the confirmation's playback afterward (below).
     await ref.read(arrivalActionProvider(jobId).notifier).markArrived(technicianId: technicianId);
     final result = ref.read(arrivalActionProvider(jobId));
     if (result.hasError) {
       debugPrint('VOICE ERROR: arrival logging failed for job $jobId: ${result.error}');
-      await service.speak("Sorry, I didn't catch that");
+      unawaited(service.speak("Sorry, I didn't catch that"));
     } else {
       debugPrint('VOICE: arrival logged for job $jobId');
-      await service.speak('Arrival logged');
+      unawaited(service.speak('Arrival logged'));
     }
   } catch (e, stackTrace) {
     debugPrint('VOICE ERROR (arrived): $e\n$stackTrace');
@@ -164,13 +171,13 @@ Future<void> _handleJobComplete(WidgetRef ref, String jobId) async {
         'VOICE: job $jobId not ready to complete '
         '(status=${runtime.status}, estimate=$estimateStatus, invoice=$invoiceStatus)',
       );
-      await service.speak('Job cannot be completed yet');
+      unawaited(service.speak('Job cannot be completed yet'));
       return;
     }
 
     ref.read(jobRuntimeProvider(jobId).notifier).markComplete();
     debugPrint('VOICE: job $jobId marked complete');
-    await service.speak('Job marked complete');
+    unawaited(service.speak('Job marked complete'));
   } catch (e, stackTrace) {
     debugPrint('VOICE ERROR (job complete): $e\n$stackTrace');
   }

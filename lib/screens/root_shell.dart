@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../providers/global_voice_service_provider.dart';
+import '../providers/offline_upload_queue_provider.dart';
 import '../providers/permission_providers.dart';
 import 'history_screen.dart';
 import 'home_screen.dart';
@@ -27,18 +28,33 @@ class RootShell extends ConsumerStatefulWidget {
 
 class _RootShellState extends ConsumerState<RootShell> {
   int _selectedIndex = 0;
-  bool _voiceStarted = false;
+  bool _voiceInitialized = false;
+  bool _offlineQueueStarted = false;
 
   static const _tabs = [HomeScreen(), HistoryScreen(), ProfileScreen()];
 
   @override
   Widget build(BuildContext context) {
     final cameraMic = ref.watch(cameraMicProvider);
-    // Only known-granted mic permission is safe to start the recognizer on
-    // — starting it earlier would re-trigger the OS permission flow.
-    if (cameraMic.checked && cameraMic.micGranted && !_voiceStarted) {
-      _voiceStarted = true;
-      ref.read(globalVoiceServiceProvider.notifier).start();
+    // Only known-granted mic permission is safe to initialize the recognizer
+    // on — doing it earlier would re-trigger the OS permission flow. This
+    // only readies the recognizer so there's no first-job delay; it does
+    // NOT start listening — voice is never active on Home/History/Profile,
+    // only once a job is open (see JobDetailScreen.initState/dispose, which
+    // call GlobalVoiceService.enterJobScope/exitJobScope).
+    if (cameraMic.checked && cameraMic.micGranted && !_voiceInitialized) {
+      _voiceInitialized = true;
+      ref.read(globalVoiceServiceProvider.notifier).initialize();
+    }
+
+    // No permission gate needed here (unlike voice) — starting the offline
+    // queue only opens a local DB and listens for connectivity, so it's
+    // started unconditionally the moment RootShell first builds, covering
+    // both "fresh login" and "app relaunch while already logged in" (see
+    // OfflineUploadQueueService's doc comment).
+    if (!_offlineQueueStarted) {
+      _offlineQueueStarted = true;
+      ref.read(offlineUploadQueueProvider.notifier).start();
     }
 
     return Scaffold(

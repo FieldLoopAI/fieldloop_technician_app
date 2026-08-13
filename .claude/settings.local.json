@@ -6,7 +6,8 @@
       "Bash(flutter test *)",
       "Bash(flutter devices *)",
       "Bash(adb devices *)",
-      "Bash(flutter build *)"
+      "Bash(flutter build *)",
+      "Bash(flutter emulators *)"
     ]
   }
 }

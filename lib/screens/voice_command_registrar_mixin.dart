@@ -64,7 +64,17 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
   /// (mounted-guarded) check inside still matters separately, since the
   /// deferred callback itself can fire after this widget was disposed in a
   /// fast-navigation scenario — this needs both, not one or the other.
+  ///
+  /// DIAGNOSTIC (voice-going-stale investigation) — this deferral means
+  /// the TRIGGER (this RouteAware callback firing) and the APPLY (the
+  /// registry actually being mutated, a frame later) can land in a
+  /// different order than the raw sequence of navigation events would
+  /// suggest, e.g. Photo Preview's didPop() (unregister, applied
+  /// immediately) racing Job Detail's didPopNext() (register, deferred a
+  /// full frame) — logging both points with millisecond timestamps is
+  /// what makes that visible instead of assumed.
   void _registerCommands() {
+    debugPrint('VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: $T register TRIGGERED (didPush/didPopNext)');
     final commands = buildVoiceCommands();
     final ids = commands.map((c) => c.id).toList(growable: false);
     final generation = ++_registrationGeneration;
@@ -73,9 +83,15 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
       // this frame's callbacks ran (e.g. covered again immediately) — that
       // call already left the registry in the state it wants; applying
       // this older snapshot on top would be wrong.
-      if (generation != _registrationGeneration) return;
+      if (generation != _registrationGeneration) {
+        debugPrint(
+          'VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: $T register APPLY skipped — '
+          'superseded by a later trigger before this frame ran',
+        );
+        return;
+      }
       safeWrite(() {
-        debugPrint('VOICE REGISTRY: $T registering [${ids.join(', ')}]');
+        debugPrint('VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: $T register APPLYING [${ids.join(', ')}]');
         _registeredCommandIds = ids;
         _voiceRegistry.registerAll(commands);
       });
@@ -83,11 +99,12 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
   }
 
   void _unregisterCommands() {
+    debugPrint('VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: $T unregister TRIGGERED (didPushNext/didPop/dispose)');
     _registrationGeneration++;
     if (_registeredCommandIds.isEmpty) return;
     final ids = _registeredCommandIds;
     _registeredCommandIds = const [];
-    debugPrint('VOICE REGISTRY: $T unregistering [${ids.join(', ')}]');
+    debugPrint('VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: $T unregister APPLYING [${ids.join(', ')}]');
     // `_voiceRegistry` was captured once in initState (see SafeRefDisposal)
     // — never re-read via `ref` here, including from dispose().
     _voiceRegistry.unregisterAll(ids);
