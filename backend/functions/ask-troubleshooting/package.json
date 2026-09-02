@@ -11,7 +11,8 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@aws-sdk/client-secrets-manager": "^3.1103.0",
+    "@aws-sdk/client-secrets-manager": "^3.1112.0",
+    "@supabase/supabase-js": "^2.112.3",
     "node-fetch": "^3.3.2"
   }
 }

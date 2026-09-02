@@ -9,7 +9,11 @@ import '../theme/app_theme.dart';
 import '../widgets/job_card.dart';
 import 'job_detail_screen.dart';
 
-/// Bottom-nav "History" tab: past jobs (complete/invoiced/paid).
+/// Bottom-nav "History" tab: past jobs (complete/invoiced/paid/closed).
+/// Data is re-queried each time this tab is selected — see
+/// `RootShell.onDestinationSelected`, which invalidates
+/// [historyJobsQueryProvider] on tab switch since this screen stays
+/// mounted for the whole session inside `RootShell`'s `IndexedStack`.
 class HistoryScreen extends ConsumerWidget {
   const HistoryScreen({super.key});
 
@@ -25,10 +29,14 @@ class HistoryScreen extends ConsumerWidget {
           children: [
             _Header(count: jobsAsync.valueOrNull?.length ?? 0),
             Expanded(
-              child: jobsAsync.when(
-                data: (jobs) => jobs.isEmpty ? const _EmptyState() : _HistoryList(jobs: jobs),
-                loading: () => const _LoadingState(),
-                error: (error, stackTrace) => const _ErrorState(),
+              child: RefreshIndicator(
+                color: AppColors.primaryGreen,
+                onRefresh: () => ref.refresh(historyJobsQueryProvider.future),
+                child: jobsAsync.when(
+                  data: (jobs) => jobs.isEmpty ? const _EmptyState() : _HistoryList(jobs: jobs),
+                  loading: () => const _LoadingState(),
+                  error: (error, stackTrace) => const _ErrorState(),
+                ),
               ),
             ),
           ],
@@ -156,6 +164,7 @@ class _HistoryList extends StatelessWidget {
 
         if (isWide) {
           return GridView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
             padding: EdgeInsets.symmetric(horizontal: horizontalPadding, vertical: 16),
             gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
               crossAxisCount: 2,
@@ -178,6 +187,7 @@ class _HistoryList extends StatelessWidget {
         }
 
         return ListView.separated(
+          physics: const AlwaysScrollableScrollPhysics(),
           padding: EdgeInsets.symmetric(horizontal: horizontalPadding, vertical: 16),
           itemCount: jobs.length,
           separatorBuilder: (_, _) => const SizedBox(height: 12),

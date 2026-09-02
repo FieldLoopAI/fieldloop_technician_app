@@ -9,6 +9,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../models/job_photo.dart';
 import '../providers/global_voice_service_provider.dart';
 import '../providers/job_photos_provider.dart';
+import '../providers/job_runtime_provider.dart';
 import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
 import '../providers/permission_providers.dart';
@@ -21,8 +22,7 @@ import '../widgets/job_photo_thumbnail.dart';
 import '../widgets/permission_card.dart';
 import '../widgets/pending_upload_badge.dart';
 import '../widgets/tap_scale.dart';
-import '../widgets/voice_listening_indicator.dart';
-import 'estimate_screen.dart';
+import '../widgets/voice_phase_indicator.dart';
 import 'photo_preview_screen.dart';
 import 'photo_viewer_screen.dart';
 import 'voice_command_registrar_mixin.dart';
@@ -34,6 +34,14 @@ import 'voice_command_registrar_mixin.dart';
 /// the registered voice commands call (see [buildVoiceCommands]). This
 /// screen never touches the recognizer itself — only the shared command
 /// registry, via `VoiceCommandRegistrarMixin`.
+///
+/// A finished job (complete/invoiced/paid/closed) never gets here under
+/// normal navigation — `JobDetailScreen`'s "Add Photos" tile is hidden for
+/// one (see `_PhotoStrip.canAddPhotos`) — but [build] independently checks
+/// the same [activeJobStatuses] itself and refuses to initialize the
+/// camera (or register any voice command — see [_jobFinished]) if it's
+/// ever reached anyway, showing a plain read-only message instead. Two
+/// independent layers, not one relying on the other.
 class PhotoCaptureScreen extends ConsumerStatefulWidget {
   const PhotoCaptureScreen({super.key, required this.jobId});
 
@@ -68,8 +76,24 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
     super.dispose();
   }
 
+  /// DEFENSE IN DEPTH — Job Detail's "Add Photos" entry point is already
+  /// hidden for a finished job (see `_PhotoStrip.canAddPhotos` in
+  /// `job_detail_screen.dart`), so under normal navigation this screen is
+  /// never reached for one at all. This is the second, independent layer:
+  /// even if reached some other way (a stale button, a deep link, future
+  /// code that forgets the check), [build] never initializes the camera
+  /// for a finished job (see its early-return), and this makes sure voice
+  /// is equally off here — a finished job is read-only for ANY new data,
+  /// not just photos, matching `JobDetailScreen._voiceEligible`'s exact
+  /// same [activeJobStatuses] check.
+  bool get _jobFinished {
+    final job = ref.read(jobByIdProvider(widget.jobId));
+    return job != null && !activeJobStatuses.contains(job.status);
+  }
+
   @override
   List<VoiceCommand> buildVoiceCommands() {
+    if (_jobFinished) return const [];
     return [
       VoiceCommand(
         id: 'next_picture',
@@ -94,13 +118,7 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
           await ref.read(globalVoiceServiceProvider.notifier).speak('Finishing photos');
         },
       ),
-      prepareEstimateVoiceCommand(
-        ref: ref,
-        jobId: widget.jobId,
-        navigate: () => Navigator.of(
-          context,
-        ).push(FadeSlidePageRoute(builder: (_) => EstimateScreen(jobId: widget.jobId))),
-      ),
+      prepareEstimateVoiceCommand(ref: ref, jobId: widget.jobId),
       ...jobLifecycleVoiceCommands(ref, widget.jobId),
     ];
   }
@@ -324,16 +342,54 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
   @override
   Widget build(BuildContext context) {
     final job = ref.watch(jobByIdProvider(widget.jobId));
+
+    // DEFENSE IN DEPTH — see [_jobFinished]'s doc comment. Checked here,
+    // reactively (ref.watch, not a one-time initState snapshot), before
+    // anything else in this build touches the camera: no
+    // `_ensureCameraInitialized()` call, no `CameraController` ever
+    // created, for a finished job. Existing photos are deliberately NOT
+    // shown here — Job Detail's own photo strip already shows them in
+    // view-only mode; this screen's only reason to exist at all is
+    // capturing NEW ones, which a finished job can never do.
+    if (job != null && !activeJobStatuses.contains(job.status)) {
+      return Scaffold(
+        backgroundColor: AppColors.background,
+        appBar: AppBar(
+          title: Text('Add Photos · ${job.jobIdPublic}'),
+          backgroundColor: AppColors.surface,
+          foregroundColor: AppColors.textDark,
+          elevation: 0,
+        ),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.lock_outline_rounded, size: 40, color: AppColors.neutralGreyLight),
+                const SizedBox(height: 14),
+                const Text(
+                  'This job is complete — no further photos can be added.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: AppColors.textDark),
+                ),
+                const SizedBox(height: 20),
+                OutlinedButton.icon(
+                  onPressed: () => Navigator.of(context).pop(),
+                  icon: const Icon(Icons.arrow_back_rounded, size: 18),
+                  label: const Text('Go Back'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
     final photosAsync = ref.watch(jobPhotosProvider(widget.jobId));
     final photos = photosAsync.valueOrNull ?? const [];
     final cameraMic = ref.watch(cameraMicProvider);
     final askShown = ref.watch(cameraMicAskShownProvider);
-
-    // The recognizer itself is a single global service, started once at
-    // RootShell (see GlobalVoiceService) — this screen only watches its
-    // state for the indicator and offers its own commands while active
-    // (see buildVoiceCommands).
-    final voiceSession = ref.watch(globalVoiceServiceProvider);
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -346,14 +402,7 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
           if (cameraMic.micGranted)
             Padding(
               padding: const EdgeInsets.only(right: 14),
-              child: Center(
-                child: VoiceListeningIndicator(
-                  phase: voiceSession.phase,
-                  showRings: false,
-                  coreSize: 34,
-                  iconSize: 16,
-                ),
-              ),
+              child: Center(child: VoicePhaseIndicator()),
             ),
         ],
       ),

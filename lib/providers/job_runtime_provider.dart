@@ -5,6 +5,20 @@ import '../models/mock_history_event.dart';
 import '../models/mock_job.dart';
 import 'jobs_provider.dart';
 
+/// Statuses a technician can still act on for a job — the single, shared
+/// definition of "finished" (anything NOT in this set:
+/// complete/invoiced/paid/closed, i.e. `historyJobsQueryProvider`'s
+/// statuses) a finished job is read-only for ANY new data, not just voice:
+/// no wake-word mic/voice commands (`JobDetailScreen`'s `_voiceEligible`),
+/// no "Add Photos" entry point (`_PhotoStrip`) and no camera
+/// (`PhotoCaptureScreen`'s own initState guard, defense in depth against
+/// reaching that screen some other way), no "Dictate Estimate"/"Add
+/// Change Order" tap fallbacks (`_TabContent`'s `voiceEligible`). Every
+/// one of those call sites imports this same constant rather than each
+/// keeping its own copy, so they can never drift out of sync with each
+/// other.
+const activeJobStatuses = {JobStatus.scheduled, JobStatus.enRoute, JobStatus.onSite};
+
 /// Live, in-session state for a job's on-site progress: current status plus
 /// when the technician arrived/completed the job. Seeded from the job's
 /// real status (from the `jobs` table) and mutated by the "I've Arrived" /
@@ -62,6 +76,7 @@ class JobRuntimeController extends StateNotifier<JobRuntimeState> {
       case JobStatus.complete:
       case JobStatus.invoiced:
       case JobStatus.paid:
+      case JobStatus.closed:
         final arrivedAt = _arrivalEventTimestamp(jobId) ?? job.scheduledStart;
         return JobRuntimeState(
           status: job.status,
@@ -78,8 +93,15 @@ class JobRuntimeController extends StateNotifier<JobRuntimeState> {
     state = state.copyWith(status: JobStatus.onSite, arrivedAt: arrivedAt);
   }
 
+  /// Applies a confirmed completion — called by [JobCompleteActionController]
+  /// (`job_complete_provider.dart`) only after the real `jobs` status
+  /// update + `field_events` insert succeed. Unlike [setArrived], not
+  /// gated on the current status: completion no longer requires having
+  /// been on-site first (see `job_complete_provider.dart`'s doc comment —
+  /// the only real precondition is an explicit confirm), so this always
+  /// applies the transition rather than silently no-op'ing on an
+  /// unexpected prior status.
   void markComplete() {
-    if (state.status != JobStatus.onSite) return;
     state = state.copyWith(status: JobStatus.complete, completedAt: DateTime.now());
   }
 }

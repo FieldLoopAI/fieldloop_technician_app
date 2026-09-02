@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/mock_technician.dart';
+import 'session_storage.dart';
 
 final authControllerProvider = AsyncNotifierProvider<AuthController, MockTechnician?>(
   AuthController.new,
@@ -51,12 +52,45 @@ class AuthController extends AsyncNotifier<MockTechnician?> {
         throw StateError('This account is not registered as a technician.');
       }
 
+      await saveLastLoginAt();
       return MockTechnician.fromMap(row);
     });
   }
 
+  /// Called at startup instead of [login] when a Supabase session survived
+  /// the app restart and is still within the 3-day re-login window (see
+  /// `session_storage.dart`) — repopulates the technician profile from that
+  /// existing session so [HomeScreen]/[ProfileScreen], which both read this
+  /// provider directly, don't render blank. Returns whether a technician
+  /// profile was restored.
+  Future<bool> restoreSession() async {
+    final supabase = Supabase.instance.client;
+    final session = supabase.auth.currentSession;
+    if (session == null) return false;
+
+    state = const AsyncLoading();
+    final result = await AsyncValue.guard(() async {
+      final userId = session.user.id;
+      final row = await supabase
+          .from('technicians')
+          .select()
+          .eq('auth_user_id', userId)
+          .maybeSingle();
+
+      if (row == null) {
+        await supabase.auth.signOut();
+        throw StateError('This account is not registered as a technician.');
+      }
+
+      return MockTechnician.fromMap(row);
+    });
+    state = result;
+    return result.value != null;
+  }
+
   void logout() {
     Supabase.instance.client.auth.signOut();
+    clearLastLoginAt();
     state = const AsyncData(null);
   }
 }

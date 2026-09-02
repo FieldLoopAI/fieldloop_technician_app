@@ -1,0 +1,17 @@
+{
+  "name": "parse-change-order-dictation",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.1111.0",
+    "@supabase/supabase-js": "^2.112.3"
+  }
+}

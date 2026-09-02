@@ -6,7 +6,12 @@ import '../models/mock_job.dart';
 import 'auth_provider.dart';
 import 'job_runtime_provider.dart';
 
-const _historyStatuses = {JobStatus.complete, JobStatus.invoiced, JobStatus.paid};
+const _historyStatuses = {
+  JobStatus.complete,
+  JobStatus.invoiced,
+  JobStatus.paid,
+  JobStatus.closed,
+};
 
 /// Today's jobs for the signed-in technician, straight from the `jobs`
 /// table: `lead_technician_id` matches the technician and `scheduled_start`
@@ -37,8 +42,8 @@ final todaysJobsQueryProvider = FutureProvider<List<MockJob>>((ref) async {
   }
 });
 
-/// Completed/invoiced/paid jobs for the signed-in technician, most recent
-/// first.
+/// Completed/invoiced/paid/closed jobs for the signed-in technician, most
+/// recent first.
 final historyJobsQueryProvider = FutureProvider<List<MockJob>>((ref) async {
   final technician = ref.watch(authControllerProvider).value;
   if (technician == null) return const [];
@@ -49,7 +54,7 @@ final historyJobsQueryProvider = FutureProvider<List<MockJob>>((ref) async {
         .from('jobs')
         .select()
         .eq('lead_technician_id', technician.id)
-        .inFilter('status', ['complete', 'invoiced', 'paid'])
+        .inFilter('status', ['complete', 'invoiced', 'paid', 'closed'])
         .order('scheduled_start', ascending: false);
     debugPrint('JOBS: job history query returned ${rows.length} row(s)');
 
@@ -73,8 +78,8 @@ final todaysJobsProvider = Provider<AsyncValue<List<MockJob>>>((ref) {
   });
 });
 
-/// Completed/invoiced/paid jobs, most recent first — powers the History
-/// tab.
+/// Completed/invoiced/paid/closed jobs, most recent first — powers the
+/// History tab.
 final historyJobsProvider = Provider<AsyncValue<List<MockJob>>>((ref) {
   final asyncJobs = ref.watch(historyJobsQueryProvider);
   return asyncJobs.whenData((jobs) {

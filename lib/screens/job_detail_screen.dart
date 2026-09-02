@@ -6,33 +6,39 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-import '../mock_data.dart';
 import '../models/job_photo.dart';
-import '../models/mock_history_event.dart';
 import '../models/mock_job.dart';
 import '../models/mock_line_item.dart';
 import '../providers/arrival_provider.dart';
 import '../providers/auth_provider.dart';
+import '../providers/currently_viewed_job_provider.dart';
 import '../providers/estimate_invoice_providers.dart';
 import '../providers/global_voice_service_provider.dart';
+import '../providers/job_complete_provider.dart';
+import '../providers/job_dictations_provider.dart';
+import '../providers/job_history_provider.dart';
 import '../providers/job_photos_provider.dart';
 import '../providers/job_runtime_provider.dart';
 import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
 import '../providers/permission_providers.dart';
 import '../providers/safe_ref_disposal.dart';
+import '../providers/visit_provider.dart';
+import '../providers/visit_tracking_service.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
-import '../widgets/job_history_timeline.dart';
+import '../widgets/job_history_feed_timeline.dart';
 import '../widgets/job_photo_thumbnail.dart';
 import '../widgets/pending_upload_badge.dart';
 import '../widgets/permission_card.dart';
 import '../widgets/primary_button.dart';
 import '../widgets/status_pill.dart';
 import '../widgets/tap_scale.dart';
-import '../widgets/voice_listening_indicator.dart';
+import '../widgets/voice_phase_indicator.dart';
+import 'change_orders_screen.dart';
 import 'estimate_screen.dart';
+import 'invoice_review_screen.dart';
 import 'invoice_screen.dart';
 import 'job_history_screen.dart';
 import 'photo_capture_screen.dart';
@@ -83,6 +89,19 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
   // detached, so a fresh ref.read() there isn't safe.
   late final GlobalVoiceService _voiceService;
 
+  // Same capture-early-for-safe-dispose-use reasoning as [_voiceService]
+  // above. [VisitTrackingService] (`visit_tracking_service.dart`) is the
+  // app-wide singleton that now owns the actual departure/re-arrival
+  // position stream + debounce timer — this screen only calls its
+  // enterJobScope/exitJobScope at the exact same trigger points it already
+  // calls [_voiceService]'s, so tracking for this job survives the app
+  // being minimized instead of living and dying with this State object.
+  late final VisitTrackingService _visitTrackingService;
+
+  // Same capture-early-for-safe-dispose-use reasoning as [_voiceService]
+  // above — see [SafeRefDisposal.capture]'s doc comment.
+  late final StateController<String?> _viewedJobIdController;
+
   // Belt-and-suspenders alongside `mounted`: set synchronously as the very
   // first thing dispose() does, so every guard below reads it consistently
   // even if something re-enters mid-teardown. `mounted` alone is the same
@@ -94,10 +113,32 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
   // taken several lines/awaits earlier.
   bool _disposed = false;
 
+  // Whether this job was still in an active status (scheduled/en_route/
+  // on_site) as of when the screen loaded — used ONLY to decide whether to
+  // start the wake-word mic at all (see initState below). This is
+  // deliberately a one-time snapshot, not the general "is voice available
+  // right now" check — see [_voiceEligible] for that (reactive, since a
+  // job can transition to 'complete' mid-session — see `job_complete`'s
+  // `ref.listen` in [build]).
+  late final bool _initialVoiceEligible;
+
+  /// Whether voice commands/mic are available RIGHT NOW — re-evaluated on
+  /// every read, unlike [_initialVoiceEligible]. A job pulled up from
+  /// History (complete/invoiced/paid/closed) is a read-only view: no
+  /// wake-word mic, no voice commands (see [buildVoiceCommands] and the
+  /// appBar's read-only badge) — and the same is now true the instant a
+  /// job transitions to 'complete' mid-session via `job_complete`, not
+  /// just when freshly opened from History.
+  bool get _voiceEligible => activeJobStatuses.contains(ref.read(jobRuntimeProvider(widget.jobId)).status);
+
   @override
   void initState() {
     super.initState();
     _voiceService = capture((ref) => ref.read(globalVoiceServiceProvider.notifier));
+    _visitTrackingService = capture((ref) => ref.read(visitTrackingServiceProvider));
+    _viewedJobIdController = capture((ref) => ref.read(currentlyViewedJobIdProvider.notifier));
+    final job = capture((ref) => ref.read(jobByIdProvider(widget.jobId)));
+    _initialVoiceEligible = job != null && activeJobStatuses.contains(job.status);
     // Ticks the labor-clock display once a second while the card is visible.
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
@@ -108,11 +149,45 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
       // mounted (just covered) for as long as the technician is anywhere
       // inside this job (Photo Capture, Estimate, ...), so its own
       // initState/dispose is what brackets when the wake-word mic should
-      // actually be listening. Deferred to a post-frame callback for the
-      // same reason VoiceCommandRegistrarMixin._registerCommands() is:
+      // actually be listening — and, same bracket, when
+      // `currentlyViewedJobIdProvider` should report this job as open (see
+      // that provider's doc comment). Deferred to a post-frame callback for
+      // the same reason VoiceCommandRegistrarMixin._registerCommands() is:
       // writing provider state synchronously from initState() is unsafe
       // while the widget tree is still building.
-      _voiceService.enterJobScope();
+      _viewedJobIdController.state = widget.jobId;
+      if (_initialVoiceEligible) {
+        _voiceService.enterJobScope();
+        // Same trigger point as the voice enterJobScope() call just above —
+        // see [VisitTrackingService]'s doc comment for why departure/
+        // re-arrival tracking now lives there instead of this State's own
+        // fields.
+        _visitTrackingService.enterJobScope(widget.jobId);
+      } else {
+        // HARDENING (completed-job read-only audit) — GlobalVoiceService's
+        // `_jobScopeActive` is a single global flag, not scoped per screen
+        // instance: `enterJobScope`/`exitJobScope` are only ever called
+        // from a JobDetailScreen's own initState/dispose, never from
+        // `VoiceCommandRegistrarMixin`'s didPushNext/didPop (those only
+        // touch the command REGISTRY, not the recognizer itself — see that
+        // mixin's doc comment). So if a technician somehow reaches this
+        // screen while some OTHER job's scope is still active (e.g. a
+        // previous JobDetailScreen instance that got covered rather than
+        // popped/disposed), simply not calling enterJobScope() here is not
+        // enough — that stale scope would keep the mic listening
+        // regardless, with this screen offering zero commands for it to
+        // match against but the recognizer still genuinely running.
+        // Explicitly exiting scope here — not just skipping entry —
+        // guarantees a finished job's screen actively turns voice off
+        // rather than merely declining to turn it on, matching the
+        // original "fully read-only, zero recognizer activity" design.
+        debugPrint(
+          'VOICE: job ${widget.jobId} is not active-status at load (finished job, read-only) — '
+          'explicitly exiting voice scope defensively, not just skipping entry',
+        );
+        _voiceService.exitJobScope();
+        _visitTrackingService.exitJobScope();
+      }
       _maybeStartGeofencing();
     });
   }
@@ -123,6 +198,16 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
     _ticker?.cancel();
     _positionSub?.cancel();
     _voiceService.exitJobScope();
+    _visitTrackingService.exitJobScope();
+    // Only clear if we're still the job "in view" — guards against a rare
+    // teardown-order edge case where a newer JobDetailScreen instance (a
+    // different job) has already overwritten this since this one's own
+    // postFrameCallback set it.
+    if (_viewedJobIdController.state == widget.jobId) {
+      Future(() {
+        _viewedJobIdController.state = null;
+      });
+    }
     super.dispose();
   }
 
@@ -148,9 +233,12 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
   /// itself (see `enterJobScope`/`exitJobScope` above) — see `RootShell` /
   /// `GlobalVoiceService` for recognizer initialization. Independently of
   /// that, it only offers these commands while it's the
-  /// active/visible screen (handled by `VoiceCommandRegistrarMixin`).
+  /// active/visible screen (handled by `VoiceCommandRegistrarMixin`) AND
+  /// the job is still in an active status — see [_voiceEligible]. A job
+  /// pulled up from History registers nothing here.
   @override
   List<VoiceCommand> buildVoiceCommands() {
+    if (!_voiceEligible) return const [];
     return [
       openCameraVoiceCommand(
         ref: ref,
@@ -159,12 +247,14 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
           context,
         ).push(FadeSlidePageRoute(builder: (_) => PhotoCaptureScreen(jobId: widget.jobId))),
       ),
-      prepareEstimateVoiceCommand(
+      prepareEstimateVoiceCommand(ref: ref, jobId: widget.jobId),
+      changeOrderVoiceCommand(ref: ref, jobId: widget.jobId),
+      generateInvoiceVoiceCommand(
         ref: ref,
         jobId: widget.jobId,
-        navigate: () => Navigator.of(
-          context,
-        ).push(FadeSlidePageRoute(builder: (_) => EstimateScreen(jobId: widget.jobId))),
+        navigate: (preview) => Navigator.of(context).push(
+          FadeSlidePageRoute(builder: (_) => InvoiceReviewScreen(jobId: widget.jobId, preview: preview)),
+        ),
       ),
       ...jobLifecycleVoiceCommands(ref, widget.jobId),
     ];
@@ -313,12 +403,38 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
       if (next.valueOrNull != null) _stopGeofencing();
     });
 
+    // The reactive half of [_voiceEligible]/`job_complete`: a job leaving
+    // an active status mid-session (in practice, only `markComplete()`
+    // synced by `JobCompleteActionController` after a real Supabase write
+    // succeeds) must flip this screen into its read-only, voice-disabled
+    // view immediately — not just the next time it's freshly opened from
+    // History. Deferred to a post-frame callback since this listener can
+    // fire mid-build (same "provider write during the build phase is
+    // unsafe" hazard `VoiceCommandRegistrarMixin._registerCommands`'s doc
+    // comment explains); `refreshVoiceCommands()` un/re-registers this
+    // screen's commands (empty, once no longer eligible) and
+    // `exitJobScope()` actually stops the mic — see both methods' doc
+    // comments for why both are needed, not just one.
+    ref.listen<JobRuntimeState>(jobRuntimeProvider(widget.jobId), (previous, next) {
+      final wasActive = previous == null || activeJobStatuses.contains(previous.status);
+      final isActiveNow = activeJobStatuses.contains(next.status);
+      if (!wasActive || isActiveNow) return;
+      debugPrint(
+        'JOB DETAIL: job ${widget.jobId} left active status '
+        '(${previous?.status} -> ${next.status}) — exiting voice scope live',
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _disposed) return;
+        refreshVoiceCommands();
+        _voiceService.exitJobScope();
+      });
+    });
+
     // Voice commands are active on this screen too, not just the dedicated
     // Voice Assistant screen — the recognizer itself is a single global
     // service (see RootShell/GlobalVoiceService); this screen only offers
     // its own commands (see buildVoiceCommands) while it's active.
     final cameraMic = ref.watch(cameraMicProvider);
-    final voiceSession = ref.watch(globalVoiceServiceProvider);
 
     final runtime = ref.watch(jobRuntimeProvider(widget.jobId));
     final photos = ref.watch(jobPhotosProvider(widget.jobId)).valueOrNull ?? const [];
@@ -326,8 +442,6 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
     final changeOrders = ref.watch(changeOrdersProvider(widget.jobId));
     final estimateStatus = ref.watch(estimateStatusProvider(widget.jobId));
     final invoiceStatus = ref.watch(invoiceStatusProvider(widget.jobId));
-    // MOCK DATA - replace with Supabase query (history_events table, filtered by job_id)
-    final history = mockHistoryByJobId[widget.jobId] ?? const [];
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -337,17 +451,15 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
         foregroundColor: AppColors.textDark,
         elevation: 0,
         actions: [
-          if (cameraMic.micGranted)
+          if (!_voiceEligible)
+            const Padding(
+              padding: EdgeInsets.only(right: 14),
+              child: Center(child: _ReadOnlyBadge()),
+            )
+          else if (cameraMic.micGranted)
             Padding(
               padding: const EdgeInsets.only(right: 14),
-              child: Center(
-                child: VoiceListeningIndicator(
-                  phase: voiceSession.phase,
-                  showRings: false,
-                  coreSize: 34,
-                  iconSize: 16,
-                ),
-              ),
+              child: Center(child: VoicePhaseIndicator()),
             ),
         ],
       ),
@@ -365,10 +477,18 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
                   _JobHeaderCard(job: job, status: runtime.status),
                   const SizedBox(height: 16),
                   _ArrivalCard(jobId: widget.jobId, runtime: runtime),
-                  const SizedBox(height: 16),
-                  _VoiceSessionButton(jobId: widget.jobId),
+                  if (runtime.status == JobStatus.onSite) ...[
+                    const SizedBox(height: 12),
+                    _VisitControlsCard(jobId: widget.jobId),
+                  ],
+                  if (_voiceEligible) ...[
+                    const SizedBox(height: 16),
+                    _VoiceSessionButton(jobId: widget.jobId),
+                    const SizedBox(height: 10),
+                    _AskQuestionButton(jobId: widget.jobId),
+                  ],
                   const SizedBox(height: 24),
-                  _PhotoStrip(jobId: widget.jobId, photos: photos),
+                  _PhotoStrip(jobId: widget.jobId, photos: photos, canAddPhotos: _voiceEligible),
                   const SizedBox(height: 28),
                   _TabSelector(selected: _tab, onChanged: (tab) => setState(() => _tab = tab)),
                   const SizedBox(height: 16),
@@ -379,15 +499,10 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
                     changeOrders: changeOrders,
                     estimateStatus: estimateStatus,
                     invoiceStatus: invoiceStatus,
-                    history: history,
+                    voiceEligible: _voiceEligible,
                   ),
                   const SizedBox(height: 28),
-                  _JobCompleteButton(
-                    jobId: widget.jobId,
-                    runtime: runtime,
-                    estimateStatus: estimateStatus,
-                    invoiceStatus: invoiceStatus,
-                  ),
+                  _JobCompleteButton(jobId: widget.jobId, runtime: runtime),
                 ],
               ),
             );
@@ -521,6 +636,7 @@ class _ArrivalCard extends ConsumerWidget {
       case JobStatus.complete:
       case JobStatus.invoiced:
       case JobStatus.paid:
+      case JobStatus.closed:
         final total = runtime.completedAt != null && runtime.arrivedAt != null
             ? runtime.completedAt!.difference(runtime.arrivedAt!)
             : Duration.zero;
@@ -554,6 +670,87 @@ class _ArrivalCard extends ConsumerWidget {
           ),
         ).animate().fadeIn(delay: 60.ms, duration: 300.ms);
     }
+  }
+}
+
+/// Manual fallback for the multi-visit departure/re-arrival system — only
+/// rendered while `runtime.status == JobStatus.onSite` (see [build]),
+/// i.e. only once the job has had its first arrival and isn't complete
+/// yet. Watches [openVisitProvider] (the same source of truth the
+/// automatic debounce state machine in `_JobDetailScreenState` uses) to
+/// show exactly one of:
+///  - "Leaving Site" — a visit is currently open; lets the technician log
+///    a departure themselves instead of waiting on the 3-minute automatic
+///    debounce, matching the same manual-fallback pattern as "I've
+///    Arrived" (`_NotArrivedCard`).
+///  - "Back on Site" — no visit is currently open (departed mid-job); lets
+///    the technician log a fresh arrival themselves instead of waiting for
+///    automatic re-entry detection.
+/// Both log the exact same `field_events` rows the automatic path does
+/// (see [VisitActionController]) — tapping either immediately flips this
+/// card to the other, since [openVisitProvider] is invalidated on every
+/// write.
+class _VisitControlsCard extends ConsumerWidget {
+  const _VisitControlsCard({required this.jobId});
+
+  final String jobId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final openVisit = ref.watch(openVisitProvider(jobId));
+    final visitAction = ref.watch(visitActionProvider(jobId));
+    final errorMessage = visitAction.hasError ? visitAction.error.toString() : null;
+
+    // Loading (first read) or an error resolving current visit state:
+    // nothing meaningful to offer yet rather than guessing which button to
+    // show — the position-stream state machine doesn't depend on this UI
+    // read at all, so automatic detection is unaffected either way.
+    return openVisit.when(
+      loading: () => const SizedBox.shrink(),
+      error: (_, _) => const SizedBox.shrink(),
+      data: (arrivedAt) {
+        final isOpen = arrivedAt != null;
+
+        Future<void> handleTap() async {
+          final technicianId = ref.read(authControllerProvider).value?.id;
+          if (technicianId == null) {
+            debugPrint('DEPARTURE ERROR: no signed-in technician id, cannot log manual visit change for job $jobId');
+            return;
+          }
+          final controller = ref.read(visitActionProvider(jobId).notifier);
+          if (isOpen) {
+            await controller.logDeparture(technicianId: technicianId);
+          } else {
+            await controller.logReArrival(technicianId: technicianId);
+          }
+        }
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            OutlinedButton.icon(
+              onPressed: visitAction.isLoading ? null : () => handleTap(),
+              icon: Icon(isOpen ? Icons.logout_rounded : Icons.touch_app_rounded, size: 18),
+              label: Text(isOpen ? 'Leaving Site' : 'Back on Site'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppColors.primaryGreenDark,
+                side: const BorderSide(color: AppColors.primaryGreen),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13.5),
+              ),
+            ),
+            if (errorMessage != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                errorMessage,
+                style: const TextStyle(color: AppColors.error, fontSize: 12.5, fontWeight: FontWeight.w500),
+              ),
+            ],
+          ],
+        ).animate().fadeIn(delay: 60.ms, duration: 300.ms);
+      },
+    );
   }
 }
 
@@ -818,6 +1015,37 @@ class _BackgroundLocationNudge extends ConsumerWidget {
   }
 }
 
+/// Shown in place of [VoiceListeningIndicator] on a finished-status job
+/// (see `_JobDetailScreenState._voiceEligible`) — makes it visually clear
+/// voice is intentionally off here, not just silently broken.
+class _ReadOnlyBadge extends StatelessWidget {
+  const _ReadOnlyBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: AppColors.neutralGreyLight.withValues(alpha: 0.3),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.lock_outline_rounded, size: 12, color: AppColors.neutralGrey),
+          const SizedBox(width: 5),
+          Text(
+            'Completed — read only',
+            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: AppColors.neutralGrey),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _VoiceSessionButton extends StatelessWidget {
   const _VoiceSessionButton({required this.jobId});
 
@@ -860,11 +1088,43 @@ class _VoiceSessionButton extends StatelessWidget {
   }
 }
 
+/// Tap fallback for the "help"/"ask"/"question" voice trigger — runs the
+/// exact same [handleAskQuestionCommand] the voice trigger does (greeting,
+/// then listen, then the troubleshooting Lambda round-trip), same fallback
+/// principle as every other voice feature in this app (see
+/// `handleDictationCommand`'s "Dictate Estimate" tap button, above).
+class _AskQuestionButton extends ConsumerWidget {
+  const _AskQuestionButton({required this.jobId});
+
+  final String jobId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return SizedBox(
+      width: double.infinity,
+      child: OutlinedButton.icon(
+        onPressed: () => handleAskQuestionCommand(ref: ref, jobId: jobId),
+        icon: const Icon(Icons.help_outline_rounded, size: 18),
+        label: const Text('Ask a Question'),
+        style: _outlineButtonStyle,
+      ),
+    );
+  }
+}
+
 class _PhotoStrip extends ConsumerWidget {
-  const _PhotoStrip({required this.jobId, required this.photos});
+  const _PhotoStrip({required this.jobId, required this.photos, required this.canAddPhotos});
 
   final String jobId;
   final List<JobPhoto> photos;
+
+  // Same status check as `_JobDetailScreenState._voiceEligible` (a
+  // finished job — complete/invoiced/paid/closed — is read-only for ANY
+  // new data, not just voice commands): existing photos still render
+  // below in view-only mode either way, this only controls whether the
+  // "Add Photos" tile — the entry point into PhotoCaptureScreen — appears
+  // at all.
+  final bool canAddPhotos;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -886,7 +1146,7 @@ class _PhotoStrip extends ConsumerWidget {
           height: 96,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
-            itemCount: photos.length + 1,
+            itemCount: canAddPhotos ? photos.length + 1 : photos.length,
             separatorBuilder: (_, _) => const SizedBox(width: 10),
             itemBuilder: (context, index) {
               if (index == photos.length) {
@@ -1008,7 +1268,7 @@ class _TabSelector extends StatelessWidget {
   }
 }
 
-class _TabContent extends StatelessWidget {
+class _TabContent extends ConsumerWidget {
   const _TabContent({
     required this.tab,
     required this.job,
@@ -1016,7 +1276,7 @@ class _TabContent extends StatelessWidget {
     required this.changeOrders,
     required this.estimateStatus,
     required this.invoiceStatus,
-    required this.history,
+    required this.voiceEligible,
   });
 
   final _DetailTab tab;
@@ -1025,10 +1285,15 @@ class _TabContent extends StatelessWidget {
   final List<MockLineItem> changeOrders;
   final EstimateStatus estimateStatus;
   final InvoiceStatus invoiceStatus;
-  final List<MockHistoryEvent> history;
+
+  // Mirrors `_JobDetailScreenState._voiceEligible` — gates the "Dictate
+  // Estimate" tap fallback below, since it activates the mic
+  // (`handleDictationCommand`) exactly like a voice command would, and a
+  // finished-status job viewed from History is read-only.
+  final bool voiceEligible;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     switch (tab) {
       case _DetailTab.estimate:
         return _SectionCard(
@@ -1050,22 +1315,67 @@ class _TabContent extends StatelessWidget {
                 style: _outlineButtonStyle,
                 child: const Text('View Full Estimate'),
               ),
+              if (voiceEligible) ...[
+                const SizedBox(height: 10),
+                // Tap fallback for the "prepare estimate" voice command —
+                // runs the exact same handleDictationCommand the voice
+                // handler does (see job_voice_commands.dart), same fallback
+                // principle as every other voice feature in this app.
+                // Wrapped in its own Consumer since _TabContent is a plain
+                // StatelessWidget with no `ref` of its own.
+                Consumer(
+                  builder: (context, ref, _) => OutlinedButton.icon(
+                    onPressed: () => handleDictationCommand(
+                      ref: ref,
+                      jobId: job.id,
+                      commandType: DictationCommandType.prepareEstimate,
+                      prompt: 'Go ahead, describe the work and price',
+                      savedLabel: 'Estimate note saved.',
+                    ),
+                    icon: const Icon(Icons.mic_rounded, size: 18),
+                    label: const Text('Dictate Estimate'),
+                    style: _outlineButtonStyle,
+                  ),
+                ),
+              ],
             ],
           ),
         );
 
       case _DetailTab.changeOrders:
         return _SectionCard(
-          child: changeOrders.isEmpty
-              ? const Text('No change orders yet', style: TextStyle(color: AppColors.neutralGrey))
-              : Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    for (final item in changeOrders) _LineItemRow(item: item),
-                    const Divider(height: 24),
-                    _TotalRow(label: 'Change orders total', amount: _sum(changeOrders)),
-                  ],
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (changeOrders.isEmpty)
+                const Text('No change orders yet', style: TextStyle(color: AppColors.neutralGrey))
+              else ...[
+                for (final item in changeOrders) _LineItemRow(item: item),
+                const Divider(height: 24),
+                _TotalRow(label: 'Change orders total', amount: _sum(changeOrders)),
+              ],
+              const SizedBox(height: 14),
+              OutlinedButton(
+                onPressed: () => Navigator.of(
+                  context,
+                ).push(FadeSlidePageRoute(builder: (_) => ChangeOrdersScreen(jobId: job.id))),
+                style: _outlineButtonStyle,
+                child: const Text('View Change Orders'),
+              ),
+              if (voiceEligible) ...[
+                const SizedBox(height: 10),
+                // Tap fallback for the "change order" voice command — runs
+                // the exact same handleChangeOrderCommand the voice trigger
+                // does, same fallback principle as "Dictate Estimate" above.
+                OutlinedButton.icon(
+                  onPressed: () => handleChangeOrderCommand(ref: ref, jobId: job.id),
+                  icon: const Icon(Icons.mic_rounded, size: 18),
+                  label: const Text('Add Change Order'),
+                  style: _outlineButtonStyle,
                 ),
+              ],
+            ],
+          ),
         );
 
       case _DetailTab.invoice:
@@ -1094,16 +1404,62 @@ class _TabContent extends StatelessWidget {
                 style: _outlineButtonStyle,
                 child: const Text('View Full Invoice'),
               ),
+              if (voiceEligible) ...[
+                const SizedBox(height: 10),
+                // Tap fallback for the "FieldLoop, generate invoice" voice
+                // command — runs the exact same handleGenerateInvoiceCommand
+                // the voice trigger does (real /invoices/preview Lambda call,
+                // spoken summary, then InvoiceReviewScreen), same fallback
+                // principle as "Dictate Estimate"/"Add Change Order" above.
+                // Distinct from "View Full Invoice" above, which is the
+                // older mock payment-status flow (estimate_invoice_providers.dart).
+                OutlinedButton.icon(
+                  onPressed: () => handleGenerateInvoiceCommand(
+                    ref: ref,
+                    jobId: job.id,
+                    navigate: (preview) => Navigator.of(context).push(
+                      FadeSlidePageRoute(builder: (_) => InvoiceReviewScreen(jobId: job.id, preview: preview)),
+                    ),
+                  ),
+                  icon: const Icon(Icons.mic_rounded, size: 18),
+                  label: const Text('Generate Invoice'),
+                  style: _outlineButtonStyle,
+                ),
+              ],
             ],
           ),
         );
 
       case _DetailTab.history:
+        // Same `job_history_feed` provider the full JobHistoryScreen reads
+        // (see job_history_provider.dart) — one shared cache, so this
+        // preview and the full timeline are always showing the exact same
+        // underlying rows, just sliced differently: newest-first and capped
+        // to a handful here, oldest-first and complete there.
+        final historyAsync = ref.watch(jobHistoryFeedProvider(job.id));
         return _SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              JobHistoryTimeline(events: history),
+              historyAsync.when(
+                data: (entries) {
+                  final preview = entries.reversed.take(5).toList();
+                  return JobHistoryFeedTimeline(entries: preview);
+                },
+                loading: () => const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 24),
+                  child: Center(child: CircularProgressIndicator()),
+                ),
+                error: (error, _) => const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 24),
+                  child: Center(
+                    child: Text(
+                      "Couldn't load history.",
+                      style: TextStyle(color: AppColors.neutralGrey, fontSize: 14),
+                    ),
+                  ),
+                ),
+              ),
               const SizedBox(height: 8),
               Align(
                 alignment: Alignment.centerRight,
@@ -1233,31 +1589,117 @@ class _InvoiceStatusBadge extends StatelessWidget {
   }
 }
 
-class _JobCompleteButton extends ConsumerWidget {
-  const _JobCompleteButton({
-    required this.jobId,
-    required this.runtime,
-    required this.estimateStatus,
-    required this.invoiceStatus,
-  });
+/// Tap fallback for the `job_complete` voice command
+/// (`job_voice_commands.dart`'s `_handleJobComplete`, the same logic this
+/// mirrors) — the same evidence check, the same confirm-before-writing
+/// rule, but as an in-card expansion instead of speaking/listening: tapping
+/// "Mark Job Complete" checks for job_estimates/photo evidence, then
+/// expands THIS SAME widget in place to show the matching warning/simple
+/// prompt plus Confirm/Cancel — never a modal dialog. That pattern (inline
+/// expansion, not `showDialog`/`AlertDialog`) is deliberate: a dialog here
+/// previously raced this app's realtime subscriptions during the dialog's
+/// own pop/teardown and crashed with a `'_dependents.isEmpty'` assertion
+/// (see `ChangeOrdersScreen`'s void action, the first place this was fixed
+/// and the pattern this copies).
+class _JobCompleteButton extends ConsumerStatefulWidget {
+  const _JobCompleteButton({required this.jobId, required this.runtime});
 
   final String jobId;
   final JobRuntimeState runtime;
-  final EstimateStatus estimateStatus;
-  final InvoiceStatus invoiceStatus;
-
-  bool get _alreadyDone =>
-      runtime.status == JobStatus.complete ||
-      runtime.status == JobStatus.invoiced ||
-      runtime.status == JobStatus.paid;
-
-  bool get _readyToComplete =>
-      runtime.status == JobStatus.onSite &&
-      estimateStatus == EstimateStatus.signed &&
-      invoiceStatus != InvoiceStatus.notYetInvoiced;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_JobCompleteButton> createState() => _JobCompleteButtonState();
+}
+
+class _JobCompleteButtonState extends ConsumerState<_JobCompleteButton> {
+  bool _expanded = false;
+  bool _loadingEvidence = false;
+  JobCompleteEvidence? _evidence;
+  bool _confirming = false;
+  String? _error;
+
+  bool get _alreadyDone =>
+      widget.runtime.status == JobStatus.complete ||
+      widget.runtime.status == JobStatus.invoiced ||
+      widget.runtime.status == JobStatus.paid ||
+      widget.runtime.status == JobStatus.closed;
+
+  /// Opens the confirmation expansion and kicks off the same evidence
+  /// check the voice path does — no Supabase write yet, just the read that
+  /// decides which prompt to show.
+  Future<void> _startConfirming() async {
+    setState(() {
+      _expanded = true;
+      _loadingEvidence = true;
+      _error = null;
+    });
+    debugPrint('JOB COMPLETE: "Mark Job Complete" tapped for job ${widget.jobId}, checking evidence...');
+    try {
+      final evidence = await ref.read(jobCompleteActionProvider(widget.jobId).notifier).checkEvidence();
+      if (!mounted) return;
+      setState(() {
+        _evidence = evidence;
+        _loadingEvidence = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      debugPrint('JOB COMPLETE ERROR: evidence check failed for job ${widget.jobId}: $e');
+      setState(() {
+        _loadingEvidence = false;
+        _error = 'Could not check this job — please try again.';
+      });
+    }
+  }
+
+  /// Collapses the expansion without writing anything — purely local
+  /// widget state, nothing to await or race (same reasoning as
+  /// `ChangeOrdersScreen._cancelVoiding`).
+  void _cancel() {
+    debugPrint('JOB COMPLETE: cancelled for job ${widget.jobId} — no write made');
+    setState(() {
+      _expanded = false;
+      _evidence = null;
+      _error = null;
+    });
+  }
+
+  Future<void> _confirm() async {
+    final evidence = _evidence;
+    if (evidence == null) return;
+    final technicianId = ref.read(authControllerProvider).value?.id;
+    if (technicianId == null) {
+      setState(() => _error = 'No active session — please sign in again.');
+      return;
+    }
+
+    setState(() {
+      _confirming = true;
+      _error = null;
+    });
+    debugPrint('JOB COMPLETE: confirmed via tap for job ${widget.jobId}, writing completion...');
+    try {
+      await ref
+          .read(jobCompleteActionProvider(widget.jobId).notifier)
+          .markComplete(technicianId: technicianId, evidence: evidence);
+      if (!mounted) return;
+      debugPrint('JOB COMPLETE: job ${widget.jobId} marked complete via tap');
+      setState(() {
+        _confirming = false;
+        _expanded = false;
+        _evidence = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      debugPrint('JOB COMPLETE ERROR: completion write failed for job ${widget.jobId}: $e');
+      setState(() {
+        _confirming = false;
+        _error = e is StateError ? e.message : e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     if (_alreadyDone) {
       return Container(
         padding: const EdgeInsets.symmetric(vertical: 14),
@@ -1273,33 +1715,80 @@ class _JobCompleteButton extends ConsumerWidget {
       );
     }
 
-    final button = SizedBox(
+    if (_expanded) return _buildConfirmExpansion();
+
+    return SizedBox(
       width: double.infinity,
       child: ElevatedButton.icon(
-        onPressed: _readyToComplete
-            ? () => ref.read(jobRuntimeProvider(jobId).notifier).markComplete()
-            : null,
+        onPressed: _startConfirming,
         icon: const Icon(Icons.check_circle_rounded),
-        label: const Text('Job Complete'),
+        label: const Text('Mark Job Complete'),
         style: ElevatedButton.styleFrom(
           backgroundColor: AppColors.primaryGreen,
-          disabledBackgroundColor: AppColors.borderGrey,
           foregroundColor: Colors.white,
-          disabledForegroundColor: AppColors.neutralGreyLight,
           padding: const EdgeInsets.symmetric(vertical: 16),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
           textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
         ),
       ),
     );
+  }
 
-    if (_readyToComplete) return button;
-
-    return Tooltip(
-      message: runtime.status != JobStatus.onSite
-          ? 'Arrive on site before completing the job'
-          : 'Complete the estimate and invoice first',
-      child: button,
+  Widget _buildConfirmExpansion() {
+    final evidence = _evidence;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.primaryGreen.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.primaryGreen.withValues(alpha: 0.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (_loadingEvidence)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 10),
+              child: Center(
+                child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+              ),
+            )
+          else ...[
+            Text(
+              (evidence != null && !evidence.hasAny)
+                  ? 'This job has no photos or estimate logged. Mark it complete anyway?'
+                  : 'Mark this job complete?',
+              style: const TextStyle(fontSize: 13.5, color: AppColors.textDark, fontWeight: FontWeight.w600),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(_error!, style: const TextStyle(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.w600)),
+            ],
+            const SizedBox(height: 12),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(onPressed: _confirming ? null : _cancel, child: const Text('Cancel')),
+                const SizedBox(width: 4),
+                ElevatedButton(
+                  onPressed: (evidence == null || _confirming) ? null : _confirm,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppColors.primaryGreen,
+                    foregroundColor: Colors.white,
+                  ),
+                  child: _confirming
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                        )
+                      : const Text('Confirm'),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
     );
   }
 }

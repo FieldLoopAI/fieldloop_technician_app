@@ -110,6 +110,22 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
     _voiceRegistry.unregisterAll(ids);
   }
 
+  /// Re-evaluates and re-applies this screen's available voice commands
+  /// right now, without waiting for a route transition — for a screen whose
+  /// eligibility can change reactively mid-session (e.g. Job Detail's own
+  /// job being marked complete while it's still the active screen; see
+  /// `_JobDetailScreenState`'s `ref.listen` on `jobRuntimeProvider`).
+  /// Unregisters whatever's currently registered for this screen, then
+  /// re-registers from a fresh [buildVoiceCommands] call — which, if this
+  /// screen is no longer eligible, returns an empty list, so nothing gets
+  /// re-registered. Callers are responsible for only invoking this from a
+  /// safe point (e.g. a post-frame callback), same as any other provider
+  /// write — see `_registerCommands`'s doc comment for why.
+  void refreshVoiceCommands() {
+    _unregisterCommands();
+    _registerCommands();
+  }
+
   @override
   void didPush() => _registerCommands();
 

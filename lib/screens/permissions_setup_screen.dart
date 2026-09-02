@@ -47,6 +47,7 @@ class _PermissionsSetupScreenState extends ConsumerState<PermissionsSetupScreen>
     try {
       await ref.read(cameraMicProvider.notifier).request();
       await ref.read(locationProvider.notifier).requestForeground();
+      await ref.read(notificationPermissionProvider.notifier).request();
     } catch (e, stackTrace) {
       debugPrint('PERMISSIONS SETUP ERROR (initial request): $e\n$stackTrace');
     } finally {
@@ -95,6 +96,7 @@ class _PermissionsSetupScreenState extends ConsumerState<PermissionsSetupScreen>
   Widget build(BuildContext context) {
     final cameraMic = ref.watch(cameraMicProvider);
     final location = ref.watch(locationProvider);
+    final notifications = ref.watch(notificationPermissionProvider);
 
     final showBackgroundCard = _primaryRequested && location.foregroundGranted && !location.backgroundGranted;
 
@@ -155,6 +157,18 @@ class _PermissionsSetupScreenState extends ConsumerState<PermissionsSetupScreen>
                         ? _statusFor(
                             granted: location.foregroundGranted,
                             deniedNote: "Automatic arrival detection disabled — use manual \"I've Arrived\" instead.",
+                          )
+                        : null,
+                  ),
+                  const SizedBox(height: 12),
+                  _PermissionExplainerCard(
+                    icon: Icons.notifications_active_rounded,
+                    title: 'Notifications',
+                    message: 'Used to alert you about new job assignments and customer approvals, even when the app is closed.',
+                    status: _primaryRequested
+                        ? _statusFor(
+                            granted: notifications.granted,
+                            deniedNote: "You won't be notified about new jobs or approvals — check the app to see updates instead.",
                           )
                         : null,
                   ),

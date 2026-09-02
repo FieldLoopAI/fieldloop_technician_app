@@ -12,7 +12,6 @@ import '../theme/app_theme.dart';
 import '../widgets/permission_card.dart';
 import '../widgets/tap_scale.dart';
 import '../widgets/voice_listening_indicator.dart';
-import 'estimate_screen.dart';
 import 'photo_capture_screen.dart';
 import 'voice_command_registrar_mixin.dart';
 
@@ -30,11 +29,7 @@ const _quickActions = [
     icon: Icons.description_rounded,
     phrase: 'FieldLoop, prepare estimate for compressor replacement',
   ),
-  _QuickAction(
-    label: 'Troubleshoot',
-    icon: Icons.build_circle_rounded,
-    phrase: 'FieldLoop, help me troubleshoot this error code',
-  ),
+  _QuickAction(label: 'Ask a Question', icon: Icons.help_outline_rounded, phrase: 'FieldLoop, help'),
   _QuickAction(
     label: 'Site Condition',
     icon: Icons.notes_rounded,
@@ -78,13 +73,7 @@ class _VoiceAssistantScreenState extends ConsumerState<VoiceAssistantScreen>
           context,
         ).push(FadeSlidePageRoute(builder: (_) => PhotoCaptureScreen(jobId: widget.jobId))),
       ),
-      prepareEstimateVoiceCommand(
-        ref: ref,
-        jobId: widget.jobId,
-        navigate: () => Navigator.of(
-          context,
-        ).push(FadeSlidePageRoute(builder: (_) => EstimateScreen(jobId: widget.jobId))),
-      ),
+      prepareEstimateVoiceCommand(ref: ref, jobId: widget.jobId),
       ...jobLifecycleVoiceCommands(ref, widget.jobId),
     ];
   }

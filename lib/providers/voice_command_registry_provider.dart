@@ -3,8 +3,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 /// One registered voice command. [matches] is checked against the
 /// lowercased recognized text; [handler] receives the original
-/// (non-lowercased) text — e.g. the troubleshoot command sends the
-/// technician's actual question to the Lambda.
+/// (non-lowercased) matched text, available for handlers that want it —
+/// though most (including "help"/"ask"/"question", which greets and then
+/// listens for the actual question separately — see
+/// `handleAskQuestionCommand`) don't need it and ignore it.
 class VoiceCommand {
   const VoiceCommand({required this.id, required this.matches, required this.handler, this.pauseWindow});
 
@@ -21,7 +23,7 @@ class VoiceCommand {
   /// for just this command — set on short, single-word commands (e.g.
   /// "confirm", "retake") so they finalize as soon as the word is
   /// recognized, instead of waiting out the longer default tuned for
-  /// multi-word phrases like "job complete" or a troubleshooting question.
+  /// multi-word phrases like "job complete" or "site condition".
   /// `null` (the default) uses the shared value. `GlobalVoiceService`
   /// applies this dynamically — as soon as the in-progress transcript
   /// matches a command with a shorter window, the settle timer (and the

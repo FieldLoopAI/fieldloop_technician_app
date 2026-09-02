@@ -2,9 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'providers/permission_providers.dart';
+import 'routing/app_navigator_key.dart';
 import 'routing/voice_route_observer.dart';
-import 'screens/login_screen.dart';
+import 'screens/splash_screen.dart';
 import 'theme/app_theme.dart';
+import 'widgets/dictation_confirmation_bar.dart';
+import 'widgets/voice_interaction_overlay.dart';
 
 class FieldLoopApp extends ConsumerStatefulWidget {
   const FieldLoopApp({super.key});
@@ -44,8 +47,27 @@ class _FieldLoopAppState extends ConsumerState<FieldLoopApp> with WidgetsBinding
       title: 'FieldLoop AI',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light,
+      navigatorKey: rootNavigatorKey,
       navigatorObservers: [voiceRouteObserver],
-      home: const LoginScreen(),
+      // FIX 2 (dictation confirm/redo) — the tap fallback for the
+      // confirm/redo step is stacked above the navigator here, not inside
+      // any one screen, since prepare_estimate/site_condition can be
+      // triggered from several different screens with no navigation
+      // involved. Renders nothing (SizedBox.shrink) whenever no
+      // confirmation is pending, so this is a no-op everywhere else in the
+      // app, including before login.
+      builder: (context, child) => Stack(
+        children: [
+          ?child,
+          // Below DictationConfirmationBar so its Confirm/Redo tap
+          // fallback stays reachable even while this modal's scrim is up
+          // (captureConfirmation()'s `listening` phase is exactly when
+          // both are simultaneously active).
+          const VoiceInteractionOverlay(),
+          const DictationConfirmationBar(),
+        ],
+      ),
+      home: const SplashScreen(),
     );
   }
 }

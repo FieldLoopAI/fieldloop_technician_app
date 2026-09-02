@@ -10,11 +10,30 @@ import 'package:speech_to_text/speech_to_text.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'deepgram_command_capture.dart';
+import 'tts_voice_preference.dart';
 import 'voice_command_registry_provider.dart';
 
-enum VoicePhase { listening, processing }
+/// [awaitingWakeWord] vs [listening] — CONFIRMED bug fix: both used to be
+/// the single `listening` value, which meant `VoicePhaseIndicator`'s
+/// enlarge-on-non-idle logic (and anything else keying off "is voice
+/// active") couldn't tell the passive, always-on baseline loop (mic open,
+/// waiting to hear "FieldLoop", no interaction happening yet) apart from
+/// genuine active capture (the mic open AFTER the wake word, or during
+/// dictation/confirmation). [awaitingWakeWord] is set only in
+/// [GlobalVoiceService._startListening] (the baseline session's start);
+/// every other listening call site — post-wake-word command capture,
+/// [GlobalVoiceService.captureDictation], [GlobalVoiceService.
+/// captureConfirmation], and the post-handler "still listening" case in
+/// [GlobalVoiceService._dispatchCommand] — uses [listening], since those
+/// only ever run once [GlobalVoiceService._wakeDetected] is already true.
+enum VoicePhase { idle, awaitingWakeWord, listening, processing, speaking }
 
-enum _ListenStage { idle, active, freeCapture }
+/// Resolved outcome of [GlobalVoiceService.captureConfirmation] — see that
+/// method's doc comment for the full contract, in particular why
+/// [unclear] is a distinct outcome from [redo] rather than folded into it.
+enum ConfirmationOutcome { confirmed, redo, unclear }
+
+enum _ListenStage { idle, active, dictation, confirmation }
 
 /// Every legitimate reason [GlobalVoiceService._scheduleWakeWordRestart]
 /// can be called for — a closed enum (not a free-form String) so every
@@ -59,10 +78,11 @@ class _WakeWordMatch {
 
 class GlobalVoiceState {
   const GlobalVoiceState({
-    this.phase = VoicePhase.listening,
+    this.phase = VoicePhase.idle,
     this.transcript = '',
     this.available = true,
     this.muted = false,
+    this.pendingConfirmationTranscript,
   });
 
   final VoicePhase phase;
@@ -76,20 +96,42 @@ class GlobalVoiceState {
 
   final bool muted;
 
+  /// FIX 2 (dictation confirm/redo) — non-null exactly while
+  /// [GlobalVoiceService.captureConfirmation] is awaiting a spoken or
+  /// tapped confirm/redo reply, holding the full transcript being
+  /// confirmed. Screens watch this (see `DictationConfirmationBar`, wired
+  /// globally via `MaterialApp.builder` in `app.dart` since
+  /// `prepare_estimate`/`site_condition` can be triggered from several
+  /// different screens) to show the on-screen Confirm/Redo tap fallback —
+  /// the same "voice AND tap always do the same thing" principle as every
+  /// other command in this app.
+  final String? pendingConfirmationTranscript;
+
   GlobalVoiceState copyWith({
     VoicePhase? phase,
     String? transcript,
     bool? available,
     bool? muted,
+    String? pendingConfirmationTranscript,
+    bool clearPendingConfirmationTranscript = false,
   }) {
     return GlobalVoiceState(
       phase: phase ?? this.phase,
       transcript: transcript ?? this.transcript,
       available: available ?? this.available,
       muted: muted ?? this.muted,
+      pendingConfirmationTranscript: clearPendingConfirmationTranscript
+          ? null
+          : (pendingConfirmationTranscript ?? this.pendingConfirmationTranscript),
     );
   }
 }
+
+/// Speech rate applied to every `speak()` call app-wide (see
+/// `_configureTts`) — chosen alongside the voice itself in Voice Settings
+/// so pacing and voice stay consistent; this screen only changes which
+/// voice is used, not this pacing tuning.
+const ttsSpeechRate = 0.45;
 
 /// The ONE `SpeechToText` and ONE `FlutterTts` instance for the entire app.
 ///
@@ -132,8 +174,26 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
 
   final Ref _ref;
 
+  /// FIX (Deepgram/on-device mic-contention bug) — hard kill switch for the
+  /// entire Deepgram command-capture leg. CONFIRMED root cause of the
+  /// "no words captured" fallback failures: [_deepgramAttemptTimeout]
+  /// "abandoning" a slow Deepgram attempt never actually cancels the
+  /// underlying token request, WebSocket connection, or `record` mic
+  /// stream — they keep running in the background after being abandoned,
+  /// so the freshly-opened on-device fallback session and the still-live
+  /// Deepgram mic stream fight over the microphone at the same time. While
+  /// this is `false`, the wake-word handler below skips
+  /// [_tryDeepgramCommandCapture] entirely — no token request, no
+  /// WebSocket, no AudioRecorder stream ever starts — and goes straight to
+  /// [_fallBackToOnDeviceCapture], exactly as if Deepgram capture didn't
+  /// exist in this build. All Deepgram code is left intact and unchanged;
+  /// flip this back to `true` once [DeepgramCommandCapture] actually tears
+  /// down its in-flight work on cancel/timeout instead of orphaning it.
+  static const bool _useDeepgramCapture = false;
+
   SpeechToText _speech = SpeechToText();
   final FlutterTts _tts = FlutterTts();
+
 
   /// Near-miss variants Android's generic on-device recognizer has been
   /// observed producing for the invented brand wake word "FieldLoop" (real
@@ -144,6 +204,23 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// "allowing minor extra words around them" falls out for free — no
   /// other code needs to change to add a variant, just extend this set as
   /// new mishearings show up in future logs.
+  ///
+  /// FIX (wake-word detection tolerance): the entries below
+  /// 'field lupe' onward are not yet confirmed from device logs the way
+  /// the ones above them are — they're added proactively, on the same
+  /// "unfamiliar brand word gets mapped onto a common trained one"
+  /// reasoning, to widen the net before another round of failed-attempt
+  /// logs is needed to justify each one individually. A false-positive
+  /// match here just costs one wasted listening cycle (the technician
+  /// says something unrelated, the app briefly listens for a command that
+  /// never matches, and the wake-word loop restarts); a missed detection
+  /// costs a frustrating repeat-yourself delay, so this list is
+  /// deliberately biased toward over-matching. 'fieldwork' is the
+  /// riskiest addition on that front — unlike the others it's an ordinary
+  /// English word a technician might say in passing without meaning to
+  /// invoke the assistant at all — kept anyway per that same
+  /// asymmetric-cost tradeoff, but the first one to prune back if false
+  /// triggers from it show up in logs.
   static const Set<String> _wakeWordVariants = {
     'field loop',
     'fieldloop',
@@ -155,8 +232,37 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     'fill up',
     'feel loop',
     'field lube',
+    'field lupe',
+    'yield loop',
+    'yield lupe',
+    'field group',
+    'fieldwork',
+    'field loot',
+    'field pool',
+    'field crew',
+    'field blue',
+    'shield loop',
+    'field news',
   };
 
+  /// INVESTIGATED (lowering the recognizer's confidence threshold for
+  /// wake-word matching): not possible, and not needed. `speech_to_text`
+  /// 7.4.0's `SpeechListenOptions` (see the platform interface package)
+  /// exposes no input-side confidence/threshold knob at all — Android's
+  /// `SpeechRecognizer` and iOS's `SFSpeechRecognizer` don't expose one to
+  /// this plugin either, so there is nothing to tune down there. The only
+  /// confidence value the plugin surfaces is `SpeechRecognitionResult.
+  /// confidence` — a read-only score attached to the FINAL result, meant
+  /// for an app to reject a low-confidence transcript. [_matchWakeWord]
+  /// (below) never reads it: wake-word matching already runs on every
+  /// PARTIAL result (`_onSessionResult`, before `result.finalResult` and
+  /// before Android even populates a real confidence value), so this is
+  /// already the most lenient policy available — accepting a match the
+  /// instant any variant appears in the running transcript, without
+  /// waiting for the recognizer to finalize or vouch for it. Widening
+  /// [_wakeWordVariants] (above) is the only lever that actually exists
+  /// for this.
+  ///
   /// Finds the earliest-occurring known wake-word variant in [lowerText]
   /// (already lowercased by the caller). If more than one variant starts
   /// at the same position, prefers the longest one — matters if a shorter
@@ -180,17 +286,46 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// Default silence threshold applied to on-device command capture — the
   /// native recognizer's own `pauseFor`, passed via `SpeechListenOptions`
   /// whenever a session is (re)started for command capture (see
-  /// [_reopenListenForCommand]). This is the FIX 5 tuning knob: short
-  /// enough to finalize the command promptly after the technician
-  /// stops talking, long enough not to cut off a brief mid-phrase pause
-  /// (e.g. "job... complete") or a troubleshooting question. Starting point
-  /// picked conservatively at 2s (down from the previous 5s command-stage
-  /// pauseFor) — tune down further only after real-device latency logs (see
-  /// FIX 4) confirm it isn't clipping speech. This is a per-COMMAND-SET
-  /// default: individual short, single-word commands (e.g. "confirm",
-  /// "retake") override it via [VoiceCommand.pauseWindow] — see
-  /// [_matchedShortWindowCommand].
-  static const Duration _commandPauseFor = Duration(seconds: 2);
+  /// [_reopenListenForCommand]). This is a per-COMMAND-SET default:
+  /// individual short, single-word commands (e.g. "confirm", "retake")
+  /// override it via [VoiceCommand.pauseWindow] — see
+  /// [_matchedShortWindowCommand] — and that override is unaffected by the
+  /// fix below, since it only ever applies once real words are already
+  /// banked in `_pendingCommandText`.
+  ///
+  /// FIX (Deepgram-fallback "no words captured" bug) — every normal
+  /// command capture goes through Deepgram first (see
+  /// [_tryDeepgramCommandCapture]); [_reopenListenForCommand] (and
+  /// therefore this default) is ONLY ever reached today via
+  /// [_fallBackToOnDeviceCapture], after the Deepgram leg has already
+  /// failed. That makes this on-device session the technician's ONLY
+  /// capture path for that command, exactly the same shape as the
+  /// baseline wake-word session and dictation capture — both already hit
+  /// and fixed this identical bug (see [_wakeWordPauseFor] and
+  /// [_dictationNativePauseFor]'s doc comments for the full history). This
+  /// was still left at a short 2s here, so the fallback inherited the
+  /// exact same symptom: real-device logs showed it repeatedly reporting
+  /// "no words captured" immediately after being triggered, because the
+  /// native session kept ending (and getting torn down/reopened) before
+  /// the technician had said anything at all. Raised to match
+  /// [_wakeWordPauseFor]/[_dictationNativePauseFor] (18s) for the same
+  /// reason: ordinary silence right after a prompt/tone — the technician
+  /// registering that the mic is open before they speak — must not end
+  /// the session on its own.
+  static const Duration _commandPauseFor = Duration(seconds: 18);
+
+  /// Native `listenFor` ceiling for the same on-device fallback session —
+  /// was already a generous 5 minutes (hardcoded inline in
+  /// [_reopenListenForCommand]; pulled out to a named constant here purely
+  /// so it's visible/greppable next to [_commandPauseFor]), so no change
+  /// needed here to fix the bug above — `pauseFor`, not `listenFor`, was
+  /// what was ending sessions early. Deliberately NOT shrunk toward
+  /// [_wakeWordListenFor] (58s) either, for the same reason
+  /// [_dictationMaxDuration] wasn't: a fallback command capture should be
+  /// able to run as long as the technician needs (a troubleshooting
+  /// question can run well past a minute), and [_commandPauseFor]/
+  /// [_commandSettleWindow] — not this ceiling — are what should end it.
+  static const Duration _commandListenFor = Duration(minutes: 5);
 
   /// FIX 2 (wake-word bug) — default for how long to wait, from the app's
   /// own clock, after the last new bit of speech before treating the
@@ -205,6 +340,92 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// actually finalize. Like [_commandPauseFor], short single-word commands
   /// override this via [VoiceCommand.pauseWindow].
   static const Duration _commandSettleWindow = Duration(milliseconds: 1800);
+
+  /// Native `pauseFor` for dictation-capture sessions (`prepare_estimate`,
+  /// `site_condition`). FIX (dictation-capture bug): this used to be a
+  /// short 2s value on the same reasoning as [_commandPauseFor] — but
+  /// unlike ordinary command capture, dictation has no Deepgram leg to
+  /// hand off to; this on-device session is the ENTIRE capture, running
+  /// continuously for as long as the technician talks. A short pauseFor
+  /// meant the native session ended roughly every 2s regardless of whether
+  /// the technician was still mid-sentence, forcing a
+  /// stop -> real-confirmation -> settle -> relisten cycle (see
+  /// [_ensureStoppedThenListen]) that briefly closes the mic; real-device
+  /// logs showed this producing dozens of consecutive sessions with
+  /// banked="" and no speech ever captured, since a fresh session often
+  /// didn't stay open long enough to receive even one onResult callback
+  /// before being torn down again. Raised to match/exceed
+  /// [_wakeWordPauseFor] (18s) for the same underlying reason that fixed
+  /// the baseline listener: ordinary mid-sentence silence (a technician
+  /// pausing to think about a price) must not end the native session on
+  /// its own. The real "is the dictation finished" decision still belongs
+  /// entirely to [_dictationSettleWindow], on the app's own clock — this
+  /// value now mostly just needs to outlast any pause a technician would
+  /// plausibly take, so [_reopenListenForDictation] is a rare backstop
+  /// again instead of the routine path.
+  static const Duration _dictationNativePauseFor = Duration(seconds: 18);
+
+  /// How long to wait, on the app's own clock, after the last new bit of
+  /// speech before treating a multi-sentence dictation as finished. Longer
+  /// than [_commandSettleWindow] (1800ms) on purpose — dictation is prose,
+  /// not a short command phrase, so an ordinary breath or mid-sentence
+  /// pause while describing a job or pricing must not cut it off early.
+  /// Picked at 3.5s: within the 3-4s window multi-sentence capture calls for.
+  ///
+  /// This is the DEFAULT [captureDictation] settle window, used by
+  /// `prepare_estimate`/`site_condition` ([handleDictationCommand]) and
+  /// `change_order` ([handleChangeOrderCommand]) — both genuinely need this
+  /// much pause tolerance for multi-sentence pricing descriptions. See
+  /// [askQuestionSettleWindow] for the shorter override used by
+  /// `ask_question`, which doesn't.
+  static const Duration _dictationSettleWindow = Duration(milliseconds: 3500);
+
+  /// [captureDictation] settle-window override for
+  /// [handleAskQuestionCommand]'s `ask_question` flow specifically — NOT
+  /// used by the other dictation flows ([_dictationSettleWindow] above
+  /// remains their default). A troubleshooting question is typically one
+  /// short spoken sentence, not multi-sentence pricing prose, so it doesn't
+  /// need [_dictationSettleWindow]'s full 3.5s pause tolerance; the extra
+  /// wait just made the technician wait longer than necessary for the mic
+  /// to close after asking. Reduced from 3500ms to 2000ms — a moderate,
+  /// safe trim, not pushed all the way to [_commandSettleWindow]'s 1800ms —
+  /// confirm with a few real, natural-pace questions (including ones with a
+  /// mid-sentence thinking pause) that this doesn't cut anyone off before
+  /// tightening further. Public (unlike the other settle-window constants
+  /// here) so `job_voice_commands.dart`'s [handleAskQuestionCommand] can
+  /// pass it into [captureDictation] as its `settleWindow` override.
+  static const Duration askQuestionSettleWindow = Duration(milliseconds: 2000);
+
+  /// Safety ceiling on a single dictation capture (native `listenFor`,
+  /// resets on every reopen).
+  ///
+  /// FIX 1 (dictation-capture total-silence bug) — this was 5 minutes, on
+  /// the reasoning that a single dictation session should be able to run
+  /// uninterrupted for as long as the technician talks. Real-device logs
+  /// disproved that: with `listenFor=5m`, dictation mode captured ZERO
+  /// speech across 13 consecutive restart cycles over ~2.5 minutes, despite
+  /// the technician talking continuously — while baseline wake-word
+  /// listening, using the identical [_dictationNativePauseFor]-equivalent
+  /// ([_wakeWordPauseFor]) but a `listenFor` of only 58s
+  /// ([_wakeWordListenFor]), worked correctly in the same window. A 5-minute
+  /// `listenFor` on this recognizer appears to be unstable/unsupported in
+  /// practice, not merely "generous." Shrunk to 60s — matching baseline's
+  /// proven-working scale — and it is now safe to shrink: [_dictationBankedText]
+  /// is banked on every reopen (see [_reopenListenForDictation]), not only on
+  /// a `finalResult`, so a dictation that genuinely runs past 60s just cycles
+  /// through another native session and keeps accumulating instead of losing
+  /// anything. [_dictationNativePauseFor]/[_dictationSettleWindow] remain what
+  /// actually decides the dictation is finished — this is purely the ceiling,
+  /// now sized to a duration this recognizer has actually been proven to
+  /// sustain.
+  static const Duration _dictationMaxDuration = Duration(seconds: 60);
+
+  /// Extra pause [captureDictation] waits out AFTER its caller's TTS prompt
+  /// has genuinely finished playing (see [_configureTts]) and BEFORE it
+  /// opens the mic — covers residual speaker/mic echo tail, on top of (not
+  /// instead of) the `awaitSpeakCompletion` fix. See [captureDictation]'s
+  /// doc comment for the bug this closes.
+  static const Duration _dictationPostPromptBuffer = Duration(milliseconds: 400);
 
   /// Native `pauseFor` for the BASELINE wake-word-listening session (as
   /// opposed to [_commandPauseFor] above, which governs the much shorter
@@ -226,6 +447,66 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// change, error, liveness check) well before this would ever matter.
   static const Duration _wakeWordListenFor = Duration(seconds: 58);
 
+  /// FIX 2 (dictation confirm/redo) — native `pauseFor` for
+  /// [captureConfirmation]'s on-device sessions. This is a short expected
+  /// reply ("confirm" / "redo" / "yes" / "no"), not a multi-sentence
+  /// dictation, so it doesn't need [_dictationNativePauseFor]'s full 18s —
+  /// but it's still an on-device-only capture with no Deepgram leg (same
+  /// as dictation, unlike ordinary command capture), so it must stay well
+  /// above a couple of seconds or it inherits the exact same
+  /// empty-banked-session bug [_dictationNativePauseFor] above was raised
+  /// to fix. 8s gives room for a technician to hesitate ("uh... confirm")
+  /// without ending the session before they've answered.
+  static const Duration _confirmationNativePauseFor = Duration(seconds: 8);
+
+  /// App-clock silence-tolerance window for [captureConfirmation] — armed
+  /// the MOMENT each attempt starts listening (see
+  /// [_captureConfirmationAttempt]), not only after the first onResult
+  /// callback, and re-armed on every new bit of speech after that (see
+  /// [_onConfirmationResult]). That "armed immediately" detail matters:
+  /// Android's on-device recognizer only fires onResult once it detects
+  /// actual speech (documented on [_livenessCheckDelay]), so a technician
+  /// who hasn't started responding YET produces zero callbacks — without
+  /// arming this up front, this class had no bounded way to notice "true
+  /// silence" at all and would just keep reopening the native session
+  /// forever on [_confirmationNativePauseFor]'s floor.
+  ///
+  /// FIX (confirmation defaulting to redo on mere hesitation) — this was
+  /// 1200ms, which is barely enough time for a technician to register that
+  /// the readback finished before the app had already finalized on
+  /// silence and started counting it as an "unclear" reply (see
+  /// [captureConfirmation]'s retry loop) — in the field this surfaced as
+  /// the whole dictation getting silently discarded (defaulted to redo)
+  /// essentially the instant the readback stopped, well before the
+  /// technician had a real chance to answer. Raised to 6s: a real,
+  /// comfortable pause to start responding, not a hard total-window cap —
+  /// [_confirmationMaxDuration] is the actual backstop for that.
+  static const Duration _confirmationSettleWindow = Duration(seconds: 6);
+
+  /// Safety ceiling on a single confirmation-capture attempt (native
+  /// `listenFor`) — a technician should answer within a few seconds; this
+  /// is purely a backstop against a runaway session, same role as
+  /// [_dictationMaxDuration] plays for dictation.
+  static const Duration _confirmationMaxDuration = Duration(seconds: 30);
+
+  /// BUG FIX (retry-prompt/mic race) — same purpose, same duration, as
+  /// [_dictationPostPromptBuffer], but for [_captureConfirmationAttempt]:
+  /// confirmed in logs that a confirmation attempt's own re-prompt
+  /// ("I didn't hear you — say confirm to save, or redo to try again.")
+  /// was being captured by the very next listening attempt as if it were
+  /// the technician's reply — the banked transcript was literally a
+  /// fragment of that re-prompt's own text, which happens to contain the
+  /// word "confirm," so it was then (correctly, given that input)
+  /// interpreted as an explicit CONFIRM. `awaitSpeakCompletion` (see
+  /// [_configureTts]) alone wasn't enough here any more than it was for
+  /// dictation — there's still a residual speaker/mic echo tail after
+  /// playback genuinely finishes. Applied inside
+  /// [_captureConfirmationAttempt] itself (not just before the first
+  /// attempt) so EVERY attempt gets this buffer, including retries within
+  /// [captureConfirmation]'s loop — that retry path was the one
+  /// specifically missing it before this fix.
+  static const Duration _confirmationPostPromptBuffer = Duration(milliseconds: 400);
+
   bool _initialized = false;
 
   /// Whether a job is currently open (Job Detail is mounted, anywhere
@@ -239,6 +520,14 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   bool _wakeDetected = false;
   bool _commandHandled = false;
   String _pendingCommandText = '';
+
+  /// True for the rest of the current command-capture cycle once
+  /// [_fallBackToOnDeviceCapture] has run — purely diagnostic (see the
+  /// debugPrint in [_processCommandText]) so a capture outcome in the log
+  /// can be directly attributed to the on-device Deepgram-failure fallback
+  /// path rather than the normal Deepgram-succeeded path. Reset on every
+  /// fresh cycle in [_startListening].
+  bool _viaOnDeviceFallback = false;
 
   /// Command text banked from native sessions that already ended this
   /// cycle (see [_reopenListenForCommand]) — the currently-open session's
@@ -255,15 +544,43 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   DeepgramCommandCapture? _activeDeepgramCapture;
   DateTime? _wakeWordDetectedAt;
   _ListenStage _stage = _ListenStage.idle;
-  Completer<String>? _freeCaptureCompleter;
+
+  /// Dictation-capture state (see [captureDictation]) — mirrors
+  /// [_bankedCommandText]/[_pendingCommandText]'s banked-across-reopens
+  /// shape, kept as its own separate pair rather than reused so a dictation
+  /// in progress can never be corrupted by (or corrupt) an ordinary
+  /// command capture, even though the two never actually run concurrently.
+  String _dictationBankedText = '';
+  String _dictationPendingText = '';
+  Timer? _dictationSettleTimer;
+  Completer<String>? _dictationCompleter;
+
+  /// Settle window actually in effect for the CURRENT [captureDictation]
+  /// call — set once at the top of [captureDictation] from its
+  /// `settleWindow` argument (defaulting to [_dictationSettleWindow]) and
+  /// read by [_armDictationSettleTimer] on every rearm, so a per-handler
+  /// override (see [askQuestionSettleWindow]) is honored for the whole
+  /// capture, not just its first pause.
+  Duration _activeDictationSettleWindow = _dictationSettleWindow;
+
+  /// FIX 2 (dictation confirm/redo) — confirmation-capture state, mirroring
+  /// [_dictationBankedText]/[_dictationPendingText]'s shape for the exact
+  /// same reason: its own separate fields so a confirm/redo reply can never
+  /// be corrupted by (or corrupt) an in-progress dictation, even though the
+  /// two never run concurrently — [captureConfirmation] only ever starts
+  /// after [captureDictation] has already resolved.
+  String _confirmationBankedText = '';
+  String _confirmationPendingText = '';
+  Timer? _confirmationSettleTimer;
+  Completer<String>? _confirmationCompleter;
 
   // --- Session lifecycle tracking (stale-session fix) --------------------
   //
   // Minted fresh every time _ensureStoppedThenListen actually calls
   // _speech.listen() — i.e. once per genuinely NEW native session,
   // whether that's the wake-word loop starting (_startListening),
-  // reopening mid-command (_reopenListenForCommand), or a free-text
-  // capture (captureFreeText). Included in every VOICE debugPrint from
+  // reopening mid-command (_reopenListenForCommand), or a dictation
+  // capture (captureDictation). Included in every VOICE debugPrint from
   // that point on via [_voiceLog], so a log line saying "listening" can
   // be checked against whether it's actually talking about the CURRENT
   // session or a stale reference to one that's already been superseded.
@@ -324,6 +641,39 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// the next `listen()` call — gives the native side a little extra room
   /// to finish releasing the session even after it has told us it's done.
   static const Duration _settleDelay = Duration(milliseconds: 500);
+
+  /// REVERTED (Deepgram-fallback timing regression) — this was a
+  /// speculative fixed delay inserted here between stopping the on-device
+  /// recognizer and starting a Deepgram attempt, added on an unvalidated
+  /// hypothesis about a mic-hardware handoff race. It was never confirmed
+  /// necessary by a real test, and — worse — it unconditionally added
+  /// latency to EVERY wake-word cycle regardless of outcome, directly
+  /// working against reliably capturing a short command spoken right
+  /// after the wake word. Removed. See [_deepgramAttemptTimeout] below for
+  /// the actual, confirmed cause of the fallback regression this was
+  /// mistaken for.
+  ///
+  /// FIX (fallback-capture regression — "no words captured" on every
+  /// attempt) — the actual cause: [_tryDeepgramCommandCapture] never had
+  /// an overall bound on how long a Deepgram attempt is allowed to run
+  /// before giving up and calling [_fallBackToOnDeviceCapture]. Before
+  /// this session's auth fixes, Deepgram failed FAST — usually within a
+  /// couple hundred ms (bad URL, then bad auth) — so the fallback started
+  /// almost immediately after the wake word, well within the time a
+  /// technician is still speaking a short command ("photos", "confirm").
+  /// Now that auth actually works, Deepgram gets much further (a real
+  /// token request + a real WebSocket handshake, neither of which has its
+  /// own timeout) before it still ultimately doesn't produce a transcript
+  /// — pushing the fallback's start several seconds later, by which point
+  /// a short command is already over and there's nothing left for the
+  /// fresh on-device session to hear. This is TIMING, not shared mutable
+  /// state — [_fallBackToOnDeviceCapture]/[_reopenListenForCommand]
+  /// themselves are unchanged and need no Deepgram-awareness; the fix is
+  /// bounding how long [_tryDeepgramCommandCapture] waits before calling
+  /// them. 4s is generous enough for Deepgram to genuinely succeed on a
+  /// healthy connection, while keeping the fallback's worst-case start
+  /// time short and predictable again.
+  static const Duration _deepgramAttemptTimeout = Duration(seconds: 4);
 
   /// Bounded safety net for [_stopConfirmation] — NOT the normal path.
   /// Real sessions always report done/notListening; this only fires if one
@@ -496,10 +846,15 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     _initialized = true;
     try {
       debugPrint('VOICE: initializing speech recognizer...');
-      final available = await _speech.initialize(
-        onStatus: _onStatus,
-        onError: _onError,
-      );
+      // _speech.initialize() (speech_to_text) and _configureTts()
+      // (flutter_tts) are separate plugins/platform channels with zero
+      // data dependency on each other — run them concurrently instead of
+      // stacking their platform-channel round trips end to end.
+      final results = await Future.wait<dynamic>([
+        _speech.initialize(onStatus: _onStatus, onError: _onError),
+        _configureTts(),
+      ]);
+      final available = results[0] as bool;
       debugPrint('VOICE: speech recognizer available=$available');
       if (!mounted) return;
       state = state.copyWith(available: available);
@@ -538,7 +893,10 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     _cancelRestartDebounce();
     _cancelActiveDeepgramCapture();
     unawaited(_lockedStop('exitJobScope'));
-    _completeFreeCapture('');
+    _cancelDictationSettleTimer();
+    _finishDictationCapture('');
+    _cancelConfirmationSettleTimer();
+    _finishConfirmationCapture('');
   }
 
   /// Cuts short an in-flight Deepgram capture (see
@@ -571,7 +929,10 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     _liveSessionId = null;
     _pendingSettle = false;
     _stopConfirmation = null;
-    _completeFreeCapture('');
+    _cancelDictationSettleTimer();
+    _finishDictationCapture('');
+    _cancelConfirmationSettleTimer();
+    _finishConfirmationCapture('');
     if (mounted) state = const GlobalVoiceState();
   }
 
@@ -734,7 +1095,17 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       _lastLivenessSignalAt = null;
       _lastSoundLevelLogAt = null;
       try {
-        _voiceLog('calling _speech.listen() — this is the new current session');
+        // FIX 1 — logs the mode this session is ACTUALLY starting in,
+        // dumped from _stage itself (not inferred/assumed), for every
+        // single session this method ever starts (wake-word loop, mid-
+        // command reopen, dictation, confirmation) — directly verifiable
+        // against the pauseFor/listenFor values the calling method logged
+        // just before this, so a mismatch between "params logged as
+        // baseline" and "mode actually applied" is caught immediately
+        // instead of only showing up as misbehavior several seconds later.
+        _voiceLog(
+          'calling _speech.listen() — this is the new current session, mode=$_stage',
+        );
         await _speech.listen(
           onResult: onResult,
           onSoundLevelChange: _onSoundLevel,
@@ -813,9 +1184,18 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
         }
         return;
       }
-      if (_stage == _ListenStage.freeCapture) {
-        _commandHandled = true;
-        _completeFreeCapture('');
+      if (_stage == _ListenStage.dictation) {
+        // Same Android quirk documented on _commandSettleWindow: the native
+        // session can end well before the technician is actually done
+        // dictating — only _dictationSettleTimer, on the app's own clock,
+        // is allowed to decide the dictation is finished.
+        unawaited(_reopenListenForDictation());
+        return;
+      }
+      if (_stage == _ListenStage.confirmation) {
+        // FIX 2 — same reasoning again, for the short confirm/redo reply:
+        // only _confirmationSettleTimer decides the reply is finished.
+        unawaited(_reopenListenForConfirmation());
         return;
       }
     }
@@ -864,9 +1244,10 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
         } else {
           _scheduleWakeWordRestart(_RestartCause.recoverableError);
         }
-      } else if (_stage == _ListenStage.freeCapture && !_commandHandled) {
-        _commandHandled = true;
-        _completeFreeCapture('');
+      } else if (_stage == _ListenStage.dictation && !_commandHandled) {
+        unawaited(_reopenListenForDictation());
+      } else if (_stage == _ListenStage.confirmation && !_commandHandled) {
+        unawaited(_reopenListenForConfirmation());
       }
       return;
     }
@@ -882,7 +1263,8 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       );
       _stage = _ListenStage.idle;
       state = state.copyWith(available: false);
-      _completeFreeCapture('');
+      _finishDictationCapture('');
+      _finishConfirmationCapture('');
     }
   }
 
@@ -978,20 +1360,53 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     }
     _voiceLog('listening (single session: wake word + command)...');
     _stage = _ListenStage.active;
+    _viaOnDeviceFallback = false;
     _wakeDetected = false;
     _wakeWordDetectedAt = null;
     _pendingCommandText = '';
     _bankedCommandText = '';
     _commandHandled = false;
     _cancelCommandSettleTimer();
+    // FIX 1 (dictation-mode leak into the next wake-word session): moving
+    // _stage to .active above is NOT enough on its own to guarantee the
+    // next session behaves as wake-word mode. _onDictationResult /
+    // _onConfirmationResult are bound as the onResult callback of whatever
+    // native session dictation/confirmation capture last opened, and that
+    // native session is not necessarily torn down yet at this exact point
+    // — only _ensureStoppedThenListen below (which stops-and-confirms the
+    // prior live session before this new one starts) guarantees that. In
+    // the gap between _commandHandled being reset to false (just above)
+    // and that stop being genuinely confirmed, a stray callback from the
+    // OLD dictation/confirmation session could otherwise still pass those
+    // handlers' _commandHandled guard and arm a phantom dictation/
+    // confirmation settle timer — which, when it later fired, finalized
+    // stray background audio as a bogus transcript (confirmed in logs:
+    // "1955", clearly not real speech) AND clobbered this brand new
+    // session's _stage/_commandHandled out from under it. Explicitly
+    // cancelling both settle timers and resetting both text buffers here,
+    // as part of this SAME restart sequence, closes that gap; the
+    // _stage != _ListenStage.dictation / .confirmation guards added to
+    // _onDictationResult / _onConfirmationResult are the other half of
+    // this fix — belt and suspenders, since either alone would have
+    // stopped the bug.
+    _cancelDictationSettleTimer();
+    _dictationBankedText = '';
+    _dictationPendingText = '';
+    _cancelConfirmationSettleTimer();
+    _confirmationBankedText = '';
+    _confirmationPendingText = '';
     // A session is starting right now — any earlier "restart later" plan
     // still pending is moot.
     _cancelRestartDebounce();
-    state = state.copyWith(transcript: '', phase: VoicePhase.listening);
+    Future(() {
+      // Baseline session start — the mic is opening to wait for the wake
+      // word, not to capture a command yet (see VoicePhase's doc comment).
+      state = state.copyWith(transcript: '', phase: VoicePhase.awaitingWakeWord);
+    });
     _voiceLog(
       'baseline wake-word listen() params: pauseFor=${_wakeWordPauseFor.inSeconds}s '
-      'listenFor=${_wakeWordListenFor.inSeconds}s (session should stay open across normal '
-      'silence and only end via explicit stop, not on its own)',
+      'listenFor=${_wakeWordListenFor.inSeconds}s mode=$_stage (session should stay open '
+      'across normal silence and only end via explicit stop, not on its own)',
     );
     await _ensureStoppedThenListen(
       onResult: _onSessionResult,
@@ -1033,6 +1448,20 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
         'final=${result.finalResult} words="${result.recognizedWords}")',
       );
       if (!mounted || _commandHandled) return;
+      // FIX 1 — belt-and-suspenders companion to the same guard added to
+      // _onDictationResult/_onConfirmationResult: this callback is bound to
+      // whatever native session THIS function's owning listen() call
+      // opened, and that session isn't guaranteed to be torn down the
+      // instant a dictation/confirmation capture finishes on the app's own
+      // clock. Without this, a stray straggling callback from an old
+      // dictation/confirmation session could in principle be misrouted
+      // here if a future refactor ever passed _onSessionResult somewhere
+      // stage-mismatched; harmless today (this is the only call site that
+      // ever binds this handler, and it always does so with _stage already
+      // set to .active — see _startListening), but keeping every onResult
+      // handler consistently self-checking its own stage is what makes
+      // that invariant enforced by the code, not just by convention.
+      if (_stage != _ListenStage.active) return;
       final words = result.recognizedWords.toLowerCase();
 
       if (!_wakeDetected) {
@@ -1058,13 +1487,27 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
         // expects, same as before.
         _pendingCommandText = words.substring(matched.end).trim();
         _onWakeWordDetected(); // FIX 2: instant haptic + tone, fire-and-forget
-        if (mounted) state = state.copyWith(transcript: _pendingCommandText);
+        // The wake word itself was heard during `awaitingWakeWord` — this
+        // is the edge into genuine active capture (see VoicePhase's doc
+        // comment), so this is the one place that transitions to
+        // `listening` for the post-wake-word command phrase, same as
+        // `captureDictation`/`captureConfirmation` do for their own modes.
+        if (mounted) {
+          state = state.copyWith(transcript: _pendingCommandText, phase: VoicePhase.listening);
+        }
         _logLatency('wake-word-detected');
         // Command CAPTURE (not detection — the wake word itself always
         // stays on-device) now switches to Deepgram; see
         // _tryDeepgramCommandCapture for the on-device continuation this
         // used to do inline here, which only still runs as its fallback.
-        unawaited(_tryDeepgramCommandCapture());
+        if (_useDeepgramCapture) {
+          unawaited(_tryDeepgramCommandCapture());
+        } else {
+          debugPrint(
+            'VOICE: Deepgram capture disabled via flag, going straight to on-device fallback.',
+          );
+          unawaited(_fallBackToOnDeviceCapture());
+        }
         return;
       }
 
@@ -1146,18 +1589,38 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// drops and they never need to repeat the wake word.
   Future<void> _reopenListenForCommand() async {
     if (!mounted || state.muted || !state.available || _commandHandled) return;
+    // FIX (Deepgram-fallback regression) — this is the single place that
+    // (re)opens an on-device session bound to _onSessionResult for command
+    // capture, called from two different places that can leave _stage in
+    // two different states: _onSessionResult's own mid-command reopen
+    // (where _stage is already .active, so this is a no-op) AND
+    // _fallBackToOnDeviceCapture, reached after _tryDeepgramCommandCapture
+    // deliberately set _stage = .idle to free the mic for Deepgram (see
+    // that method) and never restored it. _onSessionResult now checks
+    // _stage == .active before processing any result (see FIX 1, previous
+    // round) — without this line, every result from a Deepgram-fallback
+    // session was silently dropped, the command settle timer fired on
+    // unchanged (still empty) text, and the technician got "no command
+    // captured after wake word" despite speaking right after the wake
+    // word. Setting it here, at the one place that actually starts this
+    // kind of session, makes the invariant hold regardless of which caller
+    // reopens it — the same reasoning already applied to _stage being set
+    // at the top of captureDictation/_captureConfirmationAttempt for their
+    // own modes.
+    _stage = _ListenStage.active;
     final pauseFor =
         _matchedShortWindowCommand()?.pauseWindow ?? _commandPauseFor;
     _voiceLog(
       'native session ended before settle window elapsed — reopening mic '
-      '(banked="$_pendingCommandText", pauseFor=${pauseFor.inMilliseconds}ms)',
+      '(banked="$_pendingCommandText", pauseFor=${pauseFor.inMilliseconds}ms, '
+      'listenFor=${_commandListenFor.inMinutes}m, mode=$_stage)',
     );
     await _ensureStoppedThenListen(
       onResult: _onSessionResult,
       options: SpeechListenOptions(
         partialResults: true,
         cancelOnError: false,
-        listenFor: const Duration(minutes: 5),
+        listenFor: _commandListenFor,
         pauseFor: pauseFor,
       ),
     );
@@ -1185,6 +1648,22 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// [_fallBackToOnDeviceCapture]) for this one command attempt if anything
   /// about the Deepgram leg fails, so the technician is never left with
   /// dead air.
+  ///
+  /// FIX (resilience) — the entire Deepgram-specific body below is wrapped
+  /// in a try/catch that itself falls back to on-device. `DeepgramCommand
+  /// Capture.capture()` already documents that it never throws (every
+  /// internal failure — token request, WebSocket, mic stream, a malformed
+  /// message — resolves to `null` instead, see that class), but this outer
+  /// catch enforces that promise structurally rather than trusting it by
+  /// convention: this method is invoked as `unawaited(...)` from
+  /// _onSessionResult, so ANY uncaught exception here (a 500, a network
+  /// timeout, a future change to DeepgramCommandCapture that adds a new
+  /// throw path, anything) would otherwise surface only as an unhandled
+  /// Future error — silently leaving the technician with no fallback and
+  /// no response, indistinguishable from voice just going dead after the
+  /// wake word. "Voice should never go fully silent after a wake word" is
+  /// the requirement; this is what actually guarantees it regardless of
+  /// what's happening on the Deepgram/AWS side.
   Future<void> _tryDeepgramCommandCapture() async {
     if (!mounted || _commandHandled || !_jobScopeActive) return;
     _voiceLog('wake word detected — switching to Deepgram for command capture');
@@ -1199,44 +1678,71 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     await _lockedStop('tryDeepgramCommandCapture');
     if (!mounted || _commandHandled || !_jobScopeActive) return;
 
-    final accessToken =
-        Supabase.instance.client.auth.currentSession?.accessToken;
-    if (accessToken == null) {
-      _voiceLog(
-        'no Supabase session — cannot request a Deepgram token, falling back to on-device',
+    try {
+      final accessToken =
+          Supabase.instance.client.auth.currentSession?.accessToken;
+      if (accessToken == null) {
+        _voiceLog(
+          'no Supabase session — cannot request a Deepgram token, falling back to on-device',
+        );
+        await _fallBackToOnDeviceCapture();
+        return;
+      }
+
+      final capture = DeepgramCommandCapture(
+        wakeWordDetectedAt: _wakeWordDetectedAt ?? DateTime.now(),
+        onPartialTranscript: (partial) {
+          if (!mounted || _commandHandled) return;
+          _pendingCommandText = _joinCommandParts(_bankedCommandText, partial);
+          state = state.copyWith(transcript: _pendingCommandText);
+        },
       );
+      _activeDeepgramCapture = capture;
+      // FIX (fallback-capture regression) — bounded here, at the
+      // orchestration level, NOT inside DeepgramCommandCapture itself (see
+      // _deepgramAttemptTimeout's doc comment — that class's own internals
+      // are deliberately untouched). On timeout, cancel() is the exact
+      // same public shutdown path already used when the technician backs
+      // out of a job mid-capture — nothing new added to that class, just
+      // an existing, already-safe way to give up early.
+      final result = await capture
+          .capture(supabaseAccessToken: accessToken)
+          .timeout(
+            _deepgramAttemptTimeout,
+            onTimeout: () {
+              _voiceLog(
+                'Deepgram capture exceeded ${_deepgramAttemptTimeout.inSeconds}s — abandoning it '
+                'and falling back to on-device now',
+              );
+              capture.cancel();
+              return null;
+            },
+          );
+      _activeDeepgramCapture = null;
+      if (!mounted || _commandHandled || !_jobScopeActive) return;
+
+      final transcript = result?.transcript.trim() ?? '';
+      if (transcript.isEmpty) {
+        _voiceLog(
+          'Deepgram capture produced no usable transcript — falling back to on-device',
+        );
+        await _fallBackToOnDeviceCapture();
+        return;
+      }
+
+      final finalText = _joinCommandParts(_bankedCommandText, transcript);
+      _voiceLog('command routed via Deepgram: "$finalText"');
+      // Passes into the EXISTING command-matching/routing logic exactly as
+      // the on-device path does — Deepgram only ever replaces HOW the text
+      // was captured, never what happens with it afterward.
+      _finishCommandCapture(finalText);
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (Deepgram capture, unexpected): $e\n$stackTrace');
+      _activeDeepgramCapture = null;
+      if (!mounted || _commandHandled || !_jobScopeActive) return;
+      _voiceLog('unexpected error in the Deepgram capture path — falling back to on-device');
       await _fallBackToOnDeviceCapture();
-      return;
     }
-
-    final capture = DeepgramCommandCapture(
-      wakeWordDetectedAt: _wakeWordDetectedAt ?? DateTime.now(),
-      onPartialTranscript: (partial) {
-        if (!mounted || _commandHandled) return;
-        _pendingCommandText = _joinCommandParts(_bankedCommandText, partial);
-        state = state.copyWith(transcript: _pendingCommandText);
-      },
-    );
-    _activeDeepgramCapture = capture;
-    final result = await capture.capture(supabaseAccessToken: accessToken);
-    _activeDeepgramCapture = null;
-    if (!mounted || _commandHandled || !_jobScopeActive) return;
-
-    final transcript = result?.transcript.trim() ?? '';
-    if (transcript.isEmpty) {
-      _voiceLog(
-        'Deepgram capture produced no usable transcript — falling back to on-device',
-      );
-      await _fallBackToOnDeviceCapture();
-      return;
-    }
-
-    final finalText = _joinCommandParts(_bankedCommandText, transcript);
-    _voiceLog('command routed via Deepgram: "$finalText"');
-    // Passes into the EXISTING command-matching/routing logic exactly as
-    // the on-device path does — Deepgram only ever replaces HOW the text
-    // was captured, never what happens with it afterward.
-    _finishCommandCapture(finalText);
   }
 
   /// Resumes on-device recognition for the SAME command attempt already in
@@ -1262,7 +1768,14 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// redundant and, in this context, broken. Removed.
   Future<void> _fallBackToOnDeviceCapture() async {
     if (!mounted || _commandHandled || !_jobScopeActive) return;
+    // Traceable in the log the instant the Deepgram leg gives up, before
+    // _reopenListenForCommand's own (async) listen() call even resolves —
+    // if this line is missing from a future log, the fallback isn't being
+    // reached at all; if it's present but nothing gets captured, the bug
+    // is downstream (was: _stage left stale — see _reopenListenForCommand).
+    debugPrint('VOICE: Deepgram capture failed — triggering ON-DEVICE FALLBACK capture now');
     _voiceLog('resuming on-device recognition for this command');
+    _viaOnDeviceFallback = true;
     _armCommandSettleTimer();
     await _reopenListenForCommand();
   }
@@ -1277,6 +1790,15 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
 
   Future<void> _processCommandText(String text) async {
     _stage = _ListenStage.idle;
+    if (_viaOnDeviceFallback) {
+      // Directly answers "did the on-device fallback actually capture
+      // anything" from the log, without having to cross-reference this
+      // against the earlier "triggering ON-DEVICE FALLBACK capture now"
+      // line and _pendingCommandText by hand.
+      debugPrint(
+        'VOICE: on-device FALLBACK capture ${text.isEmpty ? "FAILED — no words captured" : 'SUCCEEDED — "$text"'}',
+      );
+    }
     if (text.isEmpty) {
       _voiceLog('no command captured after wake word');
       if (mounted)
@@ -1330,7 +1852,19 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     _logLatency('action-started');
     await matched.handler(text);
     _voiceLog('handler for "${matched.id}" finished');
-    if (mounted) state = state.copyWith(phase: VoicePhase.listening);
+    // Only reset here if nothing else already moved the phase on: most
+    // handlers call speak() before returning (sometimes unawaited — see
+    // [speak]'s FIX 3 doc comment), and speak() sets VoicePhase.speaking
+    // synchronously before its first `await`, so by the time we get here
+    // phase is usually already `speaking` (still playing) or `idle` (already
+    // finished) — either way it must NOT be stomped back to `listening`
+    // while a spoken response is in flight or has already resolved. Only a
+    // handler that never calls speak() at all (e.g. PhotoCaptureScreen's
+    // `_capture`, which just navigates) leaves phase sitting at
+    // `processing`, and that's the one case this needs to clean up.
+    if (mounted && state.phase == VoicePhase.processing) {
+      state = state.copyWith(phase: VoicePhase.listening);
+    }
   }
 
   /// FIX 4 — logs elapsed time since the wake word was first detected in
@@ -1343,6 +1877,177 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     if (detectedAt == null) return;
     final elapsedMs = DateTime.now().difference(detectedAt).inMilliseconds;
     debugPrint('VOICE LATENCY: wake-to-$stage: ${elapsedMs}ms');
+  }
+
+  /// Makes `_tts.speak()`'s returned Future resolve only once playback has
+  /// ACTUALLY finished, instead of `flutter_tts`'s default of resolving as
+  /// soon as the text is handed off to the platform TTS engine (i.e. the
+  /// synthesis request was accepted, not that audio finished playing out
+  /// the speaker). Called once from [initialize].
+  ///
+  /// BUG FIX (prompt/mic race): without this, `await speak(...)` in
+  /// [speak] returned almost immediately while the prompt was still
+  /// audible. `job_voice_commands.dart`'s `handleDictationCommand` relies
+  /// on `await service.speak(prompt)` genuinely blocking until the prompt
+  /// has finished playing before it calls [captureDictation] — without
+  /// this configured, the mic started listening while "Go ahead, describe
+  /// the work and price" was still playing through the speaker, and the
+  /// recognizer picked up the tail of the device's OWN prompt audio as if
+  /// it were the technician's answer (confirmed in logs: the captured
+  /// transcript exactly matched the tail of the prompt text). See
+  /// [captureDictation] for the additional post-completion safety buffer.
+  Future<void> _configureTts() async {
+    // awaitSpeakCompletion, setSpeechRate, and the saved-voice prefs read
+    // are mutually independent platform calls — fire them concurrently.
+    // Only the voice-matching tail below (getVoices -> setVoice) has a
+    // real dependency chain (setVoice needs discoverEnUsVoices()'s live
+    // result, which is only worth fetching once we know a voice was
+    // actually saved), so that part stays sequential.
+    final awaitCompletionFuture = () async {
+      try {
+        await _tts.awaitSpeakCompletion(true);
+        debugPrint(
+          'VOICE TTS: awaitSpeakCompletion(true) configured — speak() will now wait for real '
+          'playback completion, not just hand-off to the platform TTS engine',
+        );
+      } catch (e, stackTrace) {
+        debugPrint('VOICE ERROR (tts configure): $e\n$stackTrace');
+      }
+    }();
+
+    // Pacing tuned for wake-word/prompt clarity — applies to every speak()
+    // call from here on, not just Voice Settings' own previews.
+    final speechRateFuture = () async {
+      try {
+        await _tts.setSpeechRate(ttsSpeechRate);
+      } catch (e, stackTrace) {
+        debugPrint('VOICE ERROR (tts speech rate): $e\n$stackTrace');
+      }
+    }();
+
+    final savedVoiceFuture = () async {
+      try {
+        return await getSelectedTtsVoice();
+      } catch (e, stackTrace) {
+        debugPrint('VOICE ERROR (apply tts voice): $e\n$stackTrace');
+        return null;
+      }
+    }();
+
+    final results = await Future.wait<dynamic>([awaitCompletionFuture, speechRateFuture, savedVoiceFuture]);
+    final saved = results[2] as TtsVoice?;
+
+    // Applies the technician's saved voice (see VoiceSettingsScreen /
+    // tts_voice_preference.dart) — before any other TTS output can happen,
+    // since [initialize] (the only caller) always awaits this first.
+    //
+    // The saved voice is a name+locale pair, not a position, so it can only
+    // be applied once it's re-confirmed against a LIVE getVoices() result
+    // on THIS device (see [discoverEnUsVoices]): the engine that produced
+    // it may no longer be installed (reinstall, OEM/engine change), in
+    // which case there's nothing meaningful to apply and this falls back
+    // to the device's own default voice rather than calling setVoice with
+    // a name the engine won't recognize.
+    if (saved == null) {
+      debugPrint('VOICE TTS: no saved voice preference — using device default voice');
+      return;
+    }
+    try {
+      final voices = await discoverEnUsVoices();
+      if (voices.contains(saved)) {
+        await _tts.setVoice({'name': saved.name, 'locale': saved.locale});
+        debugPrint('VOICE TTS: active voice set to "${saved.name}" (${saved.locale})');
+      } else {
+        debugPrint(
+          'VOICE TTS: saved voice "${saved.name}" (${saved.locale}) no longer exists on this '
+          'device — falling back to device default voice',
+        );
+      }
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (apply tts voice): $e\n$stackTrace');
+    }
+  }
+
+  /// Live, per-device voice discovery — calls flutter_tts's `getVoices()`
+  /// on THIS device (Android, iOS, and macOS all support it) and filters to
+  /// locale "en-US". Real voice names/codes differ completely by platform,
+  /// OS version, and installed TTS engine, so this is called fresh every
+  /// time a real answer is needed (Voice Settings opening, and
+  /// [_configureTts] on every app startup) rather than cached from a fixed
+  /// list. Returns an empty list — never throws — if the platform call
+  /// fails or returns something unexpected, so callers can treat "no
+  /// voices" as a normal, handleable state instead of a crash.
+  Future<List<TtsVoice>> discoverEnUsVoices() async {
+    try {
+      final raw = await _tts.getVoices;
+      if (raw is! List) {
+        debugPrint('VOICE TTS: getVoices() returned unexpected shape: $raw');
+        return const [];
+      }
+      final seen = <TtsVoice>{};
+      final voices = <TtsVoice>[];
+      for (final entry in raw) {
+        if (entry is! Map) continue;
+        final name = entry['name']?.toString();
+        final locale = entry['locale']?.toString();
+        if (name == null || locale == null) continue;
+        if (locale.toLowerCase() != 'en-us') continue;
+        final voice = TtsVoice(name: name, locale: locale);
+        // Some engines report duplicate entries for the same voice.
+        if (seen.add(voice)) voices.add(voice);
+      }
+      debugPrint('VOICE TTS: discovered ${voices.length} en-US voice(s) on this device');
+      return voices;
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (discover voices): $e\n$stackTrace');
+      return const [];
+    }
+  }
+
+  /// Speaks the Voice Settings sample sentence with a specific candidate
+  /// voice, on the SAME shared `_tts` instance the rest of the app uses
+  /// (see this class's doc comment: ONE FlutterTts for the whole app), so
+  /// what's heard while previewing matches real app playback exactly. Does
+  /// NOT persist [name] as the active voice — see [setActiveVoice] for that
+  /// (tapping a row, as opposed to its Play button).
+  Future<void> previewVoice({required String name, required String locale, required String sampleText}) async {
+    try {
+      await _tts.setVoice({'name': name, 'locale': locale});
+      await _tts.speak(sampleText);
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (preview voice): $e\n$stackTrace');
+    }
+  }
+
+  /// Voice Settings' row-tap handler: persists [name] as the technician's
+  /// chosen voice (see `tts_voice_preference.dart`) and applies it to the
+  /// shared `_tts` instance immediately, so the change is audible right
+  /// away without an app restart. Loaded again on every future launch by
+  /// [_configureTts].
+  Future<void> setActiveVoice({required String name, required String locale}) async {
+    await saveSelectedTtsVoice(TtsVoice(name: name, locale: locale));
+    try {
+      await _tts.setVoice({'name': name, 'locale': locale});
+      debugPrint('VOICE TTS: active voice changed to "$name" ($locale)');
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (set active voice): $e\n$stackTrace');
+    }
+  }
+
+  /// Marks a real network/database write as in progress with no mic open —
+  /// the same `processing` phase [_dispatchCommand] sets before running a
+  /// handler, and [_armDictationSettleTimer] re-sets once dictation capture
+  /// ends. Exposed here for handlers in `job_voice_commands.dart` that need
+  /// to re-assert it themselves: once a handler has already been through a
+  /// [captureConfirmation] (which sets `listening` while the mic is open —
+  /// see that method), phase is left at `listening` even after the mic
+  /// closes, so a save call made right after (e.g. `insertJobDictation`,
+  /// `createChangeOrder`, `markComplete`) would otherwise run with phase
+  /// still reading `listening`. Call this right when such a write begins;
+  /// it stays `processing` until the handler's own `speak()` call (e.g. "X
+  /// saved") takes over.
+  void markProcessing() {
+    if (mounted) state = state.copyWith(phase: VoicePhase.processing);
   }
 
   /// Speaks arbitrary text through the single shared TTS instance. Every
@@ -1358,55 +2063,582 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// concurrently instead of the action's completion waiting on TTS
   /// playback. Errors are caught here (not left to the caller) precisely
   /// because callers are expected to fire-and-forget this.
+  ///
+  /// Callers that DO await this (e.g. `handleDictationCommand`'s prompt,
+  /// right before [captureDictation]) can now rely on the returned Future
+  /// only resolving once playback has genuinely finished — see
+  /// [_configureTts].
   Future<void> speak(String text) async {
     _logLatency('spoken-confirmation-started');
-    debugPrint('VOICE: speaking "$text"');
+    final startedAt = DateTime.now();
+    debugPrint('VOICE TTS: playback starting: "$text"');
+    // Set synchronously, before the first `await` below, so this lands even
+    // when a caller fires this off with `unawaited(speak(...))` instead of
+    // awaiting it (see FIX 3 above) — Dart runs an async function's body
+    // synchronously up to its first `await`, so the phase flips to
+    // `speaking` immediately on call, not on some later microtask.
+    if (mounted) state = state.copyWith(phase: VoicePhase.speaking);
     try {
+      // `awaitSpeakCompletion(true)` (see [_configureTts]) is what makes this
+      // resolve only once playback has genuinely finished — relying on that
+      // real completion signal here too, not a fixed delay, is what lets the
+      // reset below reflect actual playback end.
       await _tts.speak(text);
+      final elapsedMs = DateTime.now().difference(startedAt).inMilliseconds;
+      debugPrint('VOICE TTS: playback completion reported after ${elapsedMs}ms: "$text"');
     } catch (e, stackTrace) {
       debugPrint('VOICE ERROR (speak): $e\n$stackTrace');
     }
+    // Back to the neutral resting state — whatever comes next (a wake-word
+    // restart, captureDictation, captureConfirmation, ...) sets `listening`
+    // or `processing` itself the moment a real capture session actually
+    // starts, so there's no need to guess that here.
+    if (mounted) state = state.copyWith(phase: VoicePhase.idle);
   }
 
-  /// One-shot free-text capture — prompts nothing itself (the caller speaks
-  /// its own prompt first), just listens once and returns whatever was
-  /// said. Used by the "site condition" command handler.
-  Future<String> captureFreeText({
-    Duration listenFor = const Duration(seconds: 15),
-    Duration pauseFor = const Duration(seconds: 4),
-  }) async {
+  /// Continuous multi-sentence dictation capture — used behind
+  /// `prepare_estimate` and `site_condition` (see `job_voice_commands.dart`)
+  /// for capturing a whole spoken estimate description or site note
+  /// verbatim, as opposed to a short command phrase.
+  ///
+  /// This reopens the mic across as many native sessions as it takes, the same way
+  /// command capture does (see [_reopenListenForCommand]/
+  /// [_onSessionResult]): Android can end a session on its own well before
+  /// the technician is actually done talking, and only real silence — no
+  /// new speech for [_activeDictationSettleWindow] ([_dictationSettleWindow]
+  /// by default, 3.5s; shorter for `ask_question` — see [settleWindow]
+  /// below), tracked on the app's own clock — is allowed to end the
+  /// capture. The transcript returned is
+  /// exactly what the recognizer produced, banked verbatim across reopens
+  /// with no correction or reformatting (see [_joinCommandParts]) — callers
+  /// must not alter it either, per the app's single-verbatim-capture rule.
+  ///
+  /// Callers are expected to have already spoken their own prompt and
+  /// awaited it (see [speak]/[_configureTts]) — this then adds its own
+  /// post-prompt safety buffer on top before opening the mic.
+  ///
+  /// [settleWindow] lets a specific caller override
+  /// [_dictationSettleWindow] — currently only [handleAskQuestionCommand]
+  /// does, passing [askQuestionSettleWindow]; every other caller omits it
+  /// and gets the 3.5s default. [handlerTag] is purely for the debugPrint
+  /// below identifying which flow's settle window is in effect.
+  Future<String> captureDictation({Duration? settleWindow, String handlerTag = 'dictation'}) async {
     if (!mounted) return '';
-    debugPrint('VOICE: listening for free-text capture...');
-    _stage = _ListenStage.freeCapture;
-    _commandHandled = false;
-    final completer = Completer<String>();
-    _freeCaptureCompleter = completer;
+    _activeDictationSettleWindow = settleWindow ?? _dictationSettleWindow;
+    debugPrint(
+      'VOICE: entering dictation-capture mode ("$handlerTag") — settle window = '
+      '${_activeDictationSettleWindow.inMilliseconds}ms',
+    );
+    // CONFIRMED gap (real log evidence, ask_question flow) — this phase
+    // flip used to happen AFTER the post-prompt buffer below, which left
+    // `phase` sitting at whatever speak() reset it to (`idle`) for the
+    // buffer's whole duration: a visible drop-out-and-back-in blip on the
+    // full-screen overlay between the prompt finishing (`speaking`) and
+    // the mic actually opening (`listening`). Setting `listening` here,
+    // before the buffer, makes that transition direct — speaking straight
+    // to listening, no idle gap — while the buffer itself is untouched
+    // and still fully elapses before the mic opens (see BUG FIX below).
     state = state.copyWith(transcript: '', phase: VoicePhase.listening);
+    // BUG FIX (prompt/mic race) — even with speak()'s Future now genuinely
+    // waiting for TTS playback completion (see _configureTts), the device
+    // speaker can still have a brief residual audio tail/echo bleeding
+    // into the microphone right as playback ends. This buffer is on top
+    // of, not instead of, that fix.
+    debugPrint(
+      'VOICE TTS: post-prompt safety buffer — waiting ${_dictationPostPromptBuffer.inMilliseconds}ms '
+      'after prompt playback completion before opening the mic (covers speaker/mic echo tail)',
+    );
+    await Future.delayed(_dictationPostPromptBuffer);
+    if (!mounted) return '';
+    _stage = _ListenStage.dictation;
+    _commandHandled = false;
+    _dictationBankedText = '';
+    _dictationPendingText = '';
+    final completer = Completer<String>();
+    _dictationCompleter = completer;
+    debugPrint('VOICE: dictation capture started, listening now (buffer elapsed)...');
+    debugPrint(
+      'VOICE: dictation listen() params: pauseFor=${_dictationNativePauseFor.inSeconds}s '
+      'listenFor=${_dictationMaxDuration.inSeconds}s (session should stay open across normal '
+      'mid-sentence pauses; settle window ("$handlerTag")=${_activeDictationSettleWindow.inMilliseconds}ms '
+      "on the app's own clock is what actually decides the dictation is finished)",
+    );
     await _ensureStoppedThenListen(
-      onResult: _onFreeCaptureResult,
+      onResult: _onDictationResult,
       options: SpeechListenOptions(
         partialResults: true,
         cancelOnError: false,
-        pauseFor: pauseFor,
-        listenFor: listenFor,
+        listenFor: _dictationMaxDuration,
+        pauseFor: _dictationNativePauseFor,
       ),
     );
-    final note = await completer.future;
-    debugPrint('VOICE: free-text capture result: "$note"');
-    return note;
+    final transcript = await completer.future;
+    debugPrint('VOICE: dictation transcript finalized: "$transcript"');
+    return transcript;
   }
 
-  void _onFreeCaptureResult(SpeechRecognitionResult result) {
-    if (!result.finalResult || _commandHandled || !mounted) return;
+  void _onDictationResult(SpeechRecognitionResult result) {
+    // Same defensive wrapping as _onSessionResult — the plugin calls this
+    // directly with no try/catch of its own.
+    try {
+      // FIX 3 (dictation diagnostics) — logs EVERY onResult callback this
+      // handler ever receives during dictation mode, partial or final, even
+      // an empty one, and BEFORE any of the early-return guards below can
+      // discard it. Needed to tell apart, in the log, "genuinely zero audio
+      // was ever recognized" (this line never appears at all) from "words
+      // were recognized but then lost/overwritten before being saved" (this
+      // line shows real words, but a later log line shows them discarded —
+      // e.g. the stray-callback guard below, or a reopen that didn't bank
+      // them). Without this, both looked identical: an empty final banked
+      // transcript.
+      debugPrint(
+        'VOICE DICTATION: ${result.finalResult ? "final" : "partial"} result received: '
+        "'${result.recognizedWords}'",
+      );
+      if (!mounted || _commandHandled) return;
+      // FIX 1 (dictation-mode leak) — THE actual fix. This handler stays
+      // bound to whatever native session captureDictation()/
+      // _reopenListenForDictation() last opened until the plugin's next
+      // listen() call replaces it — but that OLD session isn't guaranteed
+      // to be torn down the instant _finishDictationCapture decides (on
+      // the app's own clock) that the dictation is done. _startListening
+      // resets _commandHandled to false early in its own restart sequence,
+      // before the old session's stop is genuinely confirmed (see
+      // _ensureStoppedThenListen) — in that gap, a stray callback from the
+      // dying dictation session used to still pass the _commandHandled
+      // check above and get processed as if it were live dictation input,
+      // even though the app had already moved on to wake-word mode. Real
+      // logs confirmed this: stray/background audio getting armed on
+      // _dictationSettleTimer and finalized as a phantom transcript
+      // ("1955") well into what should have been a clean baseline
+      // wake-word session. Checking _stage here — the actual flag that
+      // says which mode is currently active — closes that gap: a callback
+      // arriving after the mode has moved on is simply ignored.
+      if (_stage != _ListenStage.dictation) {
+        _voiceLog(
+          'stray dictation-session callback ignored — current mode is $_stage, not dictation '
+          '(words="${result.recognizedWords}")',
+        );
+        return;
+      }
+      _dictationPendingText = _joinCommandParts(_dictationBankedText, result.recognizedWords.trim());
+      if (mounted) state = state.copyWith(transcript: _dictationPendingText);
+      _armDictationSettleTimer();
+      // FIX 2 (dictation words lost on restart) — banking now happens
+      // unconditionally inside _reopenListenForDictation itself (see its doc
+      // comment), not only here on a finalResult, so it also covers the
+      // native session ending WITHOUT ever producing one (_onStatus calling
+      // _reopenListenForDictation directly). Still trigger the reopen here
+      // on finalResult so a session that DOES finalize doesn't just sit idle
+      // waiting for _onStatus.
+      if (result.finalResult) {
+        unawaited(_reopenListenForDictation());
+      }
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (_onDictationResult) [session=$_sessionId]: $e\n$stackTrace');
+    }
+  }
+
+  /// (Re)starts the [_activeDictationSettleWindow] countdown — called on
+  /// every new bit of speech heard during dictation capture. Only fires
+  /// [_finishDictationCapture] if nothing new arrives for the whole window,
+  /// i.e. a rolling debounce, not a one-shot timer from the first word.
+  /// Uses [_activeDictationSettleWindow] (set once per [captureDictation]
+  /// call), NOT the [_dictationSettleWindow] default directly, so a
+  /// per-handler override stays in effect across every rearm of the whole
+  /// capture, not just its first pause.
+  void _armDictationSettleTimer() {
+    _dictationSettleTimer?.cancel();
+    _dictationSettleTimer = Timer(_activeDictationSettleWindow, () {
+      _voiceLog(
+        'dictation settle window (${_activeDictationSettleWindow.inMilliseconds}ms) elapsed with no new '
+        'speech, finalizing "$_dictationPendingText"',
+      );
+      // This is the genuine end of mic capture — the settle window (above)
+      // is what actually decided the technician is done talking, not a
+      // forced teardown/error path (see the other _finishDictationCapture
+      // call sites, which pass '' and are already tearing the session down,
+      // not about to make a backend call). From here the caller is about to
+      // parse/send the transcript, so phase stays `processing` — matching
+      // the _dispatchCommand/handler pattern — until speak() takes over.
+      if (mounted) state = state.copyWith(phase: VoicePhase.processing);
+      _finishDictationCapture(_dictationPendingText);
+    });
+  }
+
+  void _cancelDictationSettleTimer() {
+    _dictationSettleTimer?.cancel();
+    _dictationSettleTimer = null;
+  }
+
+  /// Reopens the mic mid-dictation after the native session ended on its
+  /// own before [_dictationSettleTimer] fired — invisible to the
+  /// technician, same as [_reopenListenForCommand] for ordinary commands.
+  ///
+  /// FIX 2 (dictation words lost on restart) — this is the ONE place a
+  /// dictation reopen actually happens (called both from [_onDictationResult]
+  /// on a `finalResult` and directly from [_onStatus] when a native session
+  /// ends WITHOUT ever producing one), so it's the right choke point to bank
+  /// whatever is currently in [_dictationPendingText] — including words that
+  /// only ever arrived as partial results — into [_dictationBankedText]
+  /// before the old session's transcript is abandoned and a fresh one
+  /// starts accumulating from empty again. Previously banking only happened
+  /// on a `finalResult`; a session that ended on the native side (status
+  /// done/notListening) without ever finalizing silently dropped every
+  /// partial word it had captured the instant the next session's first
+  /// partial result overwrote [_dictationPendingText] against the stale
+  /// (unbanked) [_dictationBankedText] — the mechanism behind "13 restart
+  /// cycles, banked stayed empty" even while the technician kept talking.
+  Future<void> _reopenListenForDictation() async {
+    if (!mounted ||
+        state.muted ||
+        !state.available ||
+        _commandHandled ||
+        _stage != _ListenStage.dictation) {
+      return;
+    }
+    if (_dictationPendingText.isNotEmpty &&
+        _dictationPendingText != _dictationBankedText) {
+      _voiceLog(
+        'banking dictation words before reopening (previously banked="$_dictationBankedText", '
+        'now banking="$_dictationPendingText")',
+      );
+      _dictationBankedText = _dictationPendingText;
+    }
+    _voiceLog(
+      'dictation native session ended before settle window elapsed — reopening mic '
+      '(banked="$_dictationBankedText", pauseFor=${_dictationNativePauseFor.inSeconds}s '
+      'listenFor=${_dictationMaxDuration.inSeconds}s)',
+    );
+    await _ensureStoppedThenListen(
+      onResult: _onDictationResult,
+      options: SpeechListenOptions(
+        partialResults: true,
+        cancelOnError: false,
+        listenFor: _dictationMaxDuration,
+        pauseFor: _dictationNativePauseFor,
+      ),
+    );
+  }
+
+  void _finishDictationCapture(String text) {
+    if (_commandHandled) return;
     _commandHandled = true;
-    _completeFreeCapture(result.recognizedWords.trim());
+    _cancelDictationSettleTimer();
+    _stage = _ListenStage.idle;
+    final completer = _dictationCompleter;
+    _dictationCompleter = null;
+    if (completer != null && !completer.isCompleted) completer.complete(text.trim());
   }
 
-  void _completeFreeCapture(String text) {
+  /// FIX 2 — words/phrases this app recognizes as an explicit "yes, save
+  /// it" or "no, discard it" reply to a dictation readback (see
+  /// [captureConfirmation]). Deliberately matched as whole words/phrases
+  /// (not a plain substring check like [_matchWakeWord]) — a bare
+  /// substring check on something as short as "no" risks matching inside
+  /// an unrelated word the recognizer mishears, which would be exactly the
+  /// kind of silent misfire this whole confirm/redo step exists to
+  /// prevent.
+  // "That's right" deliberately matched as a whole PHRASE (not split into
+  // individual words — "that's"/"right" alone are too generic/risky to
+  // treat as standalone confirm words) alongside the existing single-word
+  // set.
+  static const Set<String> _confirmPhrases = {'confirm', 'yes', 'correct', 'yep', 'yeah'};
+  static const Set<String> _confirmMultiWordPhrases = {"that's right", 'thats right'};
+  static const Set<String> _redoPhrases = {'redo', 'no', 'nope', 'wrong', 'cancel'};
+  static const Set<String> _redoMultiWordPhrases = {'try again', 'do it again', 'start over'};
+
+  /// Interprets a captured confirm/redo reply. Returns `true` only for an
+  /// unambiguous affirmative match, `false` for an unambiguous negative
+  /// match, `null` if the reply doesn't clearly match either — callers
+  /// must treat `null` as "ask again" (see [captureConfirmation]), NEVER
+  /// as an implicit yes or no. Every branch logs the exact keyword/phrase
+  /// that decided the outcome (or that nothing matched at all), so a log
+  /// reader never has to guess why an outcome was reached.
+  bool? _matchConfirmationPhrase(String rawText) {
+    final lower = rawText.trim().toLowerCase();
+    if (lower.isEmpty) {
+      debugPrint('VOICE: confirmation phrase match — no match found (empty/silent input)');
+      return null;
+    }
+    for (final phrase in _confirmMultiWordPhrases) {
+      if (lower.contains(phrase)) {
+        debugPrint('VOICE: confirmation phrase match — matched CONFIRM phrase "$phrase"');
+        return true;
+      }
+    }
+    for (final phrase in _redoMultiWordPhrases) {
+      if (lower.contains(phrase)) {
+        debugPrint('VOICE: confirmation phrase match — matched REDO phrase "$phrase"');
+        return false;
+      }
+    }
+    final words = lower.split(RegExp(r'\s+'));
+    for (final word in words) {
+      if (_confirmPhrases.contains(word)) {
+        debugPrint('VOICE: confirmation phrase match — matched CONFIRM keyword "$word"');
+        return true;
+      }
+      if (_redoPhrases.contains(word)) {
+        debugPrint('VOICE: confirmation phrase match — matched REDO keyword "$word"');
+        return false;
+      }
+    }
+    debugPrint('VOICE: confirmation phrase match — no match found in "$rawText"');
+    return null;
+  }
+
+  /// FIX 2 (transcription-error safety net) — after a dictation transcript
+  /// is captured, this reads it back (see `handleDictationCommand`, which
+  /// speaks the full transcript + prompt before calling this) and waits
+  /// for an explicit spoken "confirm"/"redo"-style reply, OR the matching
+  /// on-screen tap (see [submitConfirmationTap] and
+  /// `DictationConfirmationBar`) — whichever comes first. A real
+  /// transcription error motivated this: "two hours labor at one hundred
+  /// fifty dollars an hour" was captured as "to our labour at 10050 per
+  /// hour" and would have been saved as-is with no chance to catch it.
+  ///
+  /// Returns [ConfirmationOutcome.confirmed] ONLY on an unambiguous
+  /// affirmative match. [ConfirmationOutcome.redo] means the technician
+  /// EXPLICITLY said/tapped a negative word — callers keep treating this
+  /// however they already do (e.g. `handleChangeOrderCommand`/
+  /// `handleDictationCommand` silently re-prompt from scratch;
+  /// `_handleJobComplete` stops outright, since an explicit "cancel" there
+  /// must never be treated as "try again"). [ConfirmationOutcome.unclear]
+  /// means [_maxConfirmationAttempts] silent/unrecognized replies were
+  /// exhausted WITHOUT a clear answer either way — this is deliberately a
+  /// third, distinct outcome, not folded into `redo`: it is never the
+  /// technician's real choice, so by the time this returns it has already
+  /// spoken an explicit "let's try again from the start" — callers must
+  /// restart their whole flow from the beginning on `unclear` (not just
+  /// silently re-prompt the same confirm step), and must NEVER treat it as
+  /// an implicit confirm.
+  ///
+  /// FIX (premature redo default) — this used to allow 3 attempts but with
+  /// only a 1200ms silence tolerance per attempt (see
+  /// [_confirmationSettleWindow]'s doc comment for the full bug), so all 3
+  /// could burn through in a few seconds flat, discarding a perfectly good
+  /// dictation before the technician had even started answering. Now: at
+  /// most [_maxConfirmationAttempts] (2) attempts, each with a real ~6s
+  /// silence tolerance, and only the SECOND unclear/silent attempt in a
+  /// row resolves to [ConfirmationOutcome.unclear] — the first gets an
+  /// explicit re-prompt instead.
+  ///
+  /// [transcriptForDisplay] is stored on [GlobalVoiceState.
+  /// pendingConfirmationTranscript] purely for the on-screen tap fallback
+  /// to show what's being confirmed — this method does not speak it
+  /// itself (the caller already did, as part of its own prompt).
+  static const int _maxConfirmationAttempts = 2;
+
+  Future<ConfirmationOutcome> captureConfirmation({required String transcriptForDisplay}) async {
+    // Not `.unclear` here: an unmounted service has nothing left to restart
+    // — this is "give up entirely," the same as an explicit redo/cancel.
+    if (!mounted) return ConfirmationOutcome.redo;
+    state = state.copyWith(pendingConfirmationTranscript: transcriptForDisplay);
+    try {
+      for (var attempt = 1; attempt <= _maxConfirmationAttempts; attempt++) {
+        // The mic is genuinely open and listening for "confirm"/"redo" here
+        // — same as the original question/dictation capture — so this is
+        // `listening`, not `processing`. `processing` is reserved for spans
+        // with no mic open at all (a backend call, a handler doing work).
+        if (mounted) state = state.copyWith(phase: VoicePhase.listening);
+        final raw = await _captureConfirmationAttempt();
+        final outcome = _matchConfirmationPhrase(raw);
+        final heardNothing = raw.trim().isEmpty;
+        debugPrint(
+          'VOICE: confirmation attempt $attempt/$_maxConfirmationAttempts raw="$raw" outcome='
+          '${outcome == null ? (heardNothing ? "SILENCE (no reply heard)" : "UNCLEAR SPEECH") : (outcome ? "CONFIRM" : "REDO")}',
+        );
+        if (outcome != null) {
+          if (outcome) {
+            debugPrint('VOICE: confirmation resolved CONFIRM — unambiguous affirmative match');
+            return ConfirmationOutcome.confirmed;
+          }
+          debugPrint(
+            'VOICE: confirmation resolved REDO — technician explicitly said/tapped redo/cancel '
+            '(not a timeout default)',
+          );
+          return ConfirmationOutcome.redo;
+        }
+        if (attempt < _maxConfirmationAttempts && mounted) {
+          final reprompt = heardNothing
+              ? "I didn't hear you — say confirm to save, or redo to try again."
+              : "Sorry, I didn't catch that — say confirm to save, or redo to try again.";
+          await speak(reprompt);
+        }
+      }
+      debugPrint(
+        'VOICE: confirmation resolved UNCLEAR — exhausted $_maxConfirmationAttempts unclear/silent '
+        'attempts, NOT a real user choice (never defaulting to confirm OR redo on ambiguous input — '
+        'restarting the whole flow instead)',
+      );
+      if (mounted) {
+        await speak("I still didn't catch that — let's try again from the start.");
+      }
+      return ConfirmationOutcome.unclear;
+    } finally {
+      if (mounted) {
+        state = state.copyWith(clearPendingConfirmationTranscript: true);
+      }
+    }
+  }
+
+  Future<String> _captureConfirmationAttempt() async {
+    if (!mounted) return '';
+    // BUG FIX (retry-prompt/mic race) — see _confirmationPostPromptBuffer's
+    // doc comment. This runs for every attempt, not just the first: the
+    // caller's initial prompt (before ever calling captureConfirmation) and
+    // this loop's own retry re-prompt (see captureConfirmation, right
+    // before it loops back here) both finish with `await speak(...)`, so
+    // this buffer belongs here, once, rather than duplicated at every call
+    // site.
+    debugPrint(
+      'VOICE TTS: post-prompt safety buffer — waiting ${_confirmationPostPromptBuffer.inMilliseconds}ms '
+      'after prompt playback completion before opening the mic (covers speaker/mic echo tail)',
+    );
+    await Future.delayed(_confirmationPostPromptBuffer);
+    if (!mounted) return '';
+    _stage = _ListenStage.confirmation;
+    _commandHandled = false;
+    _confirmationBankedText = '';
+    _confirmationPendingText = '';
+    final completer = Completer<String>();
+    _confirmationCompleter = completer;
+    debugPrint(
+      'VOICE: confirmation listen() params: pauseFor=${_confirmationNativePauseFor.inSeconds}s '
+      'listenFor=${_confirmationMaxDuration.inSeconds}s '
+      'silenceTolerance=${_confirmationSettleWindow.inSeconds}s mode=$_stage',
+    );
+    await _ensureStoppedThenListen(
+      onResult: _onConfirmationResult,
+      options: SpeechListenOptions(
+        partialResults: true,
+        cancelOnError: false,
+        listenFor: _confirmationMaxDuration,
+        pauseFor: _confirmationNativePauseFor,
+      ),
+    );
+    // FIX (premature redo default) — armed here too, not only inside
+    // _onConfirmationResult: Android's on-device recognizer never fires
+    // onResult during pure silence (see _confirmationSettleWindow's doc
+    // comment), so a technician who hasn't started responding yet would
+    // otherwise produce zero callbacks and this attempt would just keep
+    // reopening on _confirmationNativePauseFor's floor forever, never
+    // reaching the "unclear, try again" re-prompt at all. Starting the
+    // timer the moment listening actually begins guarantees a bounded,
+    // real silence-tolerance window regardless of whether any callback
+    // ever lands; _onConfirmationResult re-arms (not re-starts) this same
+    // timer the instant real speech does come in, so it never cuts off an
+    // answer that's actually in progress.
+    if (mounted && _stage == _ListenStage.confirmation) {
+      _armConfirmationSettleTimer();
+    }
+    return completer.future;
+  }
+
+  void _onConfirmationResult(SpeechRecognitionResult result) {
+    // Same defensive wrapping as _onSessionResult/_onDictationResult.
+    try {
+      if (!mounted || _commandHandled) return;
+      // FIX 1's guard, applied here too — see _onDictationResult's doc
+      // comment for the full reasoning. A stray callback from an old,
+      // not-yet-torn-down confirmation session must never be processed
+      // once the mode has moved on.
+      if (_stage != _ListenStage.confirmation) {
+        _voiceLog(
+          'stray confirmation-session callback ignored — current mode is $_stage, not confirmation '
+          '(words="${result.recognizedWords}")',
+        );
+        return;
+      }
+      _confirmationPendingText = _joinCommandParts(
+        _confirmationBankedText,
+        result.recognizedWords.trim(),
+      );
+      if (mounted) state = state.copyWith(transcript: _confirmationPendingText);
+      _armConfirmationSettleTimer();
+      if (result.finalResult) {
+        _confirmationBankedText = _confirmationPendingText;
+        unawaited(_reopenListenForConfirmation());
+      }
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (_onConfirmationResult) [session=$_sessionId]: $e\n$stackTrace');
+    }
+  }
+
+  void _armConfirmationSettleTimer() {
+    _confirmationSettleTimer?.cancel();
+    _confirmationSettleTimer = Timer(_confirmationSettleWindow, () {
+      _voiceLog(
+        'confirmation settle window (${_confirmationSettleWindow.inMilliseconds}ms) elapsed with no '
+        'new speech, finalizing "$_confirmationPendingText"',
+      );
+      _finishConfirmationCapture(_confirmationPendingText);
+    });
+  }
+
+  void _cancelConfirmationSettleTimer() {
+    _confirmationSettleTimer?.cancel();
+    _confirmationSettleTimer = null;
+  }
+
+  /// Reopens the mic mid-confirmation-reply after the native session ended
+  /// on its own before [_confirmationSettleTimer] fired — same pattern as
+  /// [_reopenListenForDictation].
+  Future<void> _reopenListenForConfirmation() async {
+    if (!mounted ||
+        state.muted ||
+        !state.available ||
+        _commandHandled ||
+        _stage != _ListenStage.confirmation) {
+      return;
+    }
+    _voiceLog(
+      'confirmation native session ended before settle window elapsed — reopening mic '
+      '(banked="$_confirmationPendingText", pauseFor=${_confirmationNativePauseFor.inSeconds}s '
+      'listenFor=${_confirmationMaxDuration.inSeconds}s)',
+    );
+    await _ensureStoppedThenListen(
+      onResult: _onConfirmationResult,
+      options: SpeechListenOptions(
+        partialResults: true,
+        cancelOnError: false,
+        listenFor: _confirmationMaxDuration,
+        pauseFor: _confirmationNativePauseFor,
+      ),
+    );
+  }
+
+  void _finishConfirmationCapture(String text) {
+    if (_commandHandled) return;
+    _commandHandled = true;
+    _cancelConfirmationSettleTimer();
     _stage = _ListenStage.idle;
-    final completer = _freeCaptureCompleter;
-    _freeCaptureCompleter = null;
-    if (completer != null && !completer.isCompleted) completer.complete(text);
+    final completer = _confirmationCompleter;
+    _confirmationCompleter = null;
+    if (completer != null && !completer.isCompleted) completer.complete(text.trim());
+  }
+
+  /// FIX 2 — on-screen tap fallback for the confirm/redo step (see
+  /// `DictationConfirmationBar`), same fallback principle as every other
+  /// voice command in this app: feeds the literal keyword through the
+  /// exact same [_matchConfirmationPhrase] path a spoken reply would, so
+  /// tap and voice are never two different implementations of "confirm."
+  /// A no-op (logged, not silently ignored) if no confirmation capture is
+  /// currently in progress — e.g. the technician tapped after it already
+  /// resolved some other way.
+  void submitConfirmationTap(bool confirmed) {
+    if (_stage != _ListenStage.confirmation) {
+      debugPrint(
+        'VOICE: submitConfirmationTap($confirmed) ignored — no confirmation capture in '
+        'progress (mode=$_stage)',
+      );
+      return;
+    }
+    debugPrint(
+      'VOICE: confirmation resolved via TAP fallback -> ${confirmed ? "CONFIRM" : "REDO"}',
+    );
+    _finishConfirmationCapture(confirmed ? 'confirm' : 'redo');
   }
 
   /// Tap fallback for chips/buttons (e.g. Voice Assistant's quick actions)
@@ -1447,7 +2679,10 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // no later operation left for the lock to protect this from racing.
     _speech.cancel();
     _tts.stop();
-    _completeFreeCapture('');
+    _cancelDictationSettleTimer();
+    _finishDictationCapture('');
+    _cancelConfirmationSettleTimer();
+    _finishConfirmationCapture('');
     super.dispose();
   }
 }

@@ -1,7 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 /// Status of a job, mirroring the eventual `jobs.status` column.
-enum JobStatus { scheduled, enRoute, onSite, complete, invoiced, paid }
+enum JobStatus { scheduled, enRoute, onSite, complete, invoiced, paid, closed }
 
 extension JobStatusX on JobStatus {
   String get label {
@@ -18,6 +18,8 @@ extension JobStatusX on JobStatus {
         return 'Invoiced';
       case JobStatus.paid:
         return 'Paid';
+      case JobStatus.closed:
+        return 'Closed';
     }
   }
 
@@ -36,6 +38,8 @@ extension JobStatusX on JobStatus {
         return 'invoiced';
       case JobStatus.paid:
         return 'paid';
+      case JobStatus.closed:
+        return 'closed';
     }
   }
 
@@ -54,6 +58,8 @@ extension JobStatusX on JobStatus {
         return JobStatus.invoiced;
       case 'paid':
         return JobStatus.paid;
+      case 'closed':
+        return JobStatus.closed;
       default:
         throw ArgumentError('Unknown jobs.status value: $value');
     }
@@ -80,6 +86,7 @@ class MockJob {
     this.totalPaid,
     this.serviceLat,
     this.serviceLng,
+    this.billableHours,
   });
 
   final String id;
@@ -97,6 +104,12 @@ class MockJob {
   /// skipped in that case (the manual "I've Arrived" button still works).
   final double? serviceLat;
   final double? serviceLng;
+
+  /// Total on-site labor time across every complete arrive-to-depart visit
+  /// pair, computed and saved once the job is marked complete — see
+  /// `JobCompleteActionController.markComplete` / `computeBillableHours`
+  /// (`visit_provider.dart`). `null` until then.
+  final double? billableHours;
 
   /// Running totals for the job's estimate/invoice/payment lifecycle.
   /// `null` means the job hasn't reached that stage yet — use
@@ -157,6 +170,7 @@ class MockJob {
       totalPaid: _parseNullableDouble(map['total_paid'], id, 'total_paid'),
       serviceLat: _parseNullableDouble(map['service_lat'], id, 'service_lat'),
       serviceLng: _parseNullableDouble(map['service_lng'], id, 'service_lng'),
+      billableHours: _parseNullableDouble(map['billable_hours'], id, 'billable_hours'),
     );
   }
 }

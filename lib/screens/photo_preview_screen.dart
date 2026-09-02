@@ -15,6 +15,7 @@ import '../providers/voice_command_registry_provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/error_banner.dart';
 import '../widgets/primary_button.dart';
+import '../widgets/voice_phase_indicator.dart';
 import 'voice_command_registrar_mixin.dart';
 
 const int _maxPhotoBytes = 300 * 1024;
@@ -67,6 +68,13 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
         handler: (_) async {
           final service = ref.read(globalVoiceServiceProvider.notifier);
           await service.speak('Uploading photo');
+          // "Uploading photo" already finished playing, which reset phase
+          // to idle (see GlobalVoiceService.speak) — but a real upload
+          // (compression + uploadPhoto, no mic open) is about to run below,
+          // so re-assert `processing` until the outcome's speak() call
+          // takes over. Same pattern as the three job_voice_commands.dart
+          // fixes.
+          service.markProcessing();
           final outcome = await _confirm();
           switch (outcome) {
             case PhotoConfirmOutcome.uploaded:
@@ -180,6 +188,9 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
           foregroundColor: AppColors.textDark,
           elevation: 0,
           automaticallyImplyLeading: false,
+          actions: const [
+            Padding(padding: EdgeInsets.only(right: 14), child: Center(child: VoicePhaseIndicator())),
+          ],
         ),
         body: SafeArea(
           child: LayoutBuilder(

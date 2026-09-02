@@ -3,12 +3,15 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../providers/auth_provider.dart';
+import '../providers/global_notification_service.dart';
 import '../providers/global_voice_service_provider.dart';
+import '../providers/visit_tracking_service.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
 import '../widgets/tap_scale.dart';
 import 'login_screen.dart';
 import 'permissions_setup_screen.dart';
+import 'voice_settings_screen.dart';
 
 /// Bottom-nav "Profile" tab.
 class ProfileScreen extends ConsumerWidget {
@@ -38,12 +41,27 @@ class ProfileScreen extends ConsumerWidget {
     if (confirmed != true) return;
     if (!context.mounted) return;
 
-    ref.read(authControllerProvider.notifier).logout();
-    ref.read(globalVoiceServiceProvider.notifier).stopForLogout();
+    // Deferred to a post-frame callback rather than called synchronously
+    // here: AuthController.logout() writes authControllerProvider's state
+    // synchronously (before its signOut() network call even completes),
+    // and this screen watches that provider — so calling it in the same
+    // frame the confirmation AlertDialog's Navigator.pop() is still being
+    // processed in rebuilds ProfileScreen out from under the dialog's own
+    // removal, the same class of race that produced a `'_dependents.isEmpty'`
+    // crash in the change-orders void-confirmation dialog
+    // (`change_orders_screen.dart`'s `_showVoidDialog`). Same fix: let the
+    // pop's own frame finish rendering first.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!context.mounted) return;
+      ref.read(authControllerProvider.notifier).logout();
+      ref.read(globalVoiceServiceProvider.notifier).stopForLogout();
+      ref.read(globalNotificationServiceProvider).stopForLogout();
+      ref.read(visitTrackingServiceProvider).stopForLogout();
 
-    Navigator.of(
-      context,
-    ).pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const LoginScreen()), (route) => false);
+      Navigator.of(
+        context,
+      ).pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const LoginScreen()), (route) => false);
+    });
   }
 
   @override
@@ -159,6 +177,16 @@ class ProfileScreen extends ConsumerWidget {
                           subtitle: 'Camera, microphone & location',
                         ),
                       ),
+                      TapScale(
+                        onTap: () => Navigator.of(
+                          context,
+                        ).push(FadeSlidePageRoute(builder: (_) => const VoiceSettingsScreen())),
+                        child: const _SettingsRow(
+                          icon: Icons.record_voice_over_outlined,
+                          label: 'Voice',
+                          subtitle: 'Choose the spoken prompt voice',
+                          ),
+                        ),
                     ],
                   ).animate().fadeIn(delay: 210.ms, duration: 350.ms),
                   const SizedBox(height: 32),

@@ -194,6 +194,50 @@ final locationAskShownProvider = StateProvider<bool>((ref) => false);
 /// on every job opened after they've said "not now" once.
 final locationAlwaysNudgeDismissedProvider = StateProvider<bool>((ref) => false);
 
+/// System notification permission (POST_NOTIFICATIONS on Android 13+; the
+/// alert/sound/badge prompt on iOS) — requested alongside camera/mic/
+/// location in the Permissions Setup flow, via the same `permission_handler`
+/// package as those, so there's one consistent place technicians see every
+/// system prompt rather than a separate ask the first time a notification
+/// would fire. See `local_notifications_service.dart`/
+/// `global_notification_service.dart` for what actually uses this once
+/// granted.
+class NotificationPermissionState {
+  const NotificationPermissionState({this.status = PermissionStatus.denied, this.checked = false});
+
+  final PermissionStatus status;
+  final bool checked;
+
+  bool get granted => status.isGranted;
+
+  NotificationPermissionState copyWith({PermissionStatus? status, bool? checked}) {
+    return NotificationPermissionState(status: status ?? this.status, checked: checked ?? this.checked);
+  }
+}
+
+class NotificationPermissionController extends StateNotifier<NotificationPermissionState> {
+  NotificationPermissionController() : super(const NotificationPermissionState()) {
+    refresh();
+  }
+
+  Future<void> refresh() async {
+    final status = await Permission.notification.status;
+    if (!mounted) return;
+    state = state.copyWith(status: status, checked: true);
+  }
+
+  Future<void> request() async {
+    final result = await Permission.notification.request();
+    if (!mounted) return;
+    state = state.copyWith(status: result);
+  }
+}
+
+final notificationPermissionProvider =
+    StateNotifierProvider<NotificationPermissionController, NotificationPermissionState>(
+      (ref) => NotificationPermissionController(),
+    );
+
 const _permissionsSetupCompleteKey = 'permissions_setup_completed';
 
 /// Whether this device has already been through the one-time upfront

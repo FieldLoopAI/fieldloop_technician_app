@@ -1,11 +1,23 @@
 const { requireTechnician } = require('./shared/auth');
 const { getSecret } = require('./shared/secrets');
-//const fetch = require('node-fetch');
 
 exports.handler = async (event) => {
   try {
     await requireTechnician(event);
-    const deepgramKey = await getSecret('fieldloop/deepgram-api-key');
+
+    const secretRaw = await getSecret('fieldloop/deepgram-credentials');
+
+    // Handles either format: a plain API key string, or a JSON object
+    // like {"apiKey": "..."} — whichever way the secret was actually stored.
+    let deepgramKey;
+    try {
+      const parsed = JSON.parse(secretRaw);
+      deepgramKey = parsed.apiKey || parsed.api_key || parsed.key;
+      if (!deepgramKey) throw new Error('no recognizable key field in parsed secret');
+    } catch {
+      // Not valid JSON — treat the whole secret as the raw key itself.
+      deepgramKey = secretRaw;
+    }
 
     const response = await fetch('https://api.deepgram.com/v1/auth/grant', {
       method: 'POST',

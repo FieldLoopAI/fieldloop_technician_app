@@ -12,6 +12,10 @@
          above to also be present, and on Android 10+ must be granted as a
          separate step after foreground location is already granted. -->
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
+    <!-- Required on Android 13+ (API 33+) to show system notifications for
+         new job assignments and estimate/change order approvals — requested
+         at runtime via permission_handler in the Permissions Setup flow. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application
         android:label="fielloop"
         android:name="${applicationName}"
