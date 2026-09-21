@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -6,7 +8,10 @@ plugins {
 
 android {
     namespace = "com.fieldloop.fielloop"
-    compileSdk = flutter.compileSdkVersion
+    // Pinned to 36 (rather than flutter.compileSdkVersion) — flutter_pcm_sound's
+    // Android dependencies require compileSdk 34+; AAR metadata errors pointed
+    // at 36 as the recommended value.
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -55,4 +60,40 @@ dependencies {
 
 flutter {
     source = "../.."
+}
+
+// Regenerates lib/build_info.dart (build number + build timestamp shown on
+// the login screen — see tool/generate_build_info.dart) before every
+// Android build, so that label always reflects the actual build instead of
+// a value someone forgot to update by hand. `workingDir` is the Flutter
+// project root (two levels up from android/app, matching `source` above),
+// since the script's relative paths (build_number.txt, lib/build_info.dart)
+// assume that as the current directory.
+//
+// CONFIRMED: a bare `commandLine("dart", ...)` fails here with "A problem
+// occurred starting process 'command 'dart''" — Gradle's process launcher
+// on Windows doesn't resolve a `.bat` shim off PATH the way a shell does.
+// Resolved via the SAME `flutter.sdk` property in local.properties the
+// Flutter Gradle plugin itself already relies on, rather than a
+// machine-specific hardcoded path.
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use { localProperties.load(it) }
+}
+val flutterSdkPath = localProperties.getProperty("flutter.sdk")
+val dartExecutable = if (flutterSdkPath != null) {
+    val exeName = if (org.gradle.internal.os.OperatingSystem.current().isWindows) "dart.bat" else "dart"
+    "$flutterSdkPath/bin/$exeName"
+} else {
+    "dart"
+}
+
+tasks.register<Exec>("generateBuildInfo") {
+    workingDir = file("../..")
+    commandLine(dartExecutable, "run", "tool/generate_build_info.dart")
+}
+
+tasks.named("preBuild") {
+    dependsOn("generateBuildInfo")
 }

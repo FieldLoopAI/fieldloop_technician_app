@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../build_info.dart';
 import '../models/mock_technician.dart';
 import '../providers/auth_provider.dart';
 import '../providers/permission_providers.dart';
@@ -316,6 +317,19 @@ class _LoginScreenState extends ConsumerState<LoginScreen> with SingleTickerProv
                     context,
                   ).push(FadeSlidePageRoute(builder: (_) => const CompleteSetupScreen())),
             child: const Text('Have a setup code?'),
+          ),
+        ),
+        const SizedBox(height: 8),
+        // Small, unobtrusive build indicator for anyone doing external
+        // testing to confirm exactly which build they're running — always
+        // visible here since the login screen is the first thing opened.
+        // `kBuildTimestamp`/`kBuildNumber` come from lib/build_info.dart,
+        // regenerated automatically before every Android build (see
+        // tool/generate_build_info.dart), not hand-edited.
+        Center(
+          child: Text(
+            'Build: $kBuildTimestamp · #$kBuildNumber',
+            style: const TextStyle(color: AppColors.neutralGreyLight, fontSize: 11),
           ),
         ),
       ],

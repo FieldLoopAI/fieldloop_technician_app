@@ -9,6 +9,7 @@ import '../providers/visit_tracking_service.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
 import '../widgets/tap_scale.dart';
+import 'gemini_live_test_screen.dart';
 import 'login_screen.dart';
 import 'permissions_setup_screen.dart';
 import 'voice_settings_screen.dart';
@@ -189,6 +190,24 @@ class ProfileScreen extends ConsumerWidget {
                         ),
                     ],
                   ).animate().fadeIn(delay: 210.ms, duration: 350.ms),
+                  const SizedBox(height: 16),
+                  // TEMPORARY debug entry point for the Day-1 Gemini Live
+                  // connectivity proof — not part of the normal job flow.
+                  _InfoCard(
+                    title: 'Debug',
+                    children: [
+                      TapScale(
+                        onTap: () => Navigator.of(
+                          context,
+                        ).push(FadeSlidePageRoute(builder: (_) => const GeminiLiveTestScreen())),
+                        child: const _SettingsRow(
+                          icon: Icons.bug_report_outlined,
+                          label: 'Gemini Live Test',
+                          subtitle: 'Bare WebSocket connectivity proof',
+                        ),
+                      ),
+                    ],
+                  ).animate().fadeIn(delay: 225.ms, duration: 350.ms),
                   const SizedBox(height: 32),
                   OutlinedButton.icon(
                     onPressed: () => _confirmLogout(context, ref),

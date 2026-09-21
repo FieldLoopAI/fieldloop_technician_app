@@ -1,4 +1,5 @@
-﻿import 'dart:math' show pi, sin;
+﻿import 'dart:async';
+import 'dart:math' show pi, sin;
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
@@ -7,11 +8,25 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/global_voice_service_provider.dart';
 import '../theme/app_theme.dart';
 
-/// Full-screen modal voice experience â€” activates for the ENTIRE genuinely
-/// active interaction (listening/processing/speaking; see [_isActive]) and
-/// REPLACES the old per-screen "grow the corner pill in place" animation
-/// entirely (see `VoicePhaseIndicator`, now a plain small pill that never
-/// moves or resizes itself).
+/// Full-screen modal voice experience â€” shown only BRIEFLY, once per Gemini
+/// session (see [_briefSessionIntroDuration]/[GlobalVoiceState.sessionEpoch]),
+/// as a short "here's Gemini" intro right when a session starts, then
+/// auto-shrinks to the small corner indicator for the rest of that session
+/// regardless of how many more times [_isActive]'s phases (listening/
+/// processing/speaking) toggle on and off. REPLACES the old per-screen
+/// "grow the corner pill in place" animation entirely (see
+/// `VoicePhaseIndicator`, now a plain small pill that never moves or resizes
+/// itself, and the one thing left visible for the rest of the session).
+///
+/// CHANGED (was: full-screen for the ENTIRE active interaction, every time)
+/// â€” the technician needs to see and interact with the real app underneath
+/// for essentially the whole session (dictation readbacks, photo capture,
+/// navigating to review a screen, ...), not just the moments a function call
+/// happens to trigger real screen content ([GlobalVoiceState.screenTaskActive]
+/// still independently forces an early shrink for those, same as before â€”
+/// see that field's doc comment). A few seconds of full-screen at the very
+/// start is enough to establish "Gemini is listening now" without blocking
+/// the rest of the conversation.
 ///
 /// A single global instance, wired once at the `MaterialApp.builder` level
 /// (see `app.dart`), same root-Stack pattern as `DictationConfirmationBar`
@@ -21,10 +36,13 @@ import '../theme/app_theme.dart';
 /// a purely additive visual layer in the same root Stack, not a route push.
 ///
 /// Pure observer, same rule as every other piece of this feature: it only
-/// watches `globalVoiceServiceProvider`'s already-published `phase` â€” it
+/// watches `globalVoiceServiceProvider`'s already-published state â€” it
 /// can never delay or block the real voice pipeline, which runs
 /// identically whether or not this is even on screen. It renders nothing
-/// (`SizedBox.shrink()`, no ticker running) whenever fully at rest.
+/// (`SizedBox.shrink()`, no ticker running) whenever fully at rest. The
+/// [Timer] that ends the brief intro window is purely local UI state (when
+/// to animate this widget back to the corner) â€” it never gates or delays
+/// anything the real voice pipeline does.
 ///
 /// IS a real modal while shown: the scrim visually and functionally sits
 /// above the current screen, absorbing taps meant for it â€” but that's a
@@ -52,7 +70,36 @@ class _VoiceInteractionOverlayState extends ConsumerState<VoiceInteractionOverla
   // phone, not a small icon (CONFIRMED too small at 240).
   static const double _largeSize = 300;
 
+  /// How long the full-screen intro stays up once a session starts, before
+  /// auto-shrinking to the corner for the rest of that session (see
+  /// [_armAutoShrinkTimer]) â€” "a few seconds", per the brief-intro spec this
+  /// replaced the old every-time-active behavior with.
+  static const Duration _briefSessionIntroDuration = Duration(seconds: 3);
+
   late final AnimationController _controller;
+
+  /// The [GlobalVoiceState.sessionEpoch] this widget has already accounted
+  /// for â€” a change from this value is what "a new session just started"
+  /// means (see that field's doc comment). Initialized from whatever epoch
+  /// is current on mount so a same-epoch rebuild never mistakes itself for a
+  /// new session.
+  int _lastSeenSessionEpoch = 0;
+
+  /// True once this session's one-time brief full-screen intro has been
+  /// shown and shrunk away â€” by the timer elapsing, OR by
+  /// `screenTaskActive`/an inactive phase cutting it short before the timer
+  /// even fires (see the shrink branch in [_applyVoiceState]). Latches for
+  /// the rest of the session either way: the intro is spent once, it's
+  /// never "refunded" by a later screenTaskActive dip ending. Reset to
+  /// `false` only when [_lastSeenSessionEpoch] changes.
+  bool _hasShownIntroThisSession = false;
+
+  /// Live only while the full-screen intro is up and hasn't yet been cut
+  /// short some other way â€” fires [_briefSessionIntroDuration] after the
+  /// intro first appears and shrinks it to the corner. Purely local UI
+  /// timing; never gates the real voice pipeline (see the class doc
+  /// comment).
+  Timer? _autoShrinkTimer;
 
   /// Genuine active interaction â€” NOT `phase != VoicePhase.idle`.
   /// `VoicePhase.awaitingWakeWord` (the passive, always-on baseline loop
@@ -60,7 +107,7 @@ class _VoiceInteractionOverlayState extends ConsumerState<VoiceInteractionOverla
   /// restarts via an `idle -> awaitingWakeWord` edge after every
   /// interaction â€” a naive `!= idle` check would re-trigger this overlay
   /// the instant each interaction ends. Only these three phases represent
-  /// real, user-visible activity worth going full-screen for.
+  /// real, user-visible activity worth ever going full-screen for.
   static bool _isActive(VoicePhase phase) =>
       phase == VoicePhase.listening || phase == VoicePhase.processing || phase == VoicePhase.speaking;
 
@@ -70,33 +117,112 @@ class _VoiceInteractionOverlayState extends ConsumerState<VoiceInteractionOverla
     _controller = AnimationController(vsync: this, duration: _transitionDuration);
     // Defensive only â€” this is a single app-root instance, so it should
     // never actually mount mid-interaction, but snap straight to the
-    // active state rather than replaying the entry animation just in case.
-    if (_isActive(ref.read(globalVoiceServiceProvider).phase)) {
-      _controller.value = 1;
-    }
+    // right state (full-screen + timer armed, exactly as if [_applyVoiceState]
+    // had just run) rather than replaying the entry animation just in case.
+    final initial = ref.read(globalVoiceServiceProvider);
+    _lastSeenSessionEpoch = initial.sessionEpoch;
+    _applyVoiceState(
+      phase: initial.phase,
+      screenTaskActive: initial.screenTaskActive,
+      sessionEpoch: initial.sessionEpoch,
+      instant: true,
+    );
   }
 
   @override
   void dispose() {
+    _autoShrinkTimer?.cancel();
     _controller.dispose();
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final phase = ref.watch(globalVoiceServiceProvider.select((s) => s.phase));
+  void _armAutoShrinkTimer() {
+    _autoShrinkTimer ??= Timer(_briefSessionIntroDuration, () {
+      if (!mounted) return;
+      debugPrint('VOICE OVERLAY: brief session intro elapsed - shrinking to corner for the rest of the session');
+      _hasShownIntroThisSession = true;
+      _autoShrinkTimer = null;
+      _controller.reverse();
+    });
+  }
 
-    ref.listen<VoicePhase>(globalVoiceServiceProvider.select((s) => s.phase), (previous, next) {
-      final wasActive = previous != null && _isActive(previous);
-      final isActive = _isActive(next);
-      if (!wasActive && isActive) {
-        debugPrint('VOICE OVERLAY: activating full-screen - phase=$next');
-        _controller.forward();
-      } else if (wasActive && !isActive) {
-        debugPrint('VOICE OVERLAY: deactivating - returning to corner');
+  /// The one place that decides whether the full-screen intro should be up
+  /// right now, and reacts to it â€” called both from [initState] (with
+  /// [instant]: true, no timer bookkeeping needed since nothing was showing
+  /// yet) and from [build]'s `ref.listen` (with [instant]: false) whenever
+  /// phase/screenTaskActive/sessionEpoch change.
+  void _applyVoiceState({
+    required VoicePhase phase,
+    required bool screenTaskActive,
+    required int sessionEpoch,
+    required bool instant,
+  }) {
+    if (sessionEpoch != _lastSeenSessionEpoch) {
+      debugPrint('VOICE OVERLAY: new session (epoch $_lastSeenSessionEpoch -> $sessionEpoch) - intro available again');
+      _lastSeenSessionEpoch = sessionEpoch;
+      _hasShownIntroThisSession = false;
+      _autoShrinkTimer?.cancel();
+      _autoShrinkTimer = null;
+    }
+
+    final shouldShowFullScreen = _isActive(phase) && !screenTaskActive && !_hasShownIntroThisSession;
+
+    if (shouldShowFullScreen) {
+      if (_controller.value == 0) {
+        debugPrint('VOICE OVERLAY: activating full-screen (brief session intro) - phase=$phase');
+        if (instant) {
+          _controller.value = 1;
+        } else {
+          _controller.forward();
+        }
+      }
+      _armAutoShrinkTimer();
+      return;
+    }
+
+    // Not showing full-screen (or shouldn't be) — cutting the intro short
+    // (screenTaskActive, or phase went inactive) counts as "spent," exactly
+    // like the timer elapsing, so it never re-expands later this session.
+    if (_autoShrinkTimer != null) {
+      _autoShrinkTimer!.cancel();
+      _autoShrinkTimer = null;
+      _hasShownIntroThisSession = true;
+    }
+    if (_controller.value != 0) {
+      debugPrint(
+        'VOICE OVERLAY: deactivating - returning to corner (phase=$phase, screenTaskActive=$screenTaskActive, '
+        'introAlreadyShown=$_hasShownIntroThisSession)',
+      );
+      if (instant) {
+        _controller.value = 0;
+      } else {
         _controller.reverse();
       }
-    });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final voiceState = ref.watch(
+      globalVoiceServiceProvider.select(
+        (s) => (phase: s.phase, screenTaskActive: s.screenTaskActive, sessionEpoch: s.sessionEpoch),
+      ),
+    );
+    final phase = voiceState.phase;
+
+    ref.listen(
+      globalVoiceServiceProvider.select(
+        (s) => (phase: s.phase, screenTaskActive: s.screenTaskActive, sessionEpoch: s.sessionEpoch),
+      ),
+      (previous, next) {
+        _applyVoiceState(
+          phase: next.phase,
+          screenTaskActive: next.screenTaskActive,
+          sessionEpoch: next.sessionEpoch,
+          instant: false,
+        );
+      },
+    );
 
     return AnimatedBuilder(
       animation: _controller,

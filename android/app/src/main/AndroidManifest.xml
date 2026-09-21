@@ -3,6 +3,25 @@
     <uses-permission android:name="android.permission.CAMERA"/>
     <!-- Hands-free voice commands and job notes. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- Route the mic through a connected Bluetooth headset (e.g. a
+         BlueParrott) during voice capture instead of the phone's built-in
+         mic — confirmed root cause of a reported bug where the headset mic
+         was silently ignored: BLUETOOTH_CONNECT is required on Android
+         12+ (API 31+) to query Bluetooth connection state and request a
+         SCO audio link (AudioManager.startBluetoothSco(), see
+         MainActivity.kt), and its absence was also silently disabling
+         speech_to_text's own built-in Bluetooth routing. Requested at
+         runtime (dangerous permission) the first time voice listening
+         starts if a Bluetooth audio device is detected connected — see
+         GlobalVoiceService._maybeRouteBluetoothSco. BLUETOOTH covers the
+         same need on Android 11 and below, where it's a normal
+         (install-time, no runtime prompt) permission. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+    <!-- Required by AudioManager.setMode()/startBluetoothSco() (see
+         MainActivity.kt's startBluetoothScoAudio) — normal permission,
+         granted automatically at install time, no runtime prompt. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
     <!-- Foreground geofenced arrival/departure detection. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
@@ -19,7 +38,8 @@
     <application
         android:label="fielloop"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:networkSecurityConfig="@xml/network_security_config">
         <activity
             android:name=".MainActivity"
             android:exported="true"

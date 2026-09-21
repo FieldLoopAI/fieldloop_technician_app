@@ -20,6 +20,37 @@ import 'voice_command_registrar_mixin.dart';
 
 const int _maxPhotoBytes = 300 * 1024;
 
+/// Compresses the JPEG at [path] to under [_maxPhotoBytes], lowering
+/// quality iteratively — extracted out of [_PhotoPreviewScreenState] (was
+/// `_compressImage`) so the Gemini function-calling dispatcher's
+/// `capture_photo` handler (`lib/services/gemini_function_dispatcher.dart`)
+/// can reuse the exact same tested compression logic the Confirm button
+/// runs, instead of duplicating it. Behavior unchanged from before this was
+/// pulled out to top-level.
+Future<Uint8List> compressPhotoForUpload(String path) async {
+  var quality = 85;
+  Uint8List? result;
+
+  while (quality >= 30) {
+    final compressed = await FlutterImageCompress.compressWithFile(
+      path,
+      quality: quality,
+      format: CompressFormat.jpeg,
+      autoCorrectionAngle: true,
+    );
+    if (compressed == null) {
+      throw StateError('Image compression returned no data.');
+    }
+    result = compressed;
+    debugPrint('PHOTOS: compressed at quality=$quality -> ${compressed.length} bytes');
+    if (compressed.length <= _maxPhotoBytes) break;
+    quality -= 15;
+  }
+
+  if (result == null) throw StateError('Image compression failed.');
+  return result;
+}
+
 /// Result of [_PhotoPreviewScreenState._confirm], and what this screen pops
 /// with — `null` means "retaken, no outcome." [queuedOffline] is still a
 /// success from the technician's perspective (see [_confirm]): the photo is
@@ -99,30 +130,6 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
     ];
   }
 
-  Future<Uint8List> _compressImage(String path) async {
-    var quality = 85;
-    Uint8List? result;
-
-    while (quality >= 30) {
-      final compressed = await FlutterImageCompress.compressWithFile(
-        path,
-        quality: quality,
-        format: CompressFormat.jpeg,
-        autoCorrectionAngle: true,
-      );
-      if (compressed == null) {
-        throw StateError('Image compression returned no data.');
-      }
-      result = compressed;
-      debugPrint('PHOTOS: compressed at quality=$quality -> ${compressed.length} bytes');
-      if (compressed.length <= _maxPhotoBytes) break;
-      quality -= 15;
-    }
-
-    if (result == null) throw StateError('Image compression failed.');
-    return result;
-  }
-
   Future<PhotoConfirmOutcome> _confirm() async {
     if (_uploading) return PhotoConfirmOutcome.failed;
     setState(() {
@@ -133,7 +140,7 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
     try {
       Uint8List compressed;
       try {
-        compressed = await _compressImage(widget.imagePath);
+        compressed = await compressPhotoForUpload(widget.imagePath);
       } catch (e, stackTrace) {
         debugPrint('PHOTOS ERROR (compression): $e\n$stackTrace');
         rethrow;

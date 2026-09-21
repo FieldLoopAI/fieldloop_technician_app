@@ -1,0 +1,18 @@
+{
+  "name": "get-gemini-token",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.1127.0",
+    "@google/genai": "^2.21.0",
+    "@supabase/supabase-js": "^2.115.0"
+  }
+}

@@ -77,6 +77,7 @@ exports.handler = async (event) => {
     const { data: estimates } = await supabase
       .from('job_estimates').select('*').eq('job_id', jobId).order('created_at', { ascending: false }).limit(1);
     const estimate = estimates[0];
+    if (!estimate) throw new Error('No estimate found for this job');
     const { data: changeOrders } = await supabase.from('change_orders').select('*').eq('job_id', jobId);
     const approved = (changeOrders || []).filter(c => c.status === 'approved' && !c.voided_at);
     const voided = (changeOrders || []).filter(c => c.voided_at);

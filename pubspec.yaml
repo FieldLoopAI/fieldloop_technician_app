@@ -61,10 +61,15 @@ dependencies:
   # Raw PCM microphone audio streaming for the Deepgram command-capture path
   # (speech_to_text, used for on-device wake-word detection, only ever
   # exposes recognized text — never raw audio bytes).
-  record: ^6.2.1
   cached_network_image: ^3.4.1
   flutter_native_splash: ^2.4.8
   flutter_local_notifications: ^22.3.0
+  # Continuous raw PCM16 audio streaming for Gemini Live response playback
+  # (see gemini_live_test_screen.dart) — unlike just_audio/ConcatenatingAudioSource,
+  # it feeds one continuous native audio buffer with no per-chunk track
+  # boundaries, so back-to-back small chunks don't produce audible gaps.
+  flutter_pcm_sound: ^3.3.3
+  flutter_sound: ^9.30.0
 
 dev_dependencies:
   flutter_test:

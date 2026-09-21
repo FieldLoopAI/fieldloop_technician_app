@@ -582,7 +582,7 @@ Future<void> handleAskQuestionCommand({required WidgetRef ref, required String j
 
     final fullName = ref.read(authControllerProvider).value?.fullName.trim() ?? '';
     final firstName = fullName.isNotEmpty ? fullName.split(RegExp(r'\s+')).first : 'there';
-    final greeting = "Hi $firstName, what's your question? How can I help?";
+    final greeting = "Hi $firstName, what's your question?";
 
     debugPrint('VOICE: "ask_question" greeting TTS started for job $jobId: "$greeting"');
     await service.speak(greeting);
@@ -630,40 +630,55 @@ Future<void> _handleTroubleshoot(WidgetRef ref, String jobId, String question) a
     // (confirmation-capture writes) — re-assert `processing` until the
     // resulting speak() below takes over.
     service!.markProcessing();
-    debugPrint('VOICE: troubleshooting Lambda called for job $jobId: "$question"');
-    final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
-    if (accessToken == null) {
-      throw StateError('No active session — please sign in again.');
-    }
-
-    // `jobId` lets the Lambda look up this job's trade_category itself and
-    // route the knowledge-base lookup to the right trade — it no longer
-    // trusts a client-supplied trade/description for that.
-    final response = await http.post(
-      Uri.parse('$apiBaseUrl/voice/troubleshoot'),
-      headers: {'Authorization': 'Bearer $accessToken', 'Content-Type': 'application/json'},
-      body: jsonEncode({'question': question, 'jobId': jobId}),
-    );
-    if (response.statusCode != 200) {
-      throw StateError('Troubleshooting request failed (${response.statusCode}): ${response.body}');
-    }
-
-    // DIAGNOSTIC (0-char answer investigation) — logs exactly what the
-    // Lambda sent back, before any parsing/fallback logic touches it, so a
-    // shape mismatch (wrong field name, nested differently than expected,
-    // etc.) is visible directly instead of inferred from the parsed
-    // result.
-    debugPrint('VOICE TROUBLESHOOT RAW RESPONSE: ${response.body}');
-
-    final decoded = jsonDecode(response.body);
-    final answer = (decoded is Map<String, dynamic> ? decoded['answer'] as String? : null) ??
-        "Sorry, I couldn't find an answer.";
-    debugPrint('VOICE: troubleshooting answer received for job $jobId (${answer.length} chars)');
-    debugPrint('VOICE LOG: question="$question" answer="$answer"');
+    final answer = await fetchTroubleshootingAnswer(question: question, jobId: jobId);
     await service.speak(answer);
     debugPrint('VOICE: troubleshooting answer spoken for job $jobId');
   } catch (e, stackTrace) {
     debugPrint('VOICE ERROR (troubleshoot): $e\n$stackTrace');
     await service?.speak("Sorry, I couldn't reach the troubleshooting assistant.");
   }
+}
+
+/// Calls the `/voice/troubleshoot` Lambda (`backend/functions/ask-
+/// troubleshooting`) and returns its answer — extracted out of
+/// [_handleTroubleshoot] so the Gemini function-calling dispatcher
+/// (`get_kb_answer`, see `lib/services/gemini_function_dispatcher.dart`) can
+/// reuse the exact same tested request shape instead of duplicating it.
+/// Behavior is unchanged from before this was pulled out: same endpoint,
+/// same body shape, same "Sorry, I couldn't find an answer." fallback for a
+/// missing/empty `answer` field, same auth/logging.
+///
+/// [jobId], when given, lets the Lambda look up that job's `trade_category`
+/// and route the knowledge-base lookup to the right trade rather than a
+/// generic search — every existing caller (this file) always sends it, but
+/// it's optional here since the Lambda itself falls back to
+/// 'general_contractor' when it's omitted.
+Future<String> fetchTroubleshootingAnswer({required String question, String? jobId}) async {
+  debugPrint('VOICE: troubleshooting Lambda called for job $jobId: "$question"');
+  final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
+  if (accessToken == null) {
+    throw StateError('No active session — please sign in again.');
+  }
+
+  final response = await http.post(
+    Uri.parse('$apiBaseUrl/voice/troubleshoot'),
+    headers: {'Authorization': 'Bearer $accessToken', 'Content-Type': 'application/json'},
+    body: jsonEncode({'question': question, 'jobId': jobId}),
+  );
+  if (response.statusCode != 200) {
+    throw StateError('Troubleshooting request failed (${response.statusCode}): ${response.body}');
+  }
+
+  // DIAGNOSTIC (0-char answer investigation) — logs exactly what the
+  // Lambda sent back, before any parsing/fallback logic touches it, so a
+  // shape mismatch (wrong field name, nested differently than expected,
+  // etc.) is visible directly instead of inferred from the parsed result.
+  debugPrint('VOICE TROUBLESHOOT RAW RESPONSE: ${response.body}');
+
+  final decoded = jsonDecode(response.body);
+  final answer =
+      (decoded is Map<String, dynamic> ? decoded['answer'] as String? : null) ?? "Sorry, I couldn't find an answer.";
+  debugPrint('VOICE: troubleshooting answer received for job $jobId (${answer.length} chars)');
+  debugPrint('VOICE LOG: question="$question" answer="$answer"');
+  return answer;
 }

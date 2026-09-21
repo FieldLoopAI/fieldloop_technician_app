@@ -238,6 +238,66 @@ final notificationPermissionProvider =
       (ref) => NotificationPermissionController(),
     );
 
+/// Bluetooth (SCO audio routing) permission — deliberately NOT part of the
+/// upfront Permissions Setup flow above, since most technicians don't carry
+/// a Bluetooth headset and asking everyone for it up front would just be
+/// noise. Instead [GlobalVoiceService._maybeRouteBluetoothSco] requests
+/// this lazily, the first time voice listening starts while a Bluetooth
+/// audio device is actually detected connected — this class just gives
+/// that a status/request pattern consistent with the others above.
+class BluetoothPermissionState {
+  const BluetoothPermissionState({this.status = PermissionStatus.denied, this.checked = false});
+
+  final PermissionStatus status;
+  final bool checked;
+
+  bool get granted => status.isGranted;
+
+  BluetoothPermissionState copyWith({PermissionStatus? status, bool? checked}) {
+    return BluetoothPermissionState(status: status ?? this.status, checked: checked ?? this.checked);
+  }
+}
+
+class BluetoothPermissionController extends StateNotifier<BluetoothPermissionState> {
+  BluetoothPermissionController() : super(const BluetoothPermissionState()) {
+    refresh();
+  }
+
+  Future<void> refresh() async {
+    final status = await Permission.bluetoothConnect.status;
+    if (!mounted) return;
+    state = state.copyWith(status: status, checked: true);
+  }
+
+  Future<void> request() async {
+    final result = await Permission.bluetoothConnect.request();
+    if (!mounted) return;
+    state = state.copyWith(status: result);
+  }
+}
+
+final bluetoothPermissionProvider = StateNotifierProvider<BluetoothPermissionController, BluetoothPermissionState>(
+  (ref) => BluetoothPermissionController(),
+);
+
+const _bluetoothPermissionAskedKey = 'bluetooth_permission_asked';
+
+/// Whether [GlobalVoiceService._maybeRouteBluetoothSco] has already
+/// prompted for Bluetooth permission once (regardless of outcome) — so a
+/// technician who denies it isn't re-prompted on every subsequent
+/// listen() restart, or every time they reopen a job. Separate from
+/// [Permission.bluetoothConnect]'s own granted/denied/permanentlyDenied
+/// status: this flag is about "have we asked," not "what did they say."
+Future<bool> hasAskedBluetoothPermission() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_bluetoothPermissionAskedKey) ?? false;
+}
+
+Future<void> markBluetoothPermissionAsked() async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_bluetoothPermissionAskedKey, true);
+}
+
 const _permissionsSetupCompleteKey = 'permissions_setup_completed';
 
 /// Whether this device has already been through the one-time upfront

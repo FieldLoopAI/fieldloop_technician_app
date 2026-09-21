@@ -1,15 +1,21 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../routing/app_navigator_key.dart';
+import '../screens/gemini_live_test_screen.dart';
+import 'currently_viewed_job_provider.dart';
 import 'deepgram_command_capture.dart';
+import 'permission_providers.dart';
 import 'tts_voice_preference.dart';
 import 'voice_command_registry_provider.dart';
 
@@ -83,10 +89,35 @@ class GlobalVoiceState {
     this.available = true,
     this.muted = false,
     this.pendingConfirmationTranscript,
+    this.screenTaskActive = false,
+    this.sessionEpoch = 0,
   });
 
   final VoicePhase phase;
   final String transcript;
+
+  /// Bumped by exactly one place — [GlobalVoiceService.pauseForExternalSession]
+  /// on the genuine (not-already-paused) path — once per Gemini Live session
+  /// actually starting. [VoiceInteractionOverlay] watches this alongside
+  /// [phase]/[screenTaskActive] to tell "a brand new session just started"
+  /// apart from an ordinary within-session phase change (e.g. the idle blip
+  /// [GlobalVoiceService.speak] leaves between a confirmation prompt and the
+  /// listening it starts next): the brief full-screen intro is allowed once
+  /// per bump of this value, never again until it bumps again.
+  final int sessionEpoch;
+
+  /// True while an external session (currently: the ambient Gemini Live
+  /// screen — see [GlobalVoiceService.setScreenTaskActive]) has navigated to
+  /// real, visible screen content that a function call triggered (the live
+  /// camera preview, a captured photo, ...) — as opposed to pure
+  /// conversation with nothing to look at. [VoiceInteractionOverlay] watches
+  /// this alongside [phase]: the full-screen voice animation must not sit on
+  /// top of and hide that real content, so it shrinks to the small corner
+  /// indicator for as long as this is true, exactly as if voice had gone
+  /// idle, even though [phase] itself may still say listening/processing/
+  /// speaking underneath. False the rest of the time — the full-screen
+  /// experience is unaffected for every screen/session that never sets it.
+  final bool screenTaskActive;
 
   /// Whether the on-device speech recognizer reported itself usable.
   /// Distinct from OS microphone permission (see `cameraMicProvider`) — a
@@ -114,6 +145,8 @@ class GlobalVoiceState {
     bool? muted,
     String? pendingConfirmationTranscript,
     bool clearPendingConfirmationTranscript = false,
+    bool? screenTaskActive,
+    int? sessionEpoch,
   }) {
     return GlobalVoiceState(
       phase: phase ?? this.phase,
@@ -123,6 +156,8 @@ class GlobalVoiceState {
       pendingConfirmationTranscript: clearPendingConfirmationTranscript
           ? null
           : (pendingConfirmationTranscript ?? this.pendingConfirmationTranscript),
+      screenTaskActive: screenTaskActive ?? this.screenTaskActive,
+      sessionEpoch: sessionEpoch ?? this.sessionEpoch,
     );
   }
 }
@@ -189,11 +224,28 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// exist in this build. All Deepgram code is left intact and unchanged;
   /// flip this back to `true` once [DeepgramCommandCapture] actually tears
   /// down its in-flight work on cancel/timeout instead of orphaning it.
+  ///
+  /// UNUSED as of the wake-word-triggers-Gemini change (see
+  /// [_triggerGeminiSession]): the wake-word branch in [_onSessionResult]
+  /// no longer calls [_tryDeepgramCommandCapture]/[_fallBackToOnDeviceCapture]
+  /// at all — a Gemini Live session now starts immediately instead of
+  /// capturing/matching a fixed-phrase command. Left in place (not
+  /// deleted) rather than risk a deeper cleanup pass through this file's
+  /// many cross-references for a helper that isn't reachable from anywhere
+  /// else either.
+  // ignore: unused_field
   static const bool _useDeepgramCapture = false;
 
   SpeechToText _speech = SpeechToText();
   final FlutterTts _tts = FlutterTts();
 
+  /// DIAGNOSTIC (Bluetooth-headset-mic-ignored investigation) — native
+  /// (Android-only; see [_logAudioRoute]) channel backing
+  /// [_logAudioRoute]'s `getAudioRouteInfo` call. Handler registered in
+  /// `MainActivity.kt`. Read-only: queries current audio routing state,
+  /// never changes it.
+  static const MethodChannel _audioDiagnosticsChannel =
+      MethodChannel('com.fieldloop.fielloop/audio_diagnostics');
 
   /// Near-miss variants Android's generic on-device recognizer has been
   /// observed producing for the invented brand wake word "FieldLoop" (real
@@ -222,6 +274,14 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// asymmetric-cost tradeoff, but the first one to prune back if false
   /// triggers from it show up in logs.
   static const Set<String> _wakeWordVariants = {
+    // "Loop On" — a second, EQUALLY VALID wake phrase (not a mishearing
+    // variant of "FieldLoop" like everything below it): now that the wake
+    // word starts a Gemini Live session instead of the old fixed-phrase
+    // command flow (see the wake-word-detected branch in
+    // [_onSessionResult]), this is the shorter, natural-sounding trigger
+    // for that. Matched via the exact same plain substring check as every
+    // other variant here — no separate code path.
+    'loop on',
     'field loop',
     'fieldloop',
     'facebook',
@@ -517,6 +577,19 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// [initialize]) happens independently/earlier, so there's no first-job
   /// delay, but Home/History/Profile never trigger the mic.
   bool _jobScopeActive = false;
+
+  /// True while an external system (currently: a Gemini Live session — see
+  /// [pauseForExternalSession]) has claimed the microphone and the
+  /// wake-word loop must not run — checked everywhere [_jobScopeActive] is
+  /// checked before actually starting/restarting a listen() session, so
+  /// this is a genuine pause of the real recognizer session, not just a
+  /// flag that gets ignored. Deliberately separate from [_jobScopeActive]
+  /// itself (rather than reusing enterJobScope/exitJobScope's flag
+  /// directly): pausing must NOT forget "was a job actually open" — a job
+  /// that goes read-only or is exited entirely WHILE paused must stay
+  /// silent on resume too, not have the mic forced back on unconditionally
+  /// (see [resumeAfterExternalSession]).
+  bool _externallyPaused = false;
   bool _wakeDetected = false;
   bool _commandHandled = false;
   String _pendingCommandText = '';
@@ -685,6 +758,29 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// timeout would ever matter in practice.
   static const Duration _stopConfirmationTimeout = Duration(seconds: 2);
 
+  /// Bounded safety net for [speak]'s `await _tts.speak(text)` — NOT the
+  /// normal path. Real playback always resolves via the platform's
+  /// completion callback (`awaitSpeakCompletion(true)`, see
+  /// [_configureTts]); this only fires if that callback genuinely never
+  /// arrives.
+  ///
+  /// CONFIRMED bug (real device logs, `ask_question`'s `no_match`/decline
+  /// path — `job_voice_commands.dart`'s `_handleTroubleshoot`): the
+  /// completion callback occasionally never fires for the short decline
+  /// utterance ("Sorry, that information is not available in the
+  /// Knowledge Base."), leaving `await _tts.speak(text)` — and therefore
+  /// every awaiter chained above it (`_handleTroubleshoot` ->
+  /// `handleAskQuestionCommand` -> `_dispatchCommand` ->
+  /// `_processCommandText`) — hanging forever. [_scheduleWakeWordRestart]
+  /// was never actually missing from either branch: `_handleTroubleshoot`
+  /// speaks a confident KB answer and a decline message through this
+  /// exact same [speak] call, so this fixes both identically rather than
+  /// special-casing one. Sized generously — well above any realistic
+  /// single/multi-sentence troubleshooting answer even at this app's slow
+  /// [ttsSpeechRate] — so genuine playback is never cut off, but low
+  /// enough to recover well within the 60+s silence reported on-device.
+  static const Duration _speakCompletionTimeout = Duration(seconds: 20);
+
   /// Guards against overlapping stale-session recoveries (see
   /// [_recoverFromStaleSession]).
   bool _reinitializing = false;
@@ -823,7 +919,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
         }
       });
       if (!mounted) return;
-      if (state.available && _jobScopeActive && !state.muted) {
+      if (state.available && _jobScopeActive && !state.muted && !_externallyPaused) {
         _voiceLog(
           'resuming wake-word loop on the freshly reinitialized recognizer',
         );
@@ -860,7 +956,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       state = state.copyWith(available: available);
       // Covers the (unusual but possible) case where a job was already
       // opened before this async initialize() resolved.
-      if (available && _jobScopeActive && !state.muted) {
+      if (available && _jobScopeActive && !state.muted && !_externallyPaused) {
         await _startListening(reason: 'initialize');
       }
     } catch (e, stackTrace) {
@@ -893,10 +989,215 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     _cancelRestartDebounce();
     _cancelActiveDeepgramCapture();
     unawaited(_lockedStop('exitJobScope'));
+    unawaited(_stopBluetoothScoIfActive('exitJobScope'));
     _cancelDictationSettleTimer();
     _finishDictationCapture('');
     _cancelConfirmationSettleTimer();
     _finishConfirmationCapture('');
+  }
+
+  /// Genuinely pauses the wake-word loop for an external mic consumer (a
+  /// Gemini Live session — see `GeminiLiveTestScreen._startTest`/
+  /// `_teardown`) — the SAME real teardown [exitJobScope] does (stop the
+  /// actual `_speech` session via [_lockedStop], cancel every pending
+  /// timer/in-flight capture, release Bluetooth SCO), so the microphone is
+  /// genuinely released before the other system claims it, not just
+  /// ignored while still technically listening underneath. Idempotent —
+  /// calling this while already paused is a no-op.
+  ///
+  /// Deliberately does NOT touch [_jobScopeActive] (unlike [exitJobScope]):
+  /// this is a TEMPORARY suspension, not "the job closed" — see
+  /// [resumeAfterExternalSession] for why that distinction is what keeps
+  /// resume from ever incorrectly forcing the mic back on.
+  Future<void> pauseForExternalSession(String reason) async {
+    if (_externallyPaused) return;
+    debugPrint('VOICE: pausing wake-word loop for external session ($reason) — mic will stop listening');
+    _externallyPaused = true;
+    // A genuinely new Gemini session is starting — see [GlobalVoiceState.
+    // sessionEpoch]'s doc comment for why [VoiceInteractionOverlay] needs
+    // this bump distinguished from an ordinary in-session phase change.
+    if (mounted) state = state.copyWith(sessionEpoch: state.sessionEpoch + 1);
+    _stage = _ListenStage.idle;
+    _cancelCommandSettleTimer();
+    _cancelRestartDebounce();
+    _cancelActiveDeepgramCapture();
+    await _lockedStop('pauseForExternalSession:$reason');
+    await _stopBluetoothScoIfActive('pauseForExternalSession:$reason');
+    _cancelDictationSettleTimer();
+    _finishDictationCapture('');
+    _cancelConfirmationSettleTimer();
+    _finishConfirmationCapture('');
+  }
+
+  /// Resumes the wake-word loop after [pauseForExternalSession] — but ONLY
+  /// if it should actually still be running: re-derives that from the
+  /// CURRENT [_jobScopeActive]/`state.available`/`state.muted`, exactly the
+  /// same condition [enterJobScope] itself checks, rather than
+  /// unconditionally forcing `_startListening` again. This matters because
+  /// the paused window is real wall-clock time during which the technician
+  /// could have exited the job entirely, or the job could have gone
+  /// read-only (e.g. `job_complete` dispatched THROUGH the very Gemini
+  /// session this is resuming from) — either of those already called
+  /// [exitJobScope] live while paused, and this must respect that rather
+  /// than clobbering it back on. Idempotent — calling this while not
+  /// paused is a no-op.
+  Future<void> resumeAfterExternalSession(String reason) async {
+    if (!_externallyPaused) return;
+    _externallyPaused = false;
+    debugPrint(
+      'VOICE: resuming after external session ($reason) — '
+      'jobScopeActive=$_jobScopeActive available=${state.available} muted=${state.muted}',
+    );
+    // Clears whatever phase the external session left behind (see
+    // setExternalSessionPhase) BEFORE deciding whether to restart
+    // listening — otherwise a session that ends while e.g. the job has
+    // gone read-only (the early return just below) would leave
+    // VoicePhaseIndicator stuck showing "speaking"/"listening" forever,
+    // since nothing else would ever touch phase again for a screen that's
+    // correctly gone silent. If listening DOES restart, _startListening's
+    // own flow sets phase again almost immediately anyway.
+    if (mounted) state = state.copyWith(phase: VoicePhase.idle, screenTaskActive: false);
+    if (!mounted || !_jobScopeActive || !state.available || state.muted) {
+      debugPrint('VOICE: resumeAfterExternalSession($reason) — not resuming listening, guard condition not met');
+      return;
+    }
+    await _startListening(reason: 'resumeAfterExternalSession:$reason');
+  }
+
+  /// Lets an external session (currently: the ambient Gemini Live screen —
+  /// see `GeminiLiveTestScreen`) drive [VoicePhaseIndicator] (and anything
+  /// else watching `state.phase`) while it, not this recognizer, actually
+  /// owns the microphone — reusing the exact same phase-driven visual
+  /// language (`listening`/`processing`/`speaking`) rather than adding a
+  /// new indicator widget or a new [VoicePhase] value. A no-op outside an
+  /// active [pauseForExternalSession] window, so a stray/late call (e.g.
+  /// racing [resumeAfterExternalSession]) can never leave a wrong phase
+  /// stuck on screen after this recognizer has already resumed.
+  void setExternalSessionPhase(VoicePhase phase) {
+    if (!_externallyPaused || !mounted) return;
+    state = state.copyWith(phase: phase);
+  }
+
+  /// Lets the same external session (the ambient Gemini Live screen) tell
+  /// [VoiceInteractionOverlay] whether it has navigated to real, visible
+  /// screen content that a function call triggered — see [GlobalVoiceState.
+  /// screenTaskActive]'s doc comment for the full contract. Same
+  /// active-external-session-only guard as [setExternalSessionPhase], for
+  /// the same reason: a stray/late call from a session that has already
+  /// resumed FieldLoop must not leave this flag stuck wrong.
+  void setScreenTaskActive(bool active) {
+    if (!_externallyPaused || !mounted) return;
+    state = state.copyWith(screenTaskActive: active);
+  }
+
+  /// Fires the moment the wake word ("FieldLoop"/"Loop On") is heard —
+  /// starts a Gemini Live session for whichever job is currently open
+  /// (`currentlyViewedJobIdProvider`, kept correct underneath Photo
+  /// Capture/Photo Preview/Estimate/Change Orders too, not just Job
+  /// Detail — see that provider's own doc comment) instead of the old
+  /// fixed-phrase command capture this used to kick off.
+  ///
+  /// [pauseForExternalSession] runs FIRST — same real mic release the
+  /// manual/tap-triggered entry point already uses — so there's never a
+  /// window where this recognizer and Gemini's own mic capture could both
+  /// be open. Navigation happens via [rootNavigatorKey] rather than a
+  /// BuildContext: this fires from inside a speech-plugin result callback,
+  /// not a widget's build, so there's no context of its own to navigate
+  /// with — same reasoning `rootNavigatorKey` already exists for (a tapped
+  /// system notification, see that key's doc comment).
+  ///
+  /// `ambient: true` is what makes the screen auto-start immediately, hide
+  /// its debug-only Start/Stop buttons and scrollback log, show the same
+  /// [VoicePhaseIndicator] visual language instead (see
+  /// [setExternalSessionPhase]), and remove itself the moment the session
+  /// ends — the manual "Voice Assistant" tap-fallback button on Job Detail
+  /// pushes the exact same screen WITHOUT `ambient`, keeping its existing
+  /// manual/debug experience unchanged (a normal opaque `Navigator` route,
+  /// pushed/popped the ordinary way).
+  ///
+  /// Inserted via a raw [OverlayEntry] into the root [Navigator]'s own
+  /// [Overlay] — CHANGED TWICE now:
+  ///  1. Originally `MaterialPageRoute`, fully opaque for the session's
+  ///     entire duration.
+  ///  2. Then a non-opaque `PageRouteBuilder` (`TransparentPageRoute`) —
+  ///     CONFIRMED on a real device to still NOT let touches (scrolling,
+  ///     button taps) reach the route underneath, regardless of `opaque:
+  ///     false` or what the pushed screen's own content painted;
+  ///     `Navigator`/`ModalRoute` apparently insulates the current route's
+  ///     input from whatever's behind it regardless of that flag.
+  ///  3. Now: a plain [OverlayEntry], inserted directly into the SAME
+  ///     [Overlay] the root [Navigator] already uses, the exact mechanism
+  ///     [VoiceInteractionOverlay]/`DictationConfirmationBar` already use
+  ///     successfully at the `MaterialApp.builder` level — no `ModalRoute`
+  ///     wrapping at all, so hit-testing is plain `Stack`-style cascading:
+  ///     wherever [GeminiLiveTestScreen]'s own body doesn't paint anything
+  ///     (see `_buildAmbientPureConversationUi`), a touch genuinely falls
+  ///     through to whatever's underneath (Job Detail, or wherever the
+  ///     technician was). [VoiceInteractionOverlay] still draws its
+  ///     dramatic brief full-screen intro ON TOP of everything for the
+  ///     first few seconds, since it's layered even further above (also at
+  ///     the `MaterialApp.builder` level, so above this `OverlayEntry`
+  ///     too) — independent of whichever mechanism holds this screen.
+  ///
+  /// Since there's no route to `push`/`await` the pop of, [sessionEnded]
+  /// (a [Completer]) stands in for that: [GeminiLiveTestScreen.
+  /// onAmbientSessionEnded] removes the entry AND completes it, together,
+  /// exactly once per session — see that field's doc comment.
+  Future<void> _triggerGeminiSession() async {
+    await pauseForExternalSession('wake_word');
+
+    final jobId = _ref.read(currentlyViewedJobIdProvider);
+    if (jobId == null) {
+      debugPrint('VOICE: wake word heard but no job is currently open — nothing to start a Gemini session for');
+      await resumeAfterExternalSession('wake_word_no_job');
+      return;
+    }
+
+    final navigatorState = rootNavigatorKey.currentState;
+    if (navigatorState == null) {
+      debugPrint('VOICE ERROR: rootNavigatorKey has no live NavigatorState — cannot start a Gemini session');
+      await resumeAfterExternalSession('wake_word_no_navigator');
+      return;
+    }
+    // NavigatorState.overlay — NOT Overlay.of(context) — is what actually
+    // gets this Navigator's OWN internal Overlay from here: Overlay.of
+    // searches UP from a given context for an ancestor Overlay, but
+    // rootNavigatorKey.currentContext is the Navigator widget's OWN
+    // context (built by ITS parent), not a context from inside its routed
+    // pages — searching up from there would look at the Navigator's
+    // ancestors (MaterialApp, ...), never its own internally-built Overlay,
+    // which is a DESCENDANT of the Navigator, not an ancestor.
+    final overlay = navigatorState.overlay;
+    if (overlay == null) {
+      debugPrint('VOICE ERROR: no root Overlay available — cannot start a Gemini session');
+      await resumeAfterExternalSession('wake_word_no_overlay');
+      return;
+    }
+
+    debugPrint('VOICE: wake word heard — starting ambient Gemini Live session for job $jobId');
+    final sessionEnded = Completer<void>();
+    late final OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (_) => GeminiLiveTestScreen(
+        jobId: jobId,
+        ambient: true,
+        onAmbientSessionEnded: () {
+          entry.remove();
+          if (!sessionEnded.isCompleted) sessionEnded.complete();
+        },
+      ),
+    );
+    overlay.insert(entry);
+    await sessionEnded.future;
+
+    // Defensive backstop, not the primary resume path: GeminiLiveTestScreen
+    // already calls resumeAfterExternalSession itself from _teardown()
+    // (which dispose() always runs once the OverlayEntry above is removed)
+    // — this is a harmless no-op by the time execution reaches here in the
+    // normal case (see that method's own `if (!_externallyPaused) return`
+    // idempotency guard), and only actually does something if some future
+    // change ever let the entry go away without running _teardown() first.
+    await resumeAfterExternalSession('wake_word_session_returned');
   }
 
   /// Cuts short an in-flight Deepgram capture (see
@@ -922,6 +1223,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     _cancelRestartDebounce();
     _cancelActiveDeepgramCapture();
     await _lockedStop('stopForLogout');
+    await _stopBluetoothScoIfActive('stopForLogout');
     await _withSpeechLock('cancel (stopForLogout)', () => _speech.cancel());
     // A forced cancel() outside the normal stop->confirm->settle flow —
     // don't leave a future listen() waiting on a confirmation this cancel
@@ -945,6 +1247,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       _cancelRestartDebounce();
       _cancelActiveDeepgramCapture();
       await _lockedStop('setMuted');
+      await _stopBluetoothScoIfActive('setMuted');
     } else if (state.available && _jobScopeActive) {
       await _startListening(reason: 'unmuted');
     }
@@ -1312,6 +1615,10 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// running.
   void _scheduleWakeWordRestart(_RestartCause cause) {
     if (!mounted || state.muted) return;
+    if (_externallyPaused) {
+      _voiceLog('restart SUPPRESSED — cause=${cause.name} (externally paused, e.g. a Gemini Live session)');
+      return;
+    }
     _voiceLog('restart TRIGGERED — cause=${cause.name}');
     _stage = _ListenStage.idle;
     _cancelCommandSettleTimer();
@@ -1329,7 +1636,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       _restartDebounceTimer = null;
       final firedCause = _pendingRestartCause;
       _pendingRestartCause = null;
-      if (!mounted || state.muted || !state.available || !_jobScopeActive)
+      if (!mounted || state.muted || !state.available || !_jobScopeActive || _externallyPaused)
         return;
       _voiceLog(
         'debounce window elapsed — running the single collapsed restart now for '
@@ -1339,6 +1646,140 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
         _startListening(reason: 'scheduledRestart:${firedCause?.name}'),
       );
     });
+  }
+
+  /// DIAGNOSTIC (Bluetooth-headset-mic-ignored investigation) — reads
+  /// current audio routing state via [_audioDiagnosticsChannel]
+  /// (`MainActivity.kt`'s `getAudioRouteInfo`, Android only) and logs it.
+  /// Does not change routing itself (see [_maybeRouteBluetoothSco] for the
+  /// actual fix) and never throws — a failed/missing platform call (e.g.
+  /// iOS, where no handler is registered) is itself logged rather than
+  /// surfacing as an unhandled exception.
+  ///
+  /// `bluetooth_connected` can still come back `null` — logged as such,
+  /// not coerced to `false` — if the native side hits a `SecurityException`
+  /// querying `BluetoothAdapter` despite `BLUETOOTH_CONNECT` now being
+  /// declared/requested (e.g. the technician denied it): that's a real
+  /// "couldn't determine," not a confirmed "not connected." See
+  /// `MainActivity.kt`'s `getAudioRouteInfo` doc comment for the full
+  /// picture.
+  Future<void> _logAudioRoute(String reason) async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      final result = await _audioDiagnosticsChannel.invokeMethod<Map<Object?, Object?>>(
+        'getAudioRouteInfo',
+      );
+      debugPrint(
+        'AUDIO ROUTE: bluetooth_connected=${result?['bluetoothConnected']} '
+        'bluetooth_sco_active=${result?['bluetoothScoActive']} '
+        'input_device=${result?['inputDevice']} (reason=$reason)',
+      );
+    } catch (e, stackTrace) {
+      debugPrint('AUDIO ROUTE: failed to query audio route info (reason=$reason): $e\n$stackTrace');
+    }
+  }
+
+  /// FIX (Bluetooth-headset-mic-ignored bug) — set once
+  /// [_maybeRouteBluetoothSco] has actually requested (and, per its own
+  /// await, settled — connected or given up) a Bluetooth SCO audio link
+  /// for the CURRENT job-scope voice session. Guards against re-requesting
+  /// SCO on every one of [_startListening]'s frequent internal restarts
+  /// (wake-word timeout, `livenessStaleReinit`, `unmuted`, ...) — SCO,
+  /// once up, should stay up for the whole session, not be torn down and
+  /// re-established on every cycle (each request costs a real,
+  /// user-visible delay — see [_maybeRouteBluetoothSco]'s doc comment).
+  /// Reset to `false` by [_stopBluetoothScoIfActive], called from whichever
+  /// teardown path (`exitJobScope`/`setMuted(true)`/`stopForLogout`) ends
+  /// the session for real.
+  bool _bluetoothScoActive = false;
+
+  /// FIX (Bluetooth-headset-mic-ignored bug) — the actual routing fix,
+  /// confirmed necessary via a real `SecurityException` in testing:
+  /// Android does not automatically route mic input through a connected
+  /// Bluetooth headset just because it's connected. An app must explicitly
+  /// open a Bluetooth SCO (voice) audio link via
+  /// `AudioManager.startBluetoothSco()`/`setBluetoothScoOn(true)` (see
+  /// `MainActivity.kt`'s `startBluetoothScoAudio`) before the mic opens,
+  /// or the platform falls back to the built-in mic regardless of what's
+  /// connected — exactly the reported bug.
+  ///
+  /// Called from [_startListening], AWAITED before the native listen()
+  /// session below opens the mic (unlike [_logAudioRoute], which is
+  /// read-only telemetry and safe to fire-and-forget) — the whole point is
+  /// for the headset mic to already be the active route by the time
+  /// capture starts, not to race it. Only actually does anything once per
+  /// job-scope session (see [_bluetoothScoActive]); every other call this
+  /// session is a fast no-op.
+  ///
+  /// Requests `BLUETOOTH_CONNECT` at runtime — lazily, not as part of the
+  /// upfront Permissions Setup flow — the first time this runs while a
+  /// Bluetooth audio device is actually detected connected (checked via
+  /// [_audioDiagnosticsChannel]'s `isBluetoothAudioDevicePresent`, which
+  /// needs no Bluetooth permission itself: it reads the audio-framework
+  /// device list, not `BluetoothAdapter`). [hasAskedBluetoothPermission]/
+  /// [markBluetoothPermissionAsked] (`permission_providers.dart`) make
+  /// that ask a genuine one-time thing — a technician who denies it isn't
+  /// re-prompted on every subsequent job or listen() restart.
+  Future<void> _maybeRouteBluetoothSco(String reason) async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    if (_bluetoothScoActive) return;
+    try {
+      final devicePresent =
+          await _audioDiagnosticsChannel.invokeMethod<bool>('isBluetoothAudioDevicePresent') ?? false;
+      if (!devicePresent) {
+        _voiceLog('bluetooth SCO: no bluetooth audio device present, skipping (reason=$reason)');
+        return;
+      }
+      var permissionStatus = _ref.read(bluetoothPermissionProvider).status;
+      if (!permissionStatus.isGranted) {
+        if (await hasAskedBluetoothPermission()) {
+          _voiceLog(
+            'bluetooth SCO: bluetooth device present but permission not granted '
+            '(status=$permissionStatus) and already asked once before — not re-prompting '
+            '(reason=$reason)',
+          );
+          return;
+        }
+        _voiceLog(
+          'bluetooth SCO: bluetooth audio device present, requesting BLUETOOTH_CONNECT '
+          '(reason=$reason)',
+        );
+        await _ref.read(bluetoothPermissionProvider.notifier).request();
+        await markBluetoothPermissionAsked();
+        permissionStatus = _ref.read(bluetoothPermissionProvider).status;
+        if (!permissionStatus.isGranted) {
+          _voiceLog(
+            'bluetooth SCO: permission denied (status=$permissionStatus) — continuing on '
+            'the built-in mic (reason=$reason)',
+          );
+          return;
+        }
+      }
+      _voiceLog('bluetooth SCO: requesting SCO audio routing (reason=$reason)');
+      final started = await _audioDiagnosticsChannel.invokeMethod<bool>('startBluetoothScoAudio') ?? false;
+      _bluetoothScoActive = started;
+      _voiceLog('bluetooth SCO: startBluetoothScoAudio() returned started=$started (reason=$reason)');
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (bluetooth SCO routing) reason=$reason: $e\n$stackTrace');
+    }
+  }
+
+  /// Counterpart to [_maybeRouteBluetoothSco] — tears down the Bluetooth
+  /// SCO link when the whole job-scope voice session actually ends
+  /// (`exitJobScope`/`setMuted(true)`/`stopForLogout`), not on every
+  /// individual [_startListening] restart within a session (see
+  /// [_bluetoothScoActive]). A no-op if SCO was never actually started
+  /// this session.
+  Future<void> _stopBluetoothScoIfActive(String reason) async {
+    if (!_bluetoothScoActive) return;
+    _bluetoothScoActive = false;
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      final stopped = await _audioDiagnosticsChannel.invokeMethod<bool>('stopBluetoothScoAudio') ?? false;
+      _voiceLog('bluetooth SCO: stopBluetoothScoAudio() returned stopped=$stopped (reason=$reason)');
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (bluetooth SCO teardown) reason=$reason: $e\n$stackTrace');
+    }
   }
 
   /// Starts the listen() session that detects the wake word (FIX 1).
@@ -1352,13 +1793,27 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   Future<void> _startListening({required String reason}) async {
     _voiceLog(
       '_startListening() called — reason=$reason (mounted=$mounted muted=${state.muted} '
-      'available=${state.available} jobScopeActive=$_jobScopeActive)',
+      'available=${state.available} jobScopeActive=$_jobScopeActive externallyPaused=$_externallyPaused)',
     );
-    if (!mounted || state.muted || !state.available || !_jobScopeActive) {
+    if (!mounted || state.muted || !state.available || !_jobScopeActive || _externallyPaused) {
       _voiceLog('_startListening() returning early — guard condition not met');
       return;
     }
     _voiceLog('listening (single session: wake word + command)...');
+    // FIX (Bluetooth-headset-mic-ignored bug) — route audio through a
+    // connected Bluetooth headset's SCO link, if present, BEFORE the
+    // native listen() session below opens the mic (awaited, on purpose —
+    // see _maybeRouteBluetoothSco's doc comment for why this can't be
+    // fire-and-forget the way the diagnostic log is).
+    await _maybeRouteBluetoothSco(reason);
+    // DIAGNOSTIC (Bluetooth-headset-mic-ignored investigation) — logged
+    // right before the native listen() session actually opens the mic, and
+    // AFTER the SCO routing above has had its chance to take effect, so
+    // this reflects the route the mic is actually about to use. Awaited
+    // (unlike a truly fire-and-forget log) since it's a single fast
+    // platform-channel round trip on top of the routing wait already just
+    // paid above — negligible added delay for a much more trustworthy log.
+    await _logAudioRoute(reason);
     _stage = _ListenStage.active;
     _viaOnDeviceFallback = false;
     _wakeDetected = false;
@@ -1480,34 +1935,27 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
           "wake word matched via variant '${matched.variant}' in \"$words\"",
         );
         _bankedCommandText = '';
-        // Kept even though Deepgram capture (below) starts its own,
-        // separate transcript stream: if Deepgram fails and
-        // _fallBackToOnDeviceCapture resumes on-device recognition, this is
-        // exactly the "already heard so far" state _reopenListenForCommand
-        // expects, same as before.
         _pendingCommandText = words.substring(matched.end).trim();
         _onWakeWordDetected(); // FIX 2: instant haptic + tone, fire-and-forget
         // The wake word itself was heard during `awaitingWakeWord` — this
         // is the edge into genuine active capture (see VoicePhase's doc
-        // comment), so this is the one place that transitions to
-        // `listening` for the post-wake-word command phrase, same as
-        // `captureDictation`/`captureConfirmation` do for their own modes.
+        // comment). `processing`, not `listening`: unlike the old
+        // fixed-phrase flow (which listened for the rest of the command on
+        // THIS recognizer), a Gemini session is about to take over the mic
+        // entirely — see [_triggerGeminiSession] — so there's nothing for
+        // this recognizer to actively listen for right now, just a brief
+        // handoff in progress.
         if (mounted) {
-          state = state.copyWith(transcript: _pendingCommandText, phase: VoicePhase.listening);
+          state = state.copyWith(transcript: _pendingCommandText, phase: VoicePhase.processing);
         }
         _logLatency('wake-word-detected');
-        // Command CAPTURE (not detection — the wake word itself always
-        // stays on-device) now switches to Deepgram; see
-        // _tryDeepgramCommandCapture for the on-device continuation this
-        // used to do inline here, which only still runs as its fallback.
-        if (_useDeepgramCapture) {
-          unawaited(_tryDeepgramCommandCapture());
-        } else {
-          debugPrint(
-            'VOICE: Deepgram capture disabled via flag, going straight to on-device fallback.',
-          );
-          unawaited(_fallBackToOnDeviceCapture());
-        }
+        // Starts a Gemini Live session instead of the old fixed-phrase
+        // command capture (matching a registered VoiceCommand and running
+        // its job_voice_commands.dart handler) this used to kick off here —
+        // Gemini's own function-calling now handles the entire
+        // conversation from this point on. See [_triggerGeminiSession]'s
+        // doc comment for the full handoff.
+        unawaited(_triggerGeminiSession());
         return;
       }
 
@@ -1664,6 +2112,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// wake word. "Voice should never go fully silent after a wake word" is
   /// the requirement; this is what actually guarantees it regardless of
   /// what's happening on the Deepgram/AWS side.
+  // ignore: unused_element — no longer called (see _useDeepgramCapture's doc comment); left in place.
   Future<void> _tryDeepgramCommandCapture() async {
     if (!mounted || _commandHandled || !_jobScopeActive) return;
     _voiceLog('wake word detected — switching to Deepgram for command capture');
@@ -2050,6 +2499,66 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     if (mounted) state = state.copyWith(phase: VoicePhase.processing);
   }
 
+  /// FIX (Bluetooth-headset-TTS-ignored bug) — companion to
+  /// [_maybeRouteBluetoothSco] (mic input): confirmed via real-device
+  /// testing that Bluetooth SCO input works correctly (mic routes through
+  /// the headset — `AUDIO ROUTE:` logs `bluetooth_sco_active=true`), but
+  /// spoken TTS output was still coming out of the phone's own speaker.
+  /// Root cause: Android only pulls audio explicitly tagged
+  /// `AudioAttributes.USAGE_VOICE_COMMUNICATION` onto an active SCO link —
+  /// ordinary media-style audio (what flutter_tts's engine uses by
+  /// default) never follows it, and a mono voice headset like the
+  /// BlueParrott has no A2DP sink to fall back onto either, so it was
+  /// simply playing out the phone speaker instead. See
+  /// `MainActivity.kt`'s `routeTtsAudioTo` doc comment for exactly how
+  /// this reaches flutter_tts's engine (Android only) and why
+  /// `setAudioAttributesForNavigation()` — flutter_tts's only built-in
+  /// Android audio-attributes option — isn't sufficient here.
+  ///
+  /// Re-checks LIVE audio-route state on every call (reusing
+  /// [_logAudioRoute]'s own `getAudioRouteInfo`), rather than trusting
+  /// [_bluetoothScoActive], so a headset that disconnects mid-session is
+  /// never mistakenly left routed onto the voice-communication audio
+  /// path — see [_restoreTtsRouting], always called afterward in
+  /// [speak]'s `finally`. Returns whether TTS was actually routed to
+  /// Bluetooth SCO, so [speak] knows whether restoring is needed and what
+  /// to log.
+  Future<bool> _maybeRouteTtsToBluetooth() async {
+    if (defaultTargetPlatform != TargetPlatform.android) return false;
+    try {
+      final routeInfo = await _audioDiagnosticsChannel.invokeMethod<Map<Object?, Object?>>(
+        'getAudioRouteInfo',
+      );
+      final scoActive = routeInfo?['bluetoothScoActive'] == true;
+      if (!scoActive) {
+        debugPrint('TTS ROUTE: bluetooth SCO not active — using default (speaker) output');
+        return false;
+      }
+      final routed = await _audioDiagnosticsChannel.invokeMethod<bool>('routeTtsAudioToBluetoothSco') ?? false;
+      debugPrint(
+        'TTS ROUTE: bluetooth SCO active — routeTtsAudioToBluetoothSco() returned routed=$routed',
+      );
+      return routed;
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (TTS bluetooth routing): $e\n$stackTrace');
+      return false;
+    }
+  }
+
+  /// Counterpart to [_maybeRouteTtsToBluetooth] — always called from
+  /// [speak]'s `finally` when that returned `true`, so flutter_tts's
+  /// engine never stays on the voice-communication audio path any longer
+  /// than the one utterance that needed it.
+  Future<void> _restoreTtsRouting() async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      final restored = await _audioDiagnosticsChannel.invokeMethod<bool>('restoreTtsAudioRouting') ?? false;
+      debugPrint('TTS ROUTE: restoreTtsAudioRouting() returned restored=$restored');
+    } catch (e, stackTrace) {
+      debugPrint('VOICE ERROR (TTS bluetooth routing restore): $e\n$stackTrace');
+    }
+  }
+
   /// Speaks arbitrary text through the single shared TTS instance. Every
   /// spoken confirmation across the app funnels through here — command
   /// handlers registered by screens call this (via
@@ -2078,16 +2587,41 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // synchronously up to its first `await`, so the phase flips to
     // `speaking` immediately on call, not on some later microtask.
     if (mounted) state = state.copyWith(phase: VoicePhase.speaking);
+    // FIX (Bluetooth-headset-TTS-ignored bug) — route THIS utterance
+    // through Bluetooth SCO if it's currently active, before speak()
+    // below, and always restore afterward (see _maybeRouteTtsToBluetooth's
+    // doc comment).
+    final routedToBluetooth = await _maybeRouteTtsToBluetooth();
     try {
       // `awaitSpeakCompletion(true)` (see [_configureTts]) is what makes this
       // resolve only once playback has genuinely finished — relying on that
       // real completion signal here too, not a fixed delay, is what lets the
-      // reset below reflect actual playback end.
-      await _tts.speak(text);
+      // reset below reflect actual playback end. Bounded by
+      // [_speakCompletionTimeout] as a safety net for the rare case that
+      // signal never arrives (see that constant's doc comment) — without
+      // it, a stuck callback here hangs every awaiter chained above this
+      // call, including the wake-word loop's own restart.
+      await _tts.speak(text).timeout(
+        _speakCompletionTimeout,
+        onTimeout: () {
+          _voiceLog(
+            'WARNING: no genuine TTS completion signal within '
+            '${_speakCompletionTimeout.inSeconds}s for "$text" — proceeding anyway as a bounded '
+            'safety fallback so the wake-word loop is not left stuck silently waiting on it',
+          );
+        },
+      );
       final elapsedMs = DateTime.now().difference(startedAt).inMilliseconds;
-      debugPrint('VOICE TTS: playback completion reported after ${elapsedMs}ms: "$text"');
+      debugPrint(
+        'VOICE TTS: playback completion reported after ${elapsedMs}ms: "$text" '
+        '(output_route=${routedToBluetooth ? "bluetooth_sco" : "default"})',
+      );
     } catch (e, stackTrace) {
       debugPrint('VOICE ERROR (speak): $e\n$stackTrace');
+    } finally {
+      if (routedToBluetooth) {
+        await _restoreTtsRouting();
+      }
     }
     // Back to the neutral resting state — whatever comes next (a wake-word
     // restart, captureDictation, captureConfirmation, ...) sets `listening`
@@ -2679,6 +3213,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // no later operation left for the lock to protect this from racing.
     _speech.cancel();
     _tts.stop();
+    unawaited(_stopBluetoothScoIfActive('dispose'));
     _cancelDictationSettleTimer();
     _finishDictationCapture('');
     _cancelConfirmationSettleTimer();

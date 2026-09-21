@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  just_audio (see just_audio-<version>/lib/just_audio.dart, _ProxyHttpServer)
+  runs its own local HTTP server on loopback to serve StreamAudioSource bytes
+  (e.g. GeminiLiveTestScreen's Gemini Live response-audio chunks) to
+  ExoPlayer, which needs a real URI rather than a raw byte stream. Android 9+
+  (API 28+) blocks cleartext HTTP by default, which blocks that internal
+  proxy too. Cleartext is allowed here ONLY for loopback, not the whole app.
+-->
+<network-security-config>
+  <domain-config cleartextTrafficPermitted="true">
+    <domain includeSubdomains="false">127.0.0.1</domain>
+    <domain includeSubdomains="false">localhost</domain>
+  </domain-config>
+</network-security-config>

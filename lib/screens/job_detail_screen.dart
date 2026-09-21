@@ -38,6 +38,7 @@ import '../widgets/tap_scale.dart';
 import '../widgets/voice_phase_indicator.dart';
 import 'change_orders_screen.dart';
 import 'estimate_screen.dart';
+import 'gemini_live_test_screen.dart';
 import 'invoice_review_screen.dart';
 import 'invoice_screen.dart';
 import 'job_history_screen.dart';
@@ -486,6 +487,8 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
                     _VoiceSessionButton(jobId: widget.jobId),
                     const SizedBox(height: 10),
                     _AskQuestionButton(jobId: widget.jobId),
+                    const SizedBox(height: 10),
+                    _GeminiVoiceButton(jobId: widget.jobId),
                   ],
                   const SizedBox(height: 24),
                   _PhotoStrip(jobId: widget.jobId, photos: photos, canAddPhotos: _voiceEligible),
@@ -1080,6 +1083,63 @@ class _VoiceSessionButton extends StatelessWidget {
             const Text(
               'Start Voice Session',
               style: TextStyle(color: Colors.white, fontSize: 15.5, fontWeight: FontWeight.w700),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Manual tap-fallback entry point for the Gemini Live voice system — now
+/// the app's single, permanent voice system (normally reached by saying
+/// "FieldLoop"/"Loop On", see `GlobalVoiceService._triggerGeminiSession`),
+/// not a parallel beta mode any more. Kept as a tap equivalent purely
+/// because every other voice feature in this app has one (see
+/// [_AskQuestionButton] etc.) — no "BETA" badge any more, since this isn't
+/// an experiment alongside the real system, it now leads to the same real
+/// system the wake word does. Still visually distinct from the [_VoiceSessionButton]/
+/// [_AskQuestionButton] pair above (an indigo/violet accent, a different
+/// icon) so it doesn't read as a duplicate of either.
+///
+/// Pushes [GeminiLiveTestScreen] with [jobId] set (NOT `ambient` — this
+/// keeps its manual Start/Stop/log debug-style UI, unlike the wake-word
+/// path's auto-starting ambient one), which is what actually makes this
+/// the REAL job's assistant rather than the standalone debug tool: every
+/// dispatched function call gets this exact [jobId] forced into its
+/// `job_id` argument (see that screen's `_handleToolCall`), reusing the
+/// same token service / dispatcher / function set the wake-word path uses.
+/// No new voice/session logic lives here, this is a navigation entry point
+/// only. Ending the session (its own "Stop Session" button, "Loop Off"/
+/// "FieldLoop stop" spoken to Gemini, or just navigating back) pops back to
+/// this exact screen, already unaffected — see that screen's
+/// `_stopTest`/`dispose`/`_teardown`.
+class _GeminiVoiceButton extends StatelessWidget {
+  const _GeminiVoiceButton({required this.jobId});
+
+  final String jobId;
+
+  @override
+  Widget build(BuildContext context) {
+    return TapScale(
+      onTap: () => Navigator.of(
+        context,
+      ).push(FadeSlidePageRoute(builder: (_) => GeminiLiveTestScreen(jobId: jobId))),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
+        decoration: BoxDecoration(
+          color: const Color(0xFFF3F0FF),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0xFF7C5CFC), width: 1.5),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.auto_awesome_rounded, color: Color(0xFF7C5CFC), size: 18),
+            const SizedBox(width: 10),
+            const Text(
+              'Voice Assistant',
+              style: TextStyle(color: Color(0xFF4B2FBD), fontSize: 14.5, fontWeight: FontWeight.w700),
             ),
           ],
         ),
