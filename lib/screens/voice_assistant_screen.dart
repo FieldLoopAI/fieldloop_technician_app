@@ -9,6 +9,7 @@ import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
 import '../widgets/permission_card.dart';
 import '../widgets/tap_scale.dart';
 import '../widgets/voice_listening_indicator.dart';
@@ -102,8 +103,7 @@ class _VoiceAssistantScreenState extends ConsumerState<VoiceAssistantScreen>
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.16 : 20.0;
+            final horizontalPadding = responsiveGutter(constraints.maxWidth, min: 20);
 
             return Padding(
               padding: EdgeInsets.symmetric(horizontal: horizontalPadding, vertical: 8),

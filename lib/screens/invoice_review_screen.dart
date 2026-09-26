@@ -5,6 +5,7 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/change_order.dart';
+import '../models/invoice_adjustment.dart';
 import '../models/invoice_preview.dart';
 import '../models/job_estimate.dart';
 import '../models/mock_job.dart';
@@ -15,6 +16,10 @@ import '../providers/jobs_provider.dart';
 import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
+import '../theme/design_tokens.dart';
+import '../widgets/app_components.dart';
+import '../widgets/manual_entry_form.dart';
 import '../widgets/primary_button.dart';
 import 'voice_command_registrar_mixin.dart';
 
@@ -22,13 +27,15 @@ import 'voice_command_registrar_mixin.dart';
 /// to the customer — reached from Job Detail's "FieldLoop, generate invoice"
 /// voice command or its "Generate Invoice" tap fallback (see
 /// `handleGenerateInvoiceCommand` in `job_voice_commands.dart`, the sole
-/// entry point for both), which already fetched [preview] via the read-only
-/// `/invoices/preview` Lambda before navigating here — this screen never
-/// re-fetches it itself, it's a one-shot snapshot for one review pass. If
-/// something needs fixing (an estimate to approve, a change order to
-/// re-send), "Fix something first" pops back to Job Detail rather than
-/// editing anything in place — same "review here, edit elsewhere" split as
-/// `ChangeOrdersScreen`'s "create a new change order" action.
+/// entry point for both), or Job Detail's "View Full Invoice", which already
+/// fetched [preview] via the read-only `/invoices/preview` Lambda before
+/// navigating here. The one thing editable in place is the manual
+/// Adjustments section (fees/discounts — see [InvoiceAdjustment]); adding or
+/// removing one re-fetches the preview, since the server computes the
+/// totals. Anything else that needs fixing (an estimate to approve, a change
+/// order to re-send), "Fix something first" pops back to Job Detail for —
+/// same "review here, edit elsewhere" split as `ChangeOrdersScreen`'s
+/// "create a new change order" action.
 ///
 /// Also a job-scoped screen for voice purposes (see [buildVoiceCommands]) —
 /// same `VoiceCommandRegistrarMixin` pattern as Estimate/Change Orders —
@@ -52,6 +59,59 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
   bool _sent = false;
   String? _sentMessage;
 
+  /// Starts as the snapshot this screen was opened with; replaced by a fresh
+  /// `/invoices/preview` fetch after a manual line is added or removed, since
+  /// the server is what computes the totals (see [_refreshPreview]).
+  late InvoicePreview _preview = widget.preview;
+  bool _updatingAdjustments = false;
+  String? _adjustmentError;
+
+  /// "Generate & Send Invoice" needs at least one line to bill — from the
+  /// estimate, an approved change order, or a manual invoice line.
+  bool get _hasLineItems =>
+      _preview.estimate.lineItems.isNotEmpty ||
+      _preview.approvedChangeOrders.isNotEmpty ||
+      _preview.adjustments.isNotEmpty;
+
+  Future<void> _refreshPreview() async {
+    final fresh = await fetchInvoicePreview(jobId: widget.jobId);
+    if (mounted) setState(() => _preview = fresh);
+  }
+
+  Future<void> _addAdjustment() async {
+    final added = await showModalBottomSheet<_NewAdjustment>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => _AddAdjustmentSheet(currentTotal: _preview.grossTotal),
+    );
+    if (added == null || !mounted) return;
+    await _runAdjustmentChange(
+      () => addInvoiceAdjustment(jobId: widget.jobId, description: added.description, amount: added.amount),
+    );
+  }
+
+  Future<void> _removeAdjustment(InvoiceAdjustment adjustment) async {
+    await _runAdjustmentChange(() => deleteInvoiceAdjustment(adjustment.id));
+  }
+
+  Future<void> _runAdjustmentChange(Future<Object?> Function() change) async {
+    setState(() {
+      _updatingAdjustments = true;
+      _adjustmentError = null;
+    });
+    try {
+      await change();
+      ref.invalidate(jobInvoiceAdjustmentsProvider(widget.jobId));
+      await _refreshPreview();
+    } catch (e) {
+      if (mounted) setState(() => _adjustmentError = e is StateError ? e.message : e.toString());
+    } finally {
+      if (mounted) setState(() => _updatingAdjustments = false);
+    }
+  }
+
   @override
   List<VoiceCommand> buildVoiceCommands() => jobLifecycleVoiceCommands(ref, widget.jobId);
 
@@ -60,7 +120,7 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
   /// change order is still pending; otherwise "Generate & Send Invoice"
   /// proceeds straight to [_generateAndSend].
   bool get _needsExtraConfirmation =>
-      !widget.preview.estimateApproved || widget.preview.pendingChangeOrders.isNotEmpty;
+      !_preview.estimateApproved || _preview.pendingChangeOrders.isNotEmpty;
 
   Future<void> _onGeneratePressed() async {
     if (!_needsExtraConfirmation) {
@@ -79,7 +139,7 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
   /// [InvoicePreview] snapshot with no subscription of its own, so there's
   /// nothing for a dialog teardown to race.
   Future<bool> _showConfirmDialog() async {
-    final preview = widget.preview;
+    final preview = _preview;
     final reasons = <String>[
       if (!preview.estimateApproved) "the estimate hasn't been approved by the customer yet",
       if (preview.pendingChangeOrders.isNotEmpty)
@@ -148,7 +208,7 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
   @override
   Widget build(BuildContext context) {
     final job = ref.watch(jobByIdProvider(widget.jobId));
-    final preview = widget.preview;
+    final preview = _preview;
     final estimate = preview.estimate;
     final approvedTotal = preview.approvedChangeOrders.fold<double>(0, (sum, co) => sum + co.additionalAmount);
 
@@ -163,8 +223,7 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.16 : 20.0;
+            final horizontalPadding = responsiveGutter(constraints.maxWidth, min: 20);
 
             return SingleChildScrollView(
               padding: EdgeInsets.fromLTRB(horizontalPadding, 20, horizontalPadding, 32),
@@ -175,6 +234,8 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
                   _buildEstimateSection(estimate),
                   const SizedBox(height: 20),
                   _buildChangeOrdersSection(preview),
+                  const SizedBox(height: 20),
+                  _buildAdjustmentsSection(preview),
                   if (preview.billableHours != null) ...[
                     const SizedBox(height: 20),
                     _TimeOnSiteCard(preview: preview),
@@ -198,7 +259,7 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
                     Text(
                       _error!,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.w600),
+                      style: const TextStyle(color: AppColors.statusRedText, fontSize: 13, fontWeight: FontWeight.w600),
                     ),
                     const SizedBox(height: 10),
                   ],
@@ -212,13 +273,22 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
                   ],
                   if (_sent && _sentMessage != null)
                     _SentConfirmation(message: _sentMessage!)
-                  else
+                  else ...[
+                    if (!_hasLineItems) ...[
+                      const Text(
+                        'Add at least one line item before generating the invoice.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: AppColors.neutralGrey, fontSize: 12.5),
+                      ),
+                      const SizedBox(height: 10),
+                    ],
                     PrimaryButton(
                       label: 'Generate & Send Invoice',
                       icon: Icons.receipt_long_rounded,
                       isLoading: _generating,
-                      onPressed: _onGeneratePressed,
+                      onPressed: (_hasLineItems && !_updatingAdjustments) ? _onGeneratePressed : null,
                     ),
+                  ],
                 ],
               ),
             );
@@ -253,18 +323,95 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
           else
             for (final item in estimate.lineItems) _LineItemRow(description: item.description, amount: item.amount),
           const Divider(height: 28),
+          LabelValueRow(
+            label: const Text(
+              'Estimate Total',
+              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.textDark),
+            ),
+            value: Text(
+              '\$${estimate.totalAmount.toStringAsFixed(2)}',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Manual invoice lines (fees/discounts) — see [InvoiceAdjustment]. Added
+  /// here, on top of the estimate + approved change orders, without touching
+  /// either of those customer-facing records.
+  Widget _buildAdjustmentsSection(InvoicePreview preview) {
+    final locked = _sent || _generating || _updatingAdjustments;
+    return _card(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
           Row(
             children: [
               const Text(
-                'Estimate Total',
-                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.textDark),
+                'Adjustments',
+                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: AppColors.neutralGrey, letterSpacing: 0.3),
               ),
               const Spacer(),
-              Text(
-                '\$${estimate.totalAmount.toStringAsFixed(2)}',
-                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
-              ),
+              if (_updatingAdjustments)
+                const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
             ],
+          ),
+          const SizedBox(height: 8),
+          if (preview.adjustments.isEmpty)
+            const Text(
+              'Add a fee or a discount to this invoice before sending it.',
+              style: TextStyle(fontSize: 12.5, color: AppColors.neutralGrey),
+            )
+          else
+            for (final adjustment in preview.adjustments)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(
+                  children: [
+                    Icon(
+                      adjustment.isDiscount ? Icons.discount_outlined : Icons.add_circle_outline_rounded,
+                      size: 16,
+                      color: adjustment.isDiscount ? AppColors.amber : AppColors.primaryGreenDark,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        adjustment.description,
+                        style: const TextStyle(fontSize: 13.5, color: AppColors.textDark),
+                      ),
+                    ),
+                    Text(
+                      _signedMoney(adjustment.amount),
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
+                        color: adjustment.isDiscount ? AppColors.amber : AppColors.textDark,
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: locked ? null : () => _removeAdjustment(adjustment),
+                      tooltip: 'Remove',
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.close_rounded, size: 18, color: AppColors.neutralGrey),
+                    ),
+                  ],
+                ),
+              ),
+          if (_adjustmentError != null) ...[
+            const SizedBox(height: 8),
+            Text(_adjustmentError!, style: const TextStyle(color: AppColors.error, fontSize: 12.5)),
+          ],
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: locked ? null : _addAdjustment,
+              icon: const Icon(Icons.add_rounded, size: 18),
+              label: const Text('Add Line Item'),
+              style: TextButton.styleFrom(foregroundColor: AppColors.primaryGreenDark),
+            ),
           ),
         ],
       ),
@@ -510,23 +657,23 @@ class _EstimateStatusBadge extends StatelessWidget {
     switch (status) {
       case 'draft':
         fg = AppColors.neutralGrey;
-        bg = const Color(0xFFF3F4F6);
+        bg = AppColors.statusGreyTint;
         label = 'Draft';
       case 'sent':
-        fg = AppColors.amber;
-        bg = const Color(0xFFFEF3C7);
+        fg = AppColors.statusAmberText;
+        bg = AppColors.statusAmberTint;
         label = 'Sent — awaiting customer';
       case 'approved':
-        fg = AppColors.primaryGreenDark;
-        bg = const Color(0xFFE3F5E9);
+        fg = AppColors.statusGreenText;
+        bg = AppColors.greenTint;
         label = 'Approved ✓';
       case 'declined':
         fg = AppColors.neutralGrey;
-        bg = const Color(0xFFF3F4F6);
+        bg = AppColors.statusGreyTint;
         label = 'Declined';
       default:
         fg = AppColors.neutralGrey;
-        bg = const Color(0xFFF3F4F6);
+        bg = AppColors.statusGreyTint;
         label = status;
     }
     return Container(
@@ -583,19 +730,26 @@ class _FinancialSummaryCard extends StatelessWidget {
           _summaryLine('Estimate Total', estimate.totalAmount),
           const SizedBox(height: 6),
           _summaryLine('+ Approved Change Orders', approvedTotal),
+          if (preview.adjustments.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            LabelValueRow(
+              label: const Text('Adjustments', style: TextStyle(fontSize: 13.5, color: AppColors.neutralGrey)),
+              value: Text(
+                _signedMoney(preview.adjustmentsTotal),
+                style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: AppColors.textDark),
+              ),
+            ),
+          ],
           const Divider(height: 26),
-          Row(
-            children: [
-              const Text(
-                'Gross Total',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800, color: AppColors.textDark),
-              ),
-              const Spacer(),
-              Text(
-                '\$${preview.grossTotal.toStringAsFixed(2)}',
-                style: const TextStyle(fontSize: 25, fontWeight: FontWeight.w900, color: AppColors.primaryGreenDark),
-              ),
-            ],
+          LabelValueRow(
+            label: const Text(
+              'Gross Total',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800, color: AppColors.textDark),
+            ),
+            value: Text(
+              '\$${preview.grossTotal.toStringAsFixed(2)}',
+              style: const TextStyle(fontSize: 25, fontWeight: FontWeight.w900, color: AppColors.primaryGreenDark),
+            ),
           ),
           const SizedBox(height: 18),
           Container(
@@ -608,9 +762,11 @@ class _FinancialSummaryCard extends StatelessWidget {
                   children: [
                     Icon(Icons.lock_outline_rounded, size: 13, color: AppColors.neutralGrey),
                     SizedBox(width: 6),
-                    Text(
-                      'Internal only — not shown to the customer',
-                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.neutralGrey),
+                    Expanded(
+                      child: Text(
+                        'Internal only — not shown to the customer',
+                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.neutralGrey),
+                      ),
                     ),
                   ],
                 ),
@@ -627,28 +783,22 @@ class _FinancialSummaryCard extends StatelessWidget {
   }
 
   Widget _summaryLine(String label, double amount) {
-    return Row(
-      children: [
-        Text(label, style: const TextStyle(fontSize: 13.5, color: AppColors.neutralGrey)),
-        const Spacer(),
-        Text(
-          '\$${amount.toStringAsFixed(2)}',
-          style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: AppColors.textDark),
-        ),
-      ],
+    return LabelValueRow(
+      label: Text(label, style: const TextStyle(fontSize: 13.5, color: AppColors.neutralGrey)),
+      value: Text(
+        '\$${amount.toStringAsFixed(2)}',
+        style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: AppColors.textDark),
+      ),
     );
   }
 
   Widget _summarySmallLine(String label, double amount) {
-    return Row(
-      children: [
-        Text(label, style: const TextStyle(fontSize: 12, color: AppColors.neutralGrey)),
-        const Spacer(),
-        Text(
-          '\$${amount.toStringAsFixed(2)}',
-          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: AppColors.neutralGrey),
-        ),
-      ],
+    return LabelValueRow(
+      label: Text(label, style: const TextStyle(fontSize: 12, color: AppColors.neutralGrey)),
+      value: Text(
+        '\$${amount.toStringAsFixed(2)}',
+        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: AppColors.neutralGrey),
+      ),
     );
   }
 }
@@ -758,14 +908,138 @@ class _SentConfirmation extends StatelessWidget {
 /// padding) for visual consistency across all three review screens.
 Widget _card(Widget child) {
   return Container(
-    padding: const EdgeInsets.all(18),
-    decoration: BoxDecoration(
-      color: AppColors.surface,
-      borderRadius: BorderRadius.circular(16),
-      boxShadow: [
-        BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 16, offset: const Offset(0, 6)),
-      ],
-    ),
+    padding: const EdgeInsets.all(AppSpacing.md),
+    decoration: AppDecorations.card(),
     child: child,
   );
+}
+
+/// `+$25.00` / `−$10.00` — adjustments carry a sign, unlike every other
+/// amount on this screen.
+String _signedMoney(double amount) => '${amount < 0 ? '−' : '+'}\$${amount.abs().toStringAsFixed(2)}';
+
+class _NewAdjustment {
+  const _NewAdjustment(this.description, this.amount);
+  final String description;
+
+  /// Signed — negative for a discount.
+  final double amount;
+}
+
+/// "Add Line Item" bottom sheet: a fee or a discount, always entered as a
+/// positive amount (the Fee/Discount choice sets the sign). A discount can't
+/// exceed [currentTotal], so the invoice never goes below $0.
+class _AddAdjustmentSheet extends StatefulWidget {
+  const _AddAdjustmentSheet({required this.currentTotal});
+
+  final double currentTotal;
+
+  @override
+  State<_AddAdjustmentSheet> createState() => _AddAdjustmentSheetState();
+}
+
+class _AddAdjustmentSheetState extends State<_AddAdjustmentSheet> {
+  final _formKey = GlobalKey<FormState>();
+  final _description = TextEditingController();
+  final _amount = TextEditingController();
+  bool _isDiscount = false;
+
+  @override
+  void dispose() {
+    _description.dispose();
+    _amount.dispose();
+    super.dispose();
+  }
+
+  /// "Add to Invoice" stays disabled until there is a description and an
+  /// amount above $0 (and, for a discount, no more than the invoice total).
+  bool get _valid {
+    final value = parseAmount(_amount.text);
+    return _description.text.trim().isNotEmpty &&
+        value != null &&
+        value > 0 &&
+        (!_isDiscount || value <= widget.currentTotal);
+  }
+
+  void _submit() {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+    final value = parseAmount(_amount.text)!;
+    Navigator.of(context).pop(_NewAdjustment(_description.text.trim(), _isDiscount ? -value : value));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(20, 12, 20, 20 + MediaQuery.viewInsetsOf(context).bottom),
+      child: SafeArea(
+        top: false,
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(color: AppColors.borderGrey, borderRadius: BorderRadius.circular(2)),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Add Line Item',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: AppColors.textDark),
+              ),
+              const SizedBox(height: 16),
+              SegmentedButton<bool>(
+                segments: const [
+                  ButtonSegment(value: false, label: Text('Fee / charge'), icon: Icon(Icons.add_rounded)),
+                  ButtonSegment(value: true, label: Text('Discount'), icon: Icon(Icons.remove_rounded)),
+                ],
+                selected: {_isDiscount},
+                onSelectionChanged: (s) => setState(() => _isDiscount = s.first),
+              ),
+              const SizedBox(height: 16),
+              TextFormField(
+                controller: _description,
+                autofocus: true,
+                textCapitalization: TextCapitalization.sentences,
+                decoration: InputDecoration(labelText: _isDiscount ? 'Discount description' : 'Fee description'),
+                validator: requiredTextValidator,
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _amount,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                inputFormatters: moneyInputFormatters,
+                onChanged: (_) => setState(() {}),
+                decoration: const InputDecoration(labelText: 'Amount', prefixText: '\$ '),
+                validator: (value) {
+                  final base = positiveNumberValidator('Amount')(value);
+                  if (base != null) return base;
+                  if (_isDiscount && parseAmount(value!)! > widget.currentTotal) {
+                    return "A discount can't be more than the invoice total (${formatMoney(widget.currentTotal)})";
+                  }
+                  return null;
+                },
+              ),
+              const SizedBox(height: 20),
+              FilledButton(
+                onPressed: _valid ? _submit : null,
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.primaryGreen,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                child: const Text('Add to Invoice'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

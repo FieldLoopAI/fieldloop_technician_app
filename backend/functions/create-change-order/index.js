@@ -30,21 +30,33 @@ async function extractAmount(groqKey, transcript) {
 exports.handler = async (event) => {
   try {
     const technician = await requireTechnician(event);
-    const { jobId, description } = JSON.parse(event.body);
+    const { jobId, description, amount } = JSON.parse(event.body);
     const supabase = await getSupabaseClient();
 
-    const groqSecretRaw = await getSecret('fieldloop/groq-api-key');
-    let groqKey;
-    try {
-      const parsedSecret = JSON.parse(groqSecretRaw);
-      groqKey = parsedSecret.apiKey || parsedSecret.api_key || parsedSecret.key;
-    } catch {
-      groqKey = groqSecretRaw;
-    }
+    let additionalAmount;
+    if (amount !== undefined && amount !== null) {
+      // Manual (typed) change order — the technician entered the amount, so
+      // no Groq extraction. Everything after this (pending status, customer
+      // approval SMS) is identical to the dictated path.
+      if (!String(description ?? '').trim()) throw new Error('A description is required');
+      additionalAmount = Math.round(Number(amount) * 100) / 100;
+      if (!Number.isFinite(additionalAmount) || additionalAmount <= 0) {
+        throw new Error('The amount must be a positive number');
+      }
+    } else {
+      const groqSecretRaw = await getSecret('fieldloop/groq-api-key');
+      let groqKey;
+      try {
+        const parsedSecret = JSON.parse(groqSecretRaw);
+        groqKey = parsedSecret.apiKey || parsedSecret.api_key || parsedSecret.key;
+      } catch {
+        groqKey = groqSecretRaw;
+      }
 
-    const additionalAmount = await extractAmount(groqKey, description);
-    if (additionalAmount === null || additionalAmount === undefined) {
-      throw new Error('Could not extract a dollar amount from the dictated description');
+      additionalAmount = await extractAmount(groqKey, description);
+      if (additionalAmount === null || additionalAmount === undefined) {
+        throw new Error('Could not extract a dollar amount from the dictated description');
+      }
     }
 
     const { data: changeOrder, error: insertErr } = await supabase

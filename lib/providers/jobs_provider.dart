@@ -6,6 +6,13 @@ import '../models/mock_job.dart';
 import 'auth_provider.dart';
 import 'job_runtime_provider.dart';
 
+/// Every `jobs` column plus the customer's display name from the related
+/// `customers` row — the customer name isn't a `jobs` column, which is why
+/// job cards showed "Not provided" while it existed all along (the same
+/// `customers(household_name)` relation the estimate SMS and invoice PDF
+/// already read). See [MockJob.fromMap].
+const _jobColumns = '*, customers(household_name)';
+
 const _historyStatuses = {
   JobStatus.complete,
   JobStatus.invoiced,
@@ -28,7 +35,7 @@ final todaysJobsQueryProvider = FutureProvider<List<MockJob>>((ref) async {
     debugPrint('JOBS: querying today\'s jobs for technician ${technician.id}...');
     final rows = await Supabase.instance.client
         .from('jobs')
-        .select()
+        .select(_jobColumns)
         .eq('lead_technician_id', technician.id)
         .gte('scheduled_start', startOfDay.toUtc().toIso8601String())
         .lt('scheduled_start', endOfDay.toUtc().toIso8601String())
@@ -52,7 +59,7 @@ final historyJobsQueryProvider = FutureProvider<List<MockJob>>((ref) async {
     debugPrint('JOBS: querying job history for technician ${technician.id}...');
     final rows = await Supabase.instance.client
         .from('jobs')
-        .select()
+        .select(_jobColumns)
         .eq('lead_technician_id', technician.id)
         .inFilter('status', ['complete', 'invoiced', 'paid', 'closed'])
         .order('scheduled_start', ascending: false);

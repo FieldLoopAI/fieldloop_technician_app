@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -17,6 +18,8 @@ import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
+import '../theme/design_tokens.dart';
+import '../theme/responsive.dart';
 import '../widgets/error_banner.dart';
 import '../widgets/job_photo_thumbnail.dart';
 import '../widgets/permission_card.dart';
@@ -290,7 +293,9 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
     }
   }
 
-  Widget _buildPreviewArea(CameraMicState cameraMic, bool askShown, double maxPreviewHeight) {
+  /// The camera/mic permission card to show in place of the live preview,
+  /// or null when the camera may run.
+  Widget? _buildPermissionGate(CameraMicState cameraMic, bool askShown) {
     final showCombinedAsk = cameraMic.checked && !cameraMic.allGranted && !askShown;
     if (showCombinedAsk) {
       final copy = cameraMicAskCopy(cameraMic);
@@ -328,15 +333,7 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
       );
     }
 
-    _ensureCameraInitialized();
-
-    return _CameraPreview(
-      controller: _cameraController,
-      flash: _flash,
-      busy: _capturing,
-      onCapture: _capture,
-      maxHeight: maxPreviewHeight,
-    );
+    return null;
   }
 
   @override
@@ -391,302 +388,587 @@ class _PhotoCaptureScreenState extends ConsumerState<PhotoCaptureScreen>
     final cameraMic = ref.watch(cameraMicProvider);
     final askShown = ref.watch(cameraMicAskShownProvider);
 
-    return Scaffold(
-      backgroundColor: AppColors.background,
-      appBar: AppBar(
-        title: Text(job != null ? 'Add Photos · ${job.jobIdPublic}' : 'Add Photos'),
-        backgroundColor: AppColors.surface,
-        foregroundColor: AppColors.textDark,
-        elevation: 0,
-        actions: [
-          if (cameraMic.micGranted)
-            Padding(
-              padding: const EdgeInsets.only(right: 14),
-              child: Center(child: VoicePhaseIndicator()),
-            ),
-        ],
-      ),
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.12 : 16.0;
-            // Bounds the preview by available height as well as width so a
-            // wide/short viewport (tablets especially — a 4:3 preview at
-            // full tablet width can be taller than the whole screen) can
-            // never push the rest of the column into overflow.
-            final maxPreviewHeight = (constraints.maxHeight * 0.42).clamp(180.0, 520.0).toDouble();
+    final gate = _buildPermissionGate(cameraMic, askShown);
+    if (gate == null) _ensureCameraInitialized();
 
-            return Column(
-              children: [
-                Padding(
-                  padding: EdgeInsets.fromLTRB(horizontalPadding, 16, horizontalPadding, 0),
-                  child: _buildPreviewArea(cameraMic, askShown, maxPreviewHeight),
-                ),
-                if (_error != null)
-                  Padding(
-                    padding: EdgeInsets.fromLTRB(horizontalPadding, 12, horizontalPadding, 0),
-                    child: ErrorBanner(message: _error!, onDismiss: () => setState(() => _error = null)),
-                  ),
-                const SizedBox(height: 20),
-                Padding(
-                  padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
-                  child: Row(
-                    children: [
-                      Text(
-                        'Captured photos (${photos.length})',
-                        style: const TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w700,
-                          color: AppColors.textDark,
-                        ),
-                      ),
-                      const Spacer(),
-                      PendingUploadBadge(jobId: widget.jobId),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Expanded(
-                  child: photos.isEmpty
-                      ? (photosAsync.isLoading
-                            ? const Center(child: CircularProgressIndicator())
-                            : const _EmptyGridState())
-                      : _PhotoGrid(photos: photos, horizontalPadding: horizontalPadding),
-                ),
-                Padding(
-                  padding: EdgeInsets.fromLTRB(horizontalPadding, 8, horizontalPadding, 16),
-                  child: SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton.icon(
-                      onPressed: _finishCapturing,
-                      icon: const Icon(Icons.check_rounded),
-                      label: const Text('No More Photos'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: AppColors.primaryGreenDark,
-                        side: const BorderSide(color: AppColors.primaryGreen),
-                        padding: const EdgeInsets.symmetric(vertical: 16),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                        textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            );
-          },
+    // Full-screen capture: the live preview fills the whole screen (under
+    // the status bar and home indicator too) and every control floats on
+    // top of it, so nothing ever shrinks the viewfinder. Only the controls
+    // respect the safe area.
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle.light,
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        resizeToAvoidBottomInset: false,
+        body: CaptureLayout(
+          title: 'Add Photos',
+          subtitle: job?.jobIdPublic,
+          preview: gate == null ? _FullBleedCameraPreview(controller: _cameraController) : null,
+          permissionGate: gate,
+          flash: _flash,
+          busy: _capturing,
+          cameraReady: _cameraController?.value.isInitialized ?? false,
+          showVoiceIndicator: cameraMic.micGranted,
+          error: _error,
+          onDismissError: () => setState(() => _error = null),
+          jobId: widget.jobId,
+          photos: photos,
+          photosLoading: photosAsync.isLoading,
+          onCapture: _capture,
+          onFinish: _finishCapturing,
+          onClose: () => Navigator.of(context).maybePop(),
         ),
       ),
     );
   }
 }
 
-class _CameraPreview extends StatelessWidget {
-  const _CameraPreview({
-    required this.controller,
-    required this.flash,
-    required this.busy,
-    required this.onCapture,
-    required this.maxHeight,
-  });
+/// Live camera feed scaled to COVER its parent (edge to edge, cropping
+/// whatever overhangs) rather than letterboxed into a small box. The box
+/// handed to [CameraPreview] uses the same orientation [CameraPreview]
+/// itself uses to pick its aspect ratio, so the feed is never stretched —
+/// portrait or landscape.
+class _FullBleedCameraPreview extends StatelessWidget {
+  const _FullBleedCameraPreview({required this.controller});
 
   final CameraController? controller;
-  final bool flash;
-  final bool busy;
-  final VoidCallback onCapture;
-
-  /// Height budget handed down from the screen's own [LayoutBuilder] — the
-  /// preview must never grow taller than this, even on a wide tablet where
-  /// a 4:3 preview at full available width would otherwise be taller than
-  /// the screen itself.
-  final double maxHeight;
 
   @override
   Widget build(BuildContext context) {
-    final ready = controller != null && controller!.value.isInitialized;
-
-    // previewSize is reported in the sensor's native (landscape) orientation
-    // even when displaying portrait, so the on-screen ratio is height/width.
-    // Falls back to a 3:4 portrait ratio (the 4:3 capture preset, rotated)
-    // until the controller reports a real size.
-    double previewRatio = 3 / 4;
-    if (ready) {
-      final size = controller!.value.previewSize;
-      if (size != null && size.width > 0 && size.height > 0) {
-        previewRatio = size.height / size.width;
-      }
+    final controller = this.controller;
+    if (controller == null || !controller.value.isInitialized) {
+      return const Center(
+        child: SizedBox(
+          width: 28,
+          height: 28,
+          child: CircularProgressIndicator(strokeWidth: 2.4, color: Colors.white54),
+        ),
+      );
     }
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        // Size from the available width first, then clamp to the height
-        // budget — whichever is tighter wins, and the other dimension is
-        // derived from it so the aspect ratio is always preserved.
-        final heightFromWidth = constraints.maxWidth * previewRatio;
-        final previewHeight = heightFromWidth > maxHeight ? maxHeight : heightFromWidth;
-        final previewWidth = previewHeight / previewRatio;
+    return ValueListenableBuilder<CameraValue>(
+      valueListenable: controller,
+      builder: (context, value, _) {
+        // previewSize is reported in the sensor's native landscape
+        // orientation; swap it for a portrait device.
+        final sensor = value.previewSize ?? const Size(4, 3);
+        final orientation =
+            value.previewPauseOrientation ?? value.lockedCaptureOrientation ?? value.deviceOrientation;
+        final landscape =
+            orientation == DeviceOrientation.landscapeLeft || orientation == DeviceOrientation.landscapeRight;
+        final box = landscape ? sensor : Size(sensor.height, sensor.width);
 
-        return Center(
-          child: SizedBox(
-            width: previewWidth,
-            height: previewHeight,
-            child: Stack(
-              alignment: Alignment.bottomCenter,
-              children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(20),
-              child: Container(
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [Color(0xFF2B2F33), Color(0xFF15181A)],
-                  ),
-                ),
-                child: Stack(
-                  fit: StackFit.expand,
-                  alignment: Alignment.center,
-                  children: [
-                    if (ready)
-                      FittedBox(
-                        fit: BoxFit.cover,
-                        child: SizedBox(
-                          width: controller!.value.previewSize?.height ?? 1,
-                          height: controller!.value.previewSize?.width ?? 1,
-                          child: CameraPreview(controller!),
-                        ),
-                      )
-                    else
-                      const SizedBox(
-                        width: 28,
-                        height: 28,
-                        child: CircularProgressIndicator(strokeWidth: 2.4, color: Colors.white54),
-                      ),
-                    AnimatedOpacity(
-                      opacity: flash ? 1 : 0,
-                      duration: const Duration(milliseconds: 80),
-                      child: Container(color: Colors.white),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            Positioned(
-              bottom: -28,
-              child: TapScale(
-                onTap: ready && !busy ? onCapture : () {},
-                child: Container(
-                  width: 68,
-                  height: 68,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: AppColors.surface,
-                    border: Border.all(color: AppColors.primaryGreen, width: 4),
-                    boxShadow: [
-                      BoxShadow(color: Colors.black.withValues(alpha: 0.18), blurRadius: 14, offset: const Offset(0, 6)),
-                    ],
-                  ),
-                  child: busy
-                      ? const Padding(
-                          padding: EdgeInsets.all(20),
-                          child: CircularProgressIndicator(strokeWidth: 2.4, color: AppColors.primaryGreen),
-                        )
-                      : const Icon(Icons.camera_alt_rounded, color: AppColors.primaryGreen, size: 28),
-                ),
-              ),
-            ),
-              ],
-            ),
-          ),
+        return FittedBox(
+          fit: BoxFit.cover,
+          clipBehavior: Clip.hardEdge,
+          child: SizedBox(width: box.width, height: box.height, child: CameraPreview(controller)),
         );
       },
     );
   }
 }
 
-class _EmptyGridState extends StatelessWidget {
-  const _EmptyGridState();
+/// The capture screen's presentation, separate from the camera/voice
+/// plumbing in [PhotoCaptureScreen] so it can be laid out and tested at
+/// every screen size without a real camera.
+///
+/// Portrait: top bar, then the captured-photos strip and a shutter /
+/// "No More Photos" row along the bottom. Landscape (any device wider than
+/// it is tall): the shutter and "No More Photos" move to a rail on the
+/// right, like a native camera, so the controls don't eat the little
+/// vertical space a landscape phone has.
+class CaptureLayout extends StatelessWidget {
+  const CaptureLayout({
+    super.key,
+    required this.title,
+    required this.subtitle,
+    required this.preview,
+    required this.permissionGate,
+    required this.flash,
+    required this.busy,
+    required this.cameraReady,
+    required this.showVoiceIndicator,
+    required this.error,
+    required this.onDismissError,
+    required this.jobId,
+    required this.photos,
+    required this.photosLoading,
+    required this.onCapture,
+    required this.onFinish,
+    required this.onClose,
+  });
+
+  final String title;
+  final String? subtitle;
+
+  /// The live feed; null while [permissionGate] is shown instead.
+  final Widget? preview;
+  final Widget? permissionGate;
+  final bool flash;
+  final bool busy;
+  final bool cameraReady;
+  final bool showVoiceIndicator;
+  final String? error;
+  final VoidCallback onDismissError;
+  final String jobId;
+  final List<JobPhoto> photos;
+  final bool photosLoading;
+  final VoidCallback onCapture;
+  final VoidCallback onFinish;
+  final VoidCallback onClose;
+
+  static const double _railWidth = 132;
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.photo_library_outlined, size: 44, color: AppColors.neutralGreyLight),
-          const SizedBox(height: 10),
-          const Text(
-            'No photos yet — tap the shutter to capture one',
-            style: TextStyle(color: AppColors.neutralGrey, fontSize: 13.5),
-            textAlign: TextAlign.center,
-          ),
-        ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final sideRail = constraints.maxWidth > constraints.maxHeight;
+        final showShutter = permissionGate == null;
+        final shutter = _ShutterButton(enabled: cameraReady && !busy, busy: busy, onTap: onCapture);
+        final strip = _CapturedStrip(
+          jobId: jobId,
+          photos: photos,
+          loading: photosLoading,
+          showEmptyHint: showShutter,
+        );
+
+        return Stack(
+          children: [
+            Positioned.fill(child: preview ?? const SizedBox.shrink()),
+            Positioned.fill(
+              child: IgnorePointer(
+                child: AnimatedOpacity(
+                  opacity: flash ? 0.85 : 0,
+                  duration: const Duration(milliseconds: 80),
+                  child: const ColoredBox(color: Colors.white),
+                ),
+              ),
+            ),
+            if (permissionGate != null)
+              Positioned.fill(
+                child: SafeArea(
+                  child: Center(
+                    child: SingleChildScrollView(
+                      padding: EdgeInsets.fromLTRB(
+                        AppSpacing.lg,
+                        _TopBar.height + AppSpacing.md,
+                        sideRail ? _railWidth : AppSpacing.lg,
+                        sideRail ? AppSpacing.lg : 160,
+                      ),
+                      child: MaxWidthBox(maxWidth: ContentWidth.form, child: permissionGate!),
+                    ),
+                  ),
+                ),
+              ),
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: _Scrim(
+                begin: Alignment.topCenter,
+                child: SafeArea(
+                  bottom: false,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _TopBar(
+                        title: title,
+                        subtitle: subtitle,
+                        showVoiceIndicator: showVoiceIndicator,
+                        onClose: onClose,
+                      ),
+                      if (error != null)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(AppSpacing.md, 0, AppSpacing.md, AppSpacing.xs),
+                          child: MaxWidthBox(
+                            child: ErrorBanner(message: error!, onDismiss: onDismissError),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            if (sideRail) ...[
+              Positioned(
+                left: 0,
+                right: _railWidth,
+                bottom: 0,
+                child: _Scrim(
+                  begin: Alignment.bottomCenter,
+                  child: SafeArea(
+                    top: false,
+                    right: false,
+                    minimum: const EdgeInsets.only(bottom: AppSpacing.sm),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.lg, AppSpacing.md, 0),
+                      child: strip,
+                    ),
+                  ),
+                ),
+              ),
+              Positioned(
+                top: 0,
+                bottom: 0,
+                right: 0,
+                child: _Scrim(
+                  begin: Alignment.centerRight,
+                  child: SafeArea(
+                    left: false,
+                    minimum: const EdgeInsets.symmetric(vertical: AppSpacing.md),
+                    child: SizedBox(
+                      width: _railWidth,
+                      child: Column(
+                        children: [
+                          const Spacer(),
+                          if (showShutter) shutter,
+                          const Spacer(),
+                          _FinishButton(onPressed: onFinish, stacked: true),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ] else
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: _Scrim(
+                  begin: Alignment.bottomCenter,
+                  child: SafeArea(
+                    top: false,
+                    minimum: const EdgeInsets.only(bottom: AppSpacing.md),
+                    child: MaxWidthBox(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.xl, AppSpacing.md, 0),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            strip,
+                            const SizedBox(height: AppSpacing.md),
+                            // Shutter dead center; "No More Photos" in the
+                            // right-hand slot. Equal Expanded slots on both
+                            // sides keep the shutter centered.
+                            Row(
+                              children: [
+                                const Expanded(child: SizedBox.shrink()),
+                                if (showShutter) shutter else const SizedBox(height: _ShutterButton.size),
+                                Expanded(
+                                  child: Align(
+                                    alignment: Alignment.centerRight,
+                                    child: _FinishButton(onPressed: onFinish, stacked: false),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Dark gradient behind overlaid controls so white text and icons stay
+/// legible over a bright scene, fading out toward the middle of the frame.
+class _Scrim extends StatelessWidget {
+  const _Scrim({required this.begin, required this.child});
+
+  final Alignment begin;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: begin,
+          end: -begin,
+          colors: [Colors.black.withValues(alpha: 0.6), Colors.black.withValues(alpha: 0)],
+        ),
+      ),
+      child: child,
+    );
+  }
+}
+
+class _TopBar extends StatelessWidget {
+  const _TopBar({
+    required this.title,
+    required this.subtitle,
+    required this.showVoiceIndicator,
+    required this.onClose,
+  });
+
+  static const double height = 64;
+
+  final String title;
+  final String? subtitle;
+  final bool showVoiceIndicator;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(minHeight: height),
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.xs),
+        child: Row(
+          children: [
+            IconButton(
+              onPressed: onClose,
+              tooltip: 'Close camera',
+              style: IconButton.styleFrom(
+                backgroundColor: Colors.black.withValues(alpha: 0.35),
+                foregroundColor: Colors.white,
+                minimumSize: const Size(48, 48),
+              ),
+              icon: const Icon(Icons.close_rounded),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700),
+                  ),
+                  if (subtitle != null)
+                    Text(
+                      subtitle!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                ],
+              ),
+            ),
+            if (showVoiceIndicator)
+              Container(
+                margin: const EdgeInsets.only(left: AppSpacing.xs, right: AppSpacing.xxs),
+                padding: const EdgeInsets.all(AppSpacing.xxs),
+                decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.9), shape: BoxShape.circle),
+                child: const VoicePhaseIndicator(),
+              ),
+          ],
+        ),
       ),
     );
   }
 }
 
-class _PhotoGrid extends StatelessWidget {
-  const _PhotoGrid({required this.photos, required this.horizontalPadding});
+class _ShutterButton extends StatelessWidget {
+  const _ShutterButton({required this.enabled, required this.busy, required this.onTap});
 
-  final List<JobPhoto> photos;
-  final double horizontalPadding;
+  static const double size = 78;
+
+  final bool enabled;
+  final bool busy;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final crossAxisCount = constraints.maxWidth > 700 ? 4 : 3;
-        return GridView.builder(
-          padding: EdgeInsets.symmetric(horizontal: horizontalPadding, vertical: 4),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: crossAxisCount,
-            crossAxisSpacing: 10,
-            mainAxisSpacing: 10,
-            childAspectRatio: 0.9,
+    return Semantics(
+      button: true,
+      enabled: enabled,
+      label: 'Take photo',
+      child: TapScale(
+        onTap: enabled ? onTap : () {},
+        child: AnimatedOpacity(
+          opacity: enabled || busy ? 1 : 0.5,
+          duration: const Duration(milliseconds: 150),
+          child: Container(
+            width: size,
+            height: size,
+            padding: const EdgeInsets.all(5),
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(color: Colors.white, width: 4),
+              boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.25), blurRadius: 14)],
+            ),
+            child: Container(
+              decoration: const BoxDecoration(shape: BoxShape.circle, color: Colors.white),
+              child: busy
+                  ? const Padding(
+                      padding: EdgeInsets.all(20),
+                      child: CircularProgressIndicator(strokeWidth: 2.6, color: AppColors.primaryGreen),
+                    )
+                  : const Icon(Icons.camera_alt_rounded, color: AppColors.primaryGreenDark, size: 28),
+            ),
           ),
-          itemCount: photos.length,
-          itemBuilder: (context, index) {
-            final photo = photos[index];
-            return TapScale(
-              onTap: () => Navigator.of(
-                context,
-              ).push(FadeSlidePageRoute(builder: (_) => PhotoViewerScreen(photo: photo))),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(14),
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    JobPhotoThumbnail(photo: photo, iconSize: 28),
-                    if (photo.status == JobPhotoStatus.uploading)
-                      Container(
-                        color: Colors.black.withValues(alpha: 0.35),
-                        alignment: Alignment.center,
-                        child: const SizedBox(
-                          width: 26,
-                          height: 26,
-                          child: CircularProgressIndicator(strokeWidth: 2.6, color: Colors.white),
-                        ),
-                      ),
-                    if (photo.status == JobPhotoStatus.failed)
-                      Container(
-                        color: Colors.black.withValues(alpha: 0.45),
-                        alignment: Alignment.center,
-                        child: const Icon(Icons.error_outline_rounded, color: Colors.white, size: 28),
-                      ),
-                    if (photo.status == JobPhotoStatus.queuedOffline)
-                      Container(
-                        color: Colors.black.withValues(alpha: 0.35),
-                        alignment: Alignment.center,
-                        child: const Icon(Icons.cloud_upload_outlined, color: Colors.white, size: 26),
-                      ),
-                  ],
-                ),
+        ),
+      ),
+    );
+  }
+}
+
+/// "No More Photos" — the tap equivalent of the voice command, always
+/// reachable. [stacked] puts the icon over a two-line label for the narrow
+/// landscape rail.
+class _FinishButton extends StatelessWidget {
+  const _FinishButton({required this.onPressed, required this.stacked});
+
+  final VoidCallback onPressed;
+  final bool stacked;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = FilledButton.styleFrom(
+      backgroundColor: Colors.white.withValues(alpha: 0.92),
+      foregroundColor: AppColors.primaryGreenDark,
+      minimumSize: const Size(48, 48),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadius.lg)),
+      textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+    );
+
+    if (stacked) {
+      return FilledButton(
+        onPressed: onPressed,
+        style: style,
+        child: const Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.check_rounded),
+            SizedBox(height: AppSpacing.xxs),
+            Text('No More\nPhotos', textAlign: TextAlign.center),
+          ],
+        ),
+      );
+    }
+
+    // FittedBox only ever shrinks the label, and only when the slot beside
+    // the shutter is narrower than it (a ~320dp phone at a large
+    // accessibility text size) — so it can never overflow.
+    return FittedBox(
+      fit: BoxFit.scaleDown,
+      child: FilledButton.icon(
+        onPressed: onPressed,
+        style: style,
+        icon: const Icon(Icons.check_rounded, size: 20),
+        label: const Text('No More Photos'),
+      ),
+    );
+  }
+}
+
+/// Captured photos for this job as one compact row of thumbnails, newest
+/// first, overlaid on the preview instead of taking screen space from it.
+class _CapturedStrip extends StatelessWidget {
+  const _CapturedStrip({
+    required this.jobId,
+    required this.photos,
+    required this.loading,
+    required this.showEmptyHint,
+  });
+
+  static const double _thumbSize = 60;
+
+  final String jobId;
+  final List<JobPhoto> photos;
+  final bool loading;
+  final bool showEmptyHint;
+
+  @override
+  Widget build(BuildContext context) {
+    if (photos.isEmpty) {
+      if (loading || !showEmptyHint) return const SizedBox.shrink();
+      return const Text(
+        'No photos yet — tap the shutter to capture one',
+        textAlign: TextAlign.center,
+        style: TextStyle(color: Colors.white, fontSize: 13.5, fontWeight: FontWeight.w600),
+      );
+    }
+
+    final newestFirst = photos.reversed.toList();
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Flexible(
+              child: Text(
+                'Captured photos (${photos.length})',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white, fontSize: 13.5, fontWeight: FontWeight.w700),
               ),
-            ).animate(delay: (40 * index).ms).fadeIn(duration: 250.ms).scale(begin: const Offset(0.9, 0.9), end: const Offset(1, 1));
-          },
-        );
-      },
+            ),
+            const SizedBox(width: AppSpacing.xs),
+            Flexible(child: PendingUploadBadge(jobId: jobId)),
+          ],
+        ),
+        const SizedBox(height: AppSpacing.xs),
+        SizedBox(
+          height: _thumbSize,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            itemCount: newestFirst.length,
+            separatorBuilder: (_, _) => const SizedBox(width: AppSpacing.xs),
+            itemBuilder: (context, index) {
+              final photo = newestFirst[index];
+              return TapScale(
+                onTap: () => Navigator.of(
+                  context,
+                ).push(FadeSlidePageRoute(builder: (_) => PhotoViewerScreen(photo: photo))),
+                child: Container(
+                  width: _thumbSize,
+                  decoration: BoxDecoration(
+                    borderRadius: AppRadius.tile,
+                    border: Border.all(color: Colors.white, width: 2),
+                  ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(AppRadius.md - 2),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        JobPhotoThumbnail(photo: photo),
+                        if (photo.status == JobPhotoStatus.uploading)
+                          Container(
+                            color: Colors.black.withValues(alpha: 0.35),
+                            alignment: Alignment.center,
+                            child: const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2.2, color: Colors.white),
+                            ),
+                          ),
+                        if (photo.status == JobPhotoStatus.failed)
+                          Container(
+                            color: Colors.black.withValues(alpha: 0.45),
+                            alignment: Alignment.center,
+                            child: const Icon(Icons.error_outline_rounded, color: Colors.white, size: 22),
+                          ),
+                        if (photo.status == JobPhotoStatus.queuedOffline)
+                          Container(
+                            color: Colors.black.withValues(alpha: 0.35),
+                            alignment: Alignment.center,
+                            child: const Icon(Icons.cloud_upload_outlined, color: Colors.white, size: 20),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ).animate().fadeIn(duration: 250.ms).scale(begin: const Offset(0.85, 0.85), end: const Offset(1, 1));
+            },
+          ),
+        ),
+      ],
     );
   }
 }

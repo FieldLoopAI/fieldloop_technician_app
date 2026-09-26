@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -194,7 +195,7 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
   /// (non-network) failure marks it `failed` and rethrows so the caller can
   /// surface an on-screen error — a network failure queues it instead and
   /// returns [PhotoUploadResult.queuedOffline], not an exception.
-  Future<PhotoUploadResult> uploadPhoto(Uint8List bytes) async {
+  Future<PhotoUploadResult> uploadPhoto(Uint8List bytes, {Future<UploadUrlInfo>? prefetchedUploadUrl}) async {
     final id = 'local-${DateTime.now().microsecondsSinceEpoch}';
     final startedAt = DateTime.now();
     _upsert(JobPhoto(id: id, status: JobPhotoStatus.uploading, timestamp: startedAt, localBytes: bytes));
@@ -202,11 +203,14 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
     final connectivity = await Connectivity().checkConnectivity();
     if (isOfflineResult(connectivity)) {
       debugPrint('PHOTOS: no connectivity ($connectivity) — queuing photo without calling upload-url');
+      // The offline queue's own retry always fetches a fresh URL later (see
+      // [uploadPhotoBytes]'s doc comment) — any prefetch already in flight
+      // for this photo is simply left unawaited/unused, not an error.
       return _queueOffline(id: id, startedAt: startedAt, bytes: bytes);
     }
 
     try {
-      final s3Key = await uploadPhotoBytes(jobId: jobId, bytes: bytes);
+      final s3Key = await uploadPhotoBytes(jobId: jobId, bytes: bytes, prefetchedUploadUrl: prefetchedUploadUrl);
       // FIX 1 (CRITICAL): this used to also call
       // _ref.invalidate(jobPhotosProvider(jobId)) here — but `_ref` belongs
       // to THIS SAME JobPhotosController instance (the one
@@ -264,18 +268,34 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
   }
 }
 
-/// Requests a presigned S3 URL from the `/photos/upload-url` Lambda, PUTs
-/// [bytes] straight to S3, then flips the pre-created `field_events` row to
-/// `uploaded`. Returns the `s3Key` on success; throws on any failure
-/// (network or otherwise) — callers decide what a given failure means for
-/// them (see [JobPhotosController.uploadPhoto], which queues on a network
-/// error, and `OfflineUploadQueueService`, which retries later).
+/// A presigned S3 PUT URL plus the `s3Key` the `/photos/upload-url` Lambda
+/// chose for it — see [prefetchUploadUrl].
+typedef UploadUrlInfo = ({String uploadUrl, String s3Key});
+
+/// Calls the `/photos/upload-url` Lambda alone — the first of
+/// [uploadPhotoBytes]'s two network round trips, split out so it can be
+/// started EARLY (while the technician is still looking at the photo
+/// preview, deciding keep vs. retake) instead of only after "keep it" is
+/// heard. CONFIRMED via flutter_run_log_new.txt (build #63): this call
+/// alone accounts for most of confirm_photo_upload's ~9.4s "S3 upload"
+/// time (the actual S3 PUT itself is a couple of seconds; the DB
+/// bookkeeping calls after it are already off the critical path — see
+/// [uploadPhotoBytes]'s own doc comment) — a real backend/network cost
+/// this app can't reduce directly, but CAN move off the spoken-confirmation
+/// critical path by overlapping it with time the technician is going to
+/// spend deciding anyway.
 ///
-/// Shared by both the live-capture upload path and the offline queue's
-/// retry so they hit `/photos/upload-url` + the S3 PUT + the `field_events`
-/// update identically — never two separate implementations that could
-/// drift apart.
-Future<String> uploadPhotoBytes({required String jobId, required Uint8List bytes}) async {
+/// HONEST TRADE-OFF: the Lambda INSERTs a `field_events` row (status
+/// `upload_pending`) as a side effect of generating the URL (see
+/// `backend/functions/get-photo-upload-url/index.js`) — calling this on
+/// every CAPTURE rather than every CONFIRM means a retaken (never
+/// confirmed) photo leaves an orphaned `upload_pending` row behind. That
+/// row is harmless functionally (every job-history/photo query filters on
+/// `metadata->>status = 'uploaded'`, so it never appears anywhere), just
+/// permanent DB clutter — accepted here for the latency win rather than
+/// left for a future backend change (a cancel/cleanup endpoint, or not
+/// inserting until the PUT actually succeeds) to fix properly.
+Future<UploadUrlInfo> prefetchUploadUrl({required String jobId}) async {
   final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
   if (accessToken == null) {
     throw StateError('No active session — please sign in again.');
@@ -300,6 +320,33 @@ Future<String> uploadPhotoBytes({required String jobId, required Uint8List bytes
     throw StateError('Upload URL response missing uploadUrl/s3Key.');
   }
   debugPrint('PHOTOS: got upload URL, s3Key=$s3Key');
+  return (uploadUrl: uploadUrl, s3Key: s3Key);
+}
+
+/// Requests a presigned S3 URL from the `/photos/upload-url` Lambda (or
+/// reuses [prefetchedUploadUrl], when given — see [prefetchUploadUrl]),
+/// PUTs [bytes] straight to S3, then flips the pre-created `field_events`
+/// row to `uploaded`. Returns the `s3Key` on success; throws on any
+/// failure (network or otherwise) — callers decide what a given failure
+/// means for them (see [JobPhotosController.uploadPhoto], which queues on
+/// a network error, and `OfflineUploadQueueService`, which retries later).
+///
+/// Shared by both the live-capture upload path and the offline queue's
+/// retry so they hit `/photos/upload-url` + the S3 PUT + the `field_events`
+/// update identically — never two separate implementations that could
+/// drift apart. [prefetchedUploadUrl] is only ever passed by the live-
+/// capture path (see [GeminiCameraSession.capture]/`.confirm` in
+/// `gemini_function_dispatcher.dart`); the offline queue always fetches
+/// fresh, since a queued retry can run long after any prefetch would have
+/// gone stale.
+Future<String> uploadPhotoBytes({
+  required String jobId,
+  required Uint8List bytes,
+  Future<UploadUrlInfo>? prefetchedUploadUrl,
+}) async {
+  final urlInfo = await (prefetchedUploadUrl ?? prefetchUploadUrl(jobId: jobId));
+  final uploadUrl = urlInfo.uploadUrl;
+  final s3Key = urlInfo.s3Key;
 
   debugPrint('PHOTOS: uploading ${bytes.length} bytes to S3...');
   final putResponse = await http.put(Uri.parse(uploadUrl), headers: {'Content-Type': 'image/jpeg'}, body: bytes);
@@ -308,36 +355,61 @@ Future<String> uploadPhotoBytes({required String jobId, required Uint8List bytes
   }
   debugPrint('PHOTOS: S3 upload succeeded for s3Key=$s3Key');
 
-  debugPrint('PHOTOS: marking field_events uploaded for s3Key=$s3Key...');
-  // BUG A2 fix: this used to fire-and-forget the update with no check on
-  // whether it actually touched a row. The field_events row is INSERTed by
-  // the /photos/upload-url Lambda using a privileged service-role Supabase
-  // key (see backend/functions/get-photo-upload-url), which bypasses RLS —
-  // but this UPDATE runs through the app's own RLS-governed client
-  // (Supabase.instance.client, initialized with the anon/user key, see
-  // main.dart). If there's no RLS UPDATE policy granting technicians write
-  // access to field_events, Postgrest doesn't throw — it just silently
-  // matches zero rows, so the row's metadata never actually flips to
-  // 'uploaded', while this code kept logging "succeeded" regardless. That
-  // exactly explains "upload confirmed successful, but _fetchUploaded()'s
-  // `metadata->>status = 'uploaded'` filter returns 0 rows forever" — the
-  // filter itself was correct, the write just never landed. `.select()`
-  // forces Postgrest to return the updated row(s), so an empty result here
-  // is now a loud, diagnosable failure instead of a silent no-op.
-  final updated = await Supabase.instance.client
-      .from('field_events')
-      .update({
-        'metadata': {'status': 'uploaded'},
-      })
-      .eq('s3_object_key', s3Key)
-      .select();
-  if (updated.isEmpty) {
-    throw StateError(
-      'field_events update for s3Key=$s3Key matched 0 rows — likely missing/insufficient '
-      'RLS UPDATE grant on field_events for the technician role.',
-    );
-  }
-  debugPrint('PHOTOS: field_events status update succeeded for s3Key=$s3Key (${updated.length} row updated)');
+  // BUG 3 FIX (CONFIRMED via flutter_run_log_new.txt, build #56): this
+  // update used to be awaited HERE, gating the caller's "uploaded" result —
+  // and therefore the spoken confirmation and every other user-facing
+  // "done" signal — on an extra ~1.3s Supabase round trip for a field the
+  // technician never sees or waits on. The photo is genuinely, durably
+  // uploaded the instant the S3 PUT above succeeds; this UPDATE only flips
+  // an internal `field_events.metadata.status` bookkeeping field so job-
+  // history queries stop showing 'upload_pending'. Still fully awaited and
+  // still throws loudly on 0 rows (see BUG A2 fix below) — just off the
+  // critical path via `unawaited`, with its own error caught and logged
+  // rather than propagating into a promise nobody's awaiting.
+  unawaited(_markFieldEventUploaded(s3Key));
 
   return s3Key;
+}
+
+/// See [uploadPhotoBytes]'s BUG 3 FIX doc comment for why this runs
+/// unawaited rather than gating the upload's own return.
+Future<void> _markFieldEventUploaded(String s3Key) async {
+  debugPrint('PHOTOS: marking field_events uploaded for s3Key=$s3Key...');
+  try {
+    // BUG A2 fix: this used to fire-and-forget the update with no check on
+    // whether it actually touched a row. The field_events row is INSERTed by
+    // the /photos/upload-url Lambda using a privileged service-role Supabase
+    // key (see backend/functions/get-photo-upload-url), which bypasses RLS —
+    // but this UPDATE runs through the app's own RLS-governed client
+    // (Supabase.instance.client, initialized with the anon/user key, see
+    // main.dart). If there's no RLS UPDATE policy granting technicians write
+    // access to field_events, Postgrest doesn't throw — it just silently
+    // matches zero rows, so the row's metadata never actually flips to
+    // 'uploaded', while this code kept logging "succeeded" regardless. That
+    // exactly explains "upload confirmed successful, but _fetchUploaded()'s
+    // `metadata->>status = 'uploaded'` filter returns 0 rows forever" — the
+    // filter itself was correct, the write just never landed. `.select()`
+    // forces Postgrest to return the updated row(s), so an empty result here
+    // is now a loud, diagnosable failure instead of a silent no-op.
+    final updated = await Supabase.instance.client
+        .from('field_events')
+        .update({
+          'metadata': {'status': 'uploaded'},
+        })
+        .eq('s3_object_key', s3Key)
+        .select();
+    if (updated.isEmpty) {
+      throw StateError(
+        'field_events update for s3Key=$s3Key matched 0 rows — likely missing/insufficient '
+        'RLS UPDATE grant on field_events for the technician role.',
+      );
+    }
+    debugPrint('PHOTOS: field_events status update succeeded for s3Key=$s3Key (${updated.length} row updated)');
+  } catch (e, stackTrace) {
+    // BUG 3 FIX: now genuinely fire-and-forget from the upload's own
+    // perspective (the S3 file itself is safe either way), so a failure
+    // here MUST be loud somewhere since nothing awaits this Future anymore
+    // — logged, not silently swallowed.
+    debugPrint('PHOTOS ERROR (background field_events status update for s3Key=$s3Key): $e\n$stackTrace');
+  }
 }

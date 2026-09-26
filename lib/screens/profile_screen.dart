@@ -1,18 +1,21 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../build_info.dart';
 import '../providers/auth_provider.dart';
 import '../providers/global_notification_service.dart';
 import '../providers/global_voice_service_provider.dart';
 import '../providers/visit_tracking_service.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
-import '../widgets/tap_scale.dart';
+import '../theme/responsive.dart';
+import '../theme/design_tokens.dart';
+import '../widgets/app_components.dart';
 import 'gemini_live_test_screen.dart';
 import 'login_screen.dart';
 import 'permissions_setup_screen.dart';
-import 'voice_settings_screen.dart';
 
 /// Bottom-nav "Profile" tab.
 class ProfileScreen extends ConsumerWidget {
@@ -75,152 +78,90 @@ class ProfileScreen extends ConsumerWidget {
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.15 : 20.0;
+            final horizontalPadding = responsiveGutter(constraints.maxWidth);
 
             return SingleChildScrollView(
-              padding: EdgeInsets.fromLTRB(horizontalPadding, 24, horizontalPadding, 32),
+              padding: EdgeInsets.fromLTRB(horizontalPadding, AppSpacing.lg, horizontalPadding, AppSpacing.xl),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Center(
-                    child: Column(
-                      children: [
-                        Container(
-                          width: 88,
-                          height: 88,
-                          decoration: BoxDecoration(
-                            gradient: AppColors.headerGradient,
-                            shape: BoxShape.circle,
-                            boxShadow: [
-                              BoxShadow(
-                                color: AppColors.primaryGreen.withValues(alpha: 0.3),
-                                blurRadius: 20,
-                                offset: const Offset(0, 8),
-                              ),
+                  _ProfileHeader(
+                    initials: technician.initials,
+                    name: technician.fullName,
+                    role: technician.role,
+                    phone: technician.phone,
+                  ).animate().fadeIn(duration: 250.ms).slideY(begin: -0.04, end: 0, duration: 250.ms),
+                  const SizedBox(height: AppSpacing.lg),
+                  const SectionHeader('Contact'),
+                  SettingsGroup(
+                    children: [
+                      _InfoTile(icon: Icons.mail_outline_rounded, label: 'Email', value: technician.email),
+                      _InfoTile(icon: Icons.phone_outlined, label: 'Phone', value: technician.phone),
+                      _InfoTile(icon: Icons.badge_outlined, label: 'Role', value: technician.role),
+                    ],
+                  ).animate().fadeIn(delay: 60.ms, duration: 250.ms),
+                  const SizedBox(height: AppSpacing.lg),
+                  const SectionHeader('Certifications'),
+                  AppCard(
+                    child: technician.certifications.isEmpty
+                        ? Text('No certifications on file', style: AppText.bodyMuted)
+                        : Wrap(
+                            spacing: AppSpacing.xs,
+                            runSpacing: AppSpacing.xs,
+                            children: [
+                              for (final cert in technician.certifications) _CertificationChip(label: cert),
                             ],
                           ),
-                          alignment: Alignment.center,
-                          child: Text(
-                            technician.initials,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 30,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          technician.fullName,
-                          style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontSize: 22),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          technician.role,
-                          style: const TextStyle(
-                            color: AppColors.primaryGreenDark,
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(technician.phone, style: Theme.of(context).textTheme.bodyMedium),
-                      ],
-                    ),
-                  ).animate().fadeIn(duration: 350.ms).slideY(begin: -0.06, end: 0),
-                  const SizedBox(height: 28),
-                  _InfoCard(
+                  ).animate().fadeIn(delay: 100.ms, duration: 250.ms),
+                  const SizedBox(height: AppSpacing.lg),
+                  const SectionHeader('Settings'),
+                  SettingsGroup(
                     children: [
-                      _InfoRow(icon: Icons.mail_outline_rounded, label: 'Email', value: technician.email),
-                      _InfoRow(icon: Icons.phone_outlined, label: 'Phone', value: technician.phone),
-                      _InfoRow(icon: Icons.badge_outlined, label: 'Role', value: technician.role),
-                    ],
-                  ).animate().fadeIn(delay: 120.ms, duration: 350.ms),
-                  const SizedBox(height: 16),
-                  _InfoCard(
-                    title: 'Certifications',
-                    children: [
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: technician.certifications
-                            .map(
-                              (cert) => Chip(
-                                label: Text(cert),
-                                backgroundColor: AppColors.primaryGreen.withValues(alpha: 0.1),
-                                labelStyle: const TextStyle(
-                                  color: AppColors.primaryGreenDark,
-                                  fontWeight: FontWeight.w600,
-                                  fontSize: 12.5,
-                                ),
-                                side: BorderSide.none,
-                                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                              ),
-                            )
-                            .toList(),
-                      ),
-                    ],
-                  ).animate().fadeIn(delay: 180.ms, duration: 350.ms),
-                  const SizedBox(height: 16),
-                  _InfoCard(
-                    title: 'Settings',
-                    children: [
-                      TapScale(
+                      SettingsTile(
+                        icon: Icons.shield_outlined,
+                        title: 'Permissions',
+                        subtitle: 'Camera, microphone & location',
                         onTap: () => Navigator.of(context).push(
-                          FadeSlidePageRoute(
-                            builder: (_) => const PermissionsSetupScreen(isInitialSetup: false),
-                          ),
-                        ),
-                        child: const _SettingsRow(
-                          icon: Icons.shield_outlined,
-                          label: 'Permissions',
-                          subtitle: 'Camera, microphone & location',
+                          FadeSlidePageRoute(builder: (_) => const PermissionsSetupScreen(isInitialSetup: false)),
                         ),
                       ),
-                      TapScale(
-                        onTap: () => Navigator.of(
-                          context,
-                        ).push(FadeSlidePageRoute(builder: (_) => const VoiceSettingsScreen())),
-                        child: const _SettingsRow(
-                          icon: Icons.record_voice_over_outlined,
-                          label: 'Voice',
-                          subtitle: 'Choose the spoken prompt voice',
-                          ),
-                        ),
                     ],
-                  ).animate().fadeIn(delay: 210.ms, duration: 350.ms),
-                  const SizedBox(height: 16),
-                  // TEMPORARY debug entry point for the Day-1 Gemini Live
-                  // connectivity proof — not part of the normal job flow.
-                  _InfoCard(
-                    title: 'Debug',
-                    children: [
-                      TapScale(
-                        onTap: () => Navigator.of(
-                          context,
-                        ).push(FadeSlidePageRoute(builder: (_) => const GeminiLiveTestScreen())),
-                        child: const _SettingsRow(
+                  ).animate().fadeIn(delay: 140.ms, duration: 250.ms),
+                  // Developer-only tooling: compiled out of release builds so
+                  // real technicians never see it. (kDebugMode is a
+                  // compile-time constant — the tile and its route are
+                  // tree-shaken from release builds.)
+                  if (kDebugMode) ...[
+                    const SizedBox(height: AppSpacing.lg),
+                    const SectionHeader('Developer'),
+                    SettingsGroup(
+                      children: [
+                        SettingsTile(
                           icon: Icons.bug_report_outlined,
-                          label: 'Gemini Live Test',
-                          subtitle: 'Bare WebSocket connectivity proof',
+                          title: 'Gemini Live Test',
+                          subtitle: 'Debug builds only',
+                          onTap: () => Navigator.of(
+                            context,
+                          ).push(FadeSlidePageRoute(builder: (_) => const GeminiLiveTestScreen())),
                         ),
+                      ],
+                    ).animate().fadeIn(delay: 160.ms, duration: 250.ms),
+                  ],
+                  const SizedBox(height: AppSpacing.xl),
+                  const SectionHeader('Account'),
+                  SettingsGroup(
+                    children: [
+                      SettingsTile(
+                        icon: Icons.logout_rounded,
+                        title: 'Log Out',
+                        subtitle: 'Sign out of FieldLoop on this device',
+                        destructive: true,
+                        onTap: () => _confirmLogout(context, ref),
                       ),
                     ],
-                  ).animate().fadeIn(delay: 225.ms, duration: 350.ms),
-                  const SizedBox(height: 32),
-                  OutlinedButton.icon(
-                    onPressed: () => _confirmLogout(context, ref),
-                    icon: const Icon(Icons.logout_rounded, color: AppColors.error),
-                    label: const Text('Log Out'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: AppColors.error,
-                      side: const BorderSide(color: AppColors.error),
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                      textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
-                    ),
-                  ).animate().fadeIn(delay: 240.ms, duration: 350.ms),
+                  ).animate().fadeIn(delay: 180.ms, duration: 250.ms),
+                  const SizedBox(height: AppSpacing.lg),
+                  Center(child: Text('FieldLoop AI  ·  build $kBuildNumber', style: AppText.bodyMuted.copyWith(fontSize: 12))),
                 ],
               ),
             );
@@ -231,86 +172,71 @@ class ProfileScreen extends ConsumerWidget {
   }
 }
 
-class _InfoCard extends StatelessWidget {
-  const _InfoCard({required this.children, this.title});
+/// Avatar + name + role badge, with the phone as a muted secondary line only
+/// when there actually is one (a "Not provided" line used to sit at the same
+/// weight as the role).
+class _ProfileHeader extends StatelessWidget {
+  const _ProfileHeader({required this.initials, required this.name, required this.role, required this.phone});
 
-  final List<Widget> children;
-  final String? title;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 16, offset: const Offset(0, 6)),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (title != null) ...[
-            Text(
-              title!,
-              style: const TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w700,
-                color: AppColors.neutralGrey,
-                letterSpacing: 0.3,
-              ),
-            ),
-            const SizedBox(height: 12),
-          ],
-          ...children,
-        ],
-      ),
-    );
-  }
-}
-
-class _SettingsRow extends StatelessWidget {
-  const _SettingsRow({required this.icon, required this.label, required this.subtitle});
-
-  final IconData icon;
-  final String label;
-  final String subtitle;
+  final String initials;
+  final String name;
+  final String role;
+  final String phone;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
+    return AppCard(
+      padding: const EdgeInsets.all(AppSpacing.md + 4),
       child: Row(
         children: [
           Container(
-            width: 36,
-            height: 36,
-            decoration: BoxDecoration(
-              color: AppColors.primaryGreen.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(10),
+            width: 72,
+            height: 72,
+            decoration: const BoxDecoration(
+              gradient: AppColors.dashboardHeaderGradient,
+              shape: BoxShape.circle,
+              boxShadow: AppShadows.card,
             ),
-            child: Icon(icon, size: 18, color: AppColors.primaryGreen),
+            alignment: Alignment.center,
+            child: Text(
+              initials,
+              style: const TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.w800),
+            ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: AppSpacing.md),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(label, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.textDark)),
-                Text(subtitle, style: const TextStyle(fontSize: 12, color: AppColors.neutralGreyLight)),
+                Text(name, style: AppText.headline, maxLines: 2, overflow: TextOverflow.ellipsis),
+                const SizedBox(height: AppSpacing.xs),
+                if (isProvided(role))
+                  StatusChip(tone: StatusTone.approved, label: role, icon: Icons.engineering_rounded)
+                else
+                  Text('Role not set', style: AppText.bodyMuted),
+                if (isProvided(phone)) ...[
+                  const SizedBox(height: AppSpacing.xs),
+                  Row(
+                    children: [
+                      const Icon(Icons.phone_outlined, size: 14, color: AppColors.neutralGrey),
+                      const SizedBox(width: AppSpacing.xxs),
+                      Flexible(child: Text(phone, style: AppText.bodyMuted)),
+                    ],
+                  ),
+                ],
               ],
             ),
           ),
-          const Icon(Icons.chevron_right_rounded, color: AppColors.neutralGreyLight),
         ],
       ),
     );
   }
 }
 
-class _InfoRow extends StatelessWidget {
-  const _InfoRow({required this.icon, required this.label, required this.value});
+/// Read-only row in the Contact group: small label over the value, with a
+/// missing value shown muted/italic rather than as if it were data.
+class _InfoTile extends StatelessWidget {
+  const _InfoTile({required this.icon, required this.label, required this.value});
 
   final IconData icon;
   final String label;
@@ -318,30 +244,68 @@ class _InfoRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        children: [
-          Container(
-            width: 36,
-            height: 36,
-            decoration: BoxDecoration(
-              color: AppColors.primaryGreen.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(10),
+    final provided = isProvided(value);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(minHeight: 64),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+        child: Row(
+          children: [
+            Container(
+              width: 38,
+              height: 38,
+              decoration: BoxDecoration(color: AppColors.greenTint, borderRadius: BorderRadius.circular(AppRadius.md)),
+              child: Icon(icon, size: 20, color: AppColors.primaryGreenDark),
             ),
-            child: Icon(icon, size: 18, color: AppColors.primaryGreen),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(label, style: const TextStyle(fontSize: 12, color: AppColors.neutralGreyLight)),
-                Text(
-                  value,
-                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.textDark),
-                ),
-              ],
+            const SizedBox(width: AppSpacing.sm + 2),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(label, style: AppText.bodyMuted.copyWith(fontSize: 12)),
+                  const SizedBox(height: 2),
+                  Text(
+                    provided ? value : 'Not provided',
+                    style: provided
+                        ? AppText.body.copyWith(fontWeight: FontWeight.w600)
+                        : AppText.bodyMuted.copyWith(fontStyle: FontStyle.italic),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CertificationChip extends StatelessWidget {
+  const _CertificationChip({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 6),
+      decoration: BoxDecoration(
+        color: AppColors.greenTint,
+        borderRadius: BorderRadius.circular(AppRadius.pill),
+        border: Border.all(color: AppColors.primaryGreen.withValues(alpha: 0.2)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.verified_rounded, size: 15, color: AppColors.statusGreenText),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: AppColors.statusGreenText, fontWeight: FontWeight.w700, fontSize: 12.5),
             ),
           ),
         ],

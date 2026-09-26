@@ -13,10 +13,10 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../routing/app_navigator_key.dart';
 import '../screens/gemini_live_test_screen.dart';
+import '../services/gemini_token_cache.dart';
 import 'currently_viewed_job_provider.dart';
 import 'deepgram_command_capture.dart';
 import 'permission_providers.dart';
-import 'tts_voice_preference.dart';
 import 'voice_command_registry_provider.dart';
 
 /// [awaitingWakeWord] vs [listening] — CONFIRMED bug fix: both used to be
@@ -163,9 +163,7 @@ class GlobalVoiceState {
 }
 
 /// Speech rate applied to every `speak()` call app-wide (see
-/// `_configureTts`) — chosen alongside the voice itself in Voice Settings
-/// so pacing and voice stay consistent; this screen only changes which
-/// voice is used, not this pacing tuning.
+/// `_configureTts`), tuned for wake-word/prompt clarity.
 const ttsSpeechRate = 0.45;
 
 /// The ONE `SpeechToText` and ONE `FlutterTts` instance for the entire app.
@@ -238,6 +236,43 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
 
   SpeechToText _speech = SpeechToText();
   final FlutterTts _tts = FlutterTts();
+
+  /// One pre-fetched Gemini Live token, kept only while the wake word can
+  /// actually be heard (see [_syncGeminiTokenPrefetch]) so the session the
+  /// wake word starts doesn't wait on a cold token round trip.
+  final GeminiTokenCache _geminiTokens = GeminiTokenCache();
+
+  /// Set while the app is fully backgrounded — see [onAppLifecycleChanged].
+  bool _appBackgrounded = false;
+
+  /// Keeps a spare token exactly while voice is live on a job screen (in
+  /// job scope, recognizer available, not muted, app in the foreground) and
+  /// drops it from memory otherwise.
+  void _syncGeminiTokenPrefetch() {
+    if (_jobScopeActive && state.available && !state.muted && !_appBackgrounded) {
+      _geminiTokens.activate();
+    } else {
+      _geminiTokens.deactivate();
+    }
+  }
+
+  /// A token for a Gemini session starting right now — the pre-fetched
+  /// spare when there is one, otherwise fetched on demand (the old path).
+  Future<String> takeGeminiToken() => _geminiTokens.take();
+
+  /// Called from `FieldLoopApp`'s lifecycle observer. Backgrounded: drop
+  /// the spare and stop refreshing it (same release-on-pause the camera
+  /// does). Foregrounded: fetch a new spare if voice is still live.
+  void onAppLifecycleChanged(AppLifecycleState lifecycle) {
+    if (lifecycle == AppLifecycleState.paused) {
+      _appBackgrounded = true;
+    } else if (lifecycle == AppLifecycleState.resumed) {
+      _appBackgrounded = false;
+    } else {
+      return;
+    }
+    _syncGeminiTokenPrefetch();
+  }
 
   /// DIAGNOSTIC (Bluetooth-headset-mic-ignored investigation) — native
   /// (Android-only; see [_logAudioRoute]) channel backing
@@ -911,6 +946,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
             'reinit complete (was session=$sessionId), available=$available',
           );
           if (mounted) state = state.copyWith(available: available);
+          _syncGeminiTokenPrefetch();
         } catch (e, stackTrace) {
           debugPrint(
             'VOICE ERROR (stale-session reinit) [was session=$sessionId]: $e\n$stackTrace',
@@ -954,6 +990,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       debugPrint('VOICE: speech recognizer available=$available');
       if (!mounted) return;
       state = state.copyWith(available: available);
+      _syncGeminiTokenPrefetch();
       // Covers the (unusual but possible) case where a job was already
       // opened before this async initialize() resolved.
       if (available && _jobScopeActive && !state.muted && !_externallyPaused) {
@@ -972,6 +1009,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   Future<void> enterJobScope() async {
     debugPrint('VOICE: entering job scope (mic will start listening)');
     _jobScopeActive = true;
+    _syncGeminiTokenPrefetch();
     if (!mounted || !state.available || state.muted) return;
     await _startListening(reason: 'enterJobScope');
   }
@@ -984,6 +1022,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   void exitJobScope() {
     debugPrint('VOICE: exiting job scope (mic stops listening)');
     _jobScopeActive = false;
+    _syncGeminiTokenPrefetch();
     _stage = _ListenStage.idle;
     _cancelCommandSettleTimer();
     _cancelRestartDebounce();
@@ -1057,6 +1096,9 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // correctly gone silent. If listening DOES restart, _startListening's
     // own flow sets phase again almost immediately anyway.
     if (mounted) state = state.copyWith(phase: VoicePhase.idle, screenTaskActive: false);
+    // The session just used the spare (tokens are single-use) — line up the
+    // next one. No-op unless voice is still live on a job.
+    _geminiTokens.prefetch();
     if (!mounted || !_jobScopeActive || !state.available || state.muted) {
       debugPrint('VOICE: resumeAfterExternalSession($reason) — not resuming listening, guard condition not met');
       return;
@@ -1144,6 +1186,15 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// onAmbientSessionEnded] removes the entry AND completes it, together,
   /// exactly once per session — see that field's doc comment.
   Future<void> _triggerGeminiSession() async {
+    // Claimed BEFORE the recognizer is stopped below, not after: releasing
+    // the mic takes real time, and there's no reason the token (usually
+    // already pre-fetched — see [_geminiTokens]) should wait behind it. The
+    // no-op error listener only keeps an early return below from leaving a
+    // failed fetch unhandled; the session itself still awaits and reports
+    // any error exactly as before.
+    final tokenFuture = takeGeminiToken();
+    unawaited(tokenFuture.then((_) {}, onError: (Object _) {}));
+
     await pauseForExternalSession('wake_word');
 
     final jobId = _ref.read(currentlyViewedJobIdProvider);
@@ -1181,6 +1232,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       builder: (_) => GeminiLiveTestScreen(
         jobId: jobId,
         ambient: true,
+        tokenFuture: tokenFuture,
         onAmbientSessionEnded: () {
           entry.remove();
           if (!sessionEnded.isCompleted) sessionEnded.complete();
@@ -1218,6 +1270,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     debugPrint('VOICE: stopping for logout');
     _initialized = false;
     _jobScopeActive = false;
+    _geminiTokens.deactivate();
     _stage = _ListenStage.idle;
     _cancelCommandSettleTimer();
     _cancelRestartDebounce();
@@ -1241,6 +1294,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   Future<void> setMuted(bool muted) async {
     debugPrint('VOICE: ${muted ? "muting" : "unmuting"}');
     state = state.copyWith(muted: muted);
+    _syncGeminiTokenPrefetch();
     if (muted) {
       _stage = _ListenStage.idle;
       _cancelCommandSettleTimer();
@@ -1936,17 +1990,32 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
         );
         _bankedCommandText = '';
         _pendingCommandText = words.substring(matched.end).trim();
+        // Task B diagnostic: words the ON-DEVICE recognizer already heard
+        // after the wake word, in the same breath. They become
+        // `state.transcript` (what the Voice Assistant screen shows under
+        // "Listening..."), but the Gemini session's own mic only opens after
+        // this recognizer is stopped, so Gemini never hears them — if the
+        // command was all in here, nothing downstream can act on it. Compare
+        // with the session's first `VOICE PIPELINE [u=...] transcript_received`.
+        debugPrint(
+          _pendingCommandText.isEmpty
+              ? 'VOICE PIPELINE [wake] wake_word: nothing heard after the wake word yet'
+              : 'VOICE PIPELINE [wake] wake_word: on-device recognizer already heard "$_pendingCommandText" after the '
+                    'wake word — shown on screen as the transcript, but NOT passed to the Gemini session',
+        );
         _onWakeWordDetected(); // FIX 2: instant haptic + tone, fire-and-forget
         // The wake word itself was heard during `awaitingWakeWord` — this
         // is the edge into genuine active capture (see VoicePhase's doc
-        // comment). `processing`, not `listening`: unlike the old
-        // fixed-phrase flow (which listened for the rest of the command on
-        // THIS recognizer), a Gemini session is about to take over the mic
-        // entirely — see [_triggerGeminiSession] — so there's nothing for
-        // this recognizer to actively listen for right now, just a brief
-        // handoff in progress.
+        // comment). `listening` from this very moment, in the same frame as
+        // the haptic + tone above: the Gemini session that takes over the
+        // mic (see [_triggerGeminiSession]) buffers the technician's audio
+        // from right after this handoff and delivers it once connected, so
+        // from their point of view they're being listened to already. This
+        // used to be `processing` ("Thinking..."), which read as "not
+        // listening yet" for the ~2-3s of session setup and then switched
+        // visuals at setupComplete — the cold start this avoids.
         if (mounted) {
-          state = state.copyWith(transcript: _pendingCommandText, phase: VoicePhase.processing);
+          state = state.copyWith(transcript: _pendingCommandText, phase: VoicePhase.listening);
         }
         _logLatency('wake-word-detected');
         // Starts a Gemini Live session instead of the old fixed-phrase
@@ -2346,12 +2415,11 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// transcript exactly matched the tail of the prompt text). See
   /// [captureDictation] for the additional post-completion safety buffer.
   Future<void> _configureTts() async {
-    // awaitSpeakCompletion, setSpeechRate, and the saved-voice prefs read
-    // are mutually independent platform calls — fire them concurrently.
-    // Only the voice-matching tail below (getVoices -> setVoice) has a
-    // real dependency chain (setVoice needs discoverEnUsVoices()'s live
-    // result, which is only worth fetching once we know a voice was
-    // actually saved), so that part stays sequential.
+    // awaitSpeakCompletion and setSpeechRate are independent platform calls —
+    // fire them concurrently. (The technician-chosen TTS voice that used to be
+    // applied here was removed along with Voice Settings: spoken output now
+    // comes from the Gemini Live pipeline, so this legacy engine just uses the
+    // device default voice.)
     final awaitCompletionFuture = () async {
       try {
         await _tts.awaitSpeakCompletion(true);
@@ -2365,7 +2433,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     }();
 
     // Pacing tuned for wake-word/prompt clarity — applies to every speak()
-    // call from here on, not just Voice Settings' own previews.
+    // call from here on.
     final speechRateFuture = () async {
       try {
         await _tts.setSpeechRate(ttsSpeechRate);
@@ -2374,113 +2442,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       }
     }();
 
-    final savedVoiceFuture = () async {
-      try {
-        return await getSelectedTtsVoice();
-      } catch (e, stackTrace) {
-        debugPrint('VOICE ERROR (apply tts voice): $e\n$stackTrace');
-        return null;
-      }
-    }();
-
-    final results = await Future.wait<dynamic>([awaitCompletionFuture, speechRateFuture, savedVoiceFuture]);
-    final saved = results[2] as TtsVoice?;
-
-    // Applies the technician's saved voice (see VoiceSettingsScreen /
-    // tts_voice_preference.dart) — before any other TTS output can happen,
-    // since [initialize] (the only caller) always awaits this first.
-    //
-    // The saved voice is a name+locale pair, not a position, so it can only
-    // be applied once it's re-confirmed against a LIVE getVoices() result
-    // on THIS device (see [discoverEnUsVoices]): the engine that produced
-    // it may no longer be installed (reinstall, OEM/engine change), in
-    // which case there's nothing meaningful to apply and this falls back
-    // to the device's own default voice rather than calling setVoice with
-    // a name the engine won't recognize.
-    if (saved == null) {
-      debugPrint('VOICE TTS: no saved voice preference — using device default voice');
-      return;
-    }
-    try {
-      final voices = await discoverEnUsVoices();
-      if (voices.contains(saved)) {
-        await _tts.setVoice({'name': saved.name, 'locale': saved.locale});
-        debugPrint('VOICE TTS: active voice set to "${saved.name}" (${saved.locale})');
-      } else {
-        debugPrint(
-          'VOICE TTS: saved voice "${saved.name}" (${saved.locale}) no longer exists on this '
-          'device — falling back to device default voice',
-        );
-      }
-    } catch (e, stackTrace) {
-      debugPrint('VOICE ERROR (apply tts voice): $e\n$stackTrace');
-    }
-  }
-
-  /// Live, per-device voice discovery — calls flutter_tts's `getVoices()`
-  /// on THIS device (Android, iOS, and macOS all support it) and filters to
-  /// locale "en-US". Real voice names/codes differ completely by platform,
-  /// OS version, and installed TTS engine, so this is called fresh every
-  /// time a real answer is needed (Voice Settings opening, and
-  /// [_configureTts] on every app startup) rather than cached from a fixed
-  /// list. Returns an empty list — never throws — if the platform call
-  /// fails or returns something unexpected, so callers can treat "no
-  /// voices" as a normal, handleable state instead of a crash.
-  Future<List<TtsVoice>> discoverEnUsVoices() async {
-    try {
-      final raw = await _tts.getVoices;
-      if (raw is! List) {
-        debugPrint('VOICE TTS: getVoices() returned unexpected shape: $raw');
-        return const [];
-      }
-      final seen = <TtsVoice>{};
-      final voices = <TtsVoice>[];
-      for (final entry in raw) {
-        if (entry is! Map) continue;
-        final name = entry['name']?.toString();
-        final locale = entry['locale']?.toString();
-        if (name == null || locale == null) continue;
-        if (locale.toLowerCase() != 'en-us') continue;
-        final voice = TtsVoice(name: name, locale: locale);
-        // Some engines report duplicate entries for the same voice.
-        if (seen.add(voice)) voices.add(voice);
-      }
-      debugPrint('VOICE TTS: discovered ${voices.length} en-US voice(s) on this device');
-      return voices;
-    } catch (e, stackTrace) {
-      debugPrint('VOICE ERROR (discover voices): $e\n$stackTrace');
-      return const [];
-    }
-  }
-
-  /// Speaks the Voice Settings sample sentence with a specific candidate
-  /// voice, on the SAME shared `_tts` instance the rest of the app uses
-  /// (see this class's doc comment: ONE FlutterTts for the whole app), so
-  /// what's heard while previewing matches real app playback exactly. Does
-  /// NOT persist [name] as the active voice — see [setActiveVoice] for that
-  /// (tapping a row, as opposed to its Play button).
-  Future<void> previewVoice({required String name, required String locale, required String sampleText}) async {
-    try {
-      await _tts.setVoice({'name': name, 'locale': locale});
-      await _tts.speak(sampleText);
-    } catch (e, stackTrace) {
-      debugPrint('VOICE ERROR (preview voice): $e\n$stackTrace');
-    }
-  }
-
-  /// Voice Settings' row-tap handler: persists [name] as the technician's
-  /// chosen voice (see `tts_voice_preference.dart`) and applies it to the
-  /// shared `_tts` instance immediately, so the change is audible right
-  /// away without an app restart. Loaded again on every future launch by
-  /// [_configureTts].
-  Future<void> setActiveVoice({required String name, required String locale}) async {
-    await saveSelectedTtsVoice(TtsVoice(name: name, locale: locale));
-    try {
-      await _tts.setVoice({'name': name, 'locale': locale});
-      debugPrint('VOICE TTS: active voice changed to "$name" ($locale)');
-    } catch (e, stackTrace) {
-      debugPrint('VOICE ERROR (set active voice): $e\n$stackTrace');
-    }
+    await Future.wait<void>([awaitCompletionFuture, speechRateFuture]);
   }
 
   /// Marks a real network/database write as in progress with no mic open —
@@ -3203,6 +3165,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   @override
   void dispose() {
     debugPrint('VOICE: global service disposing (app shutdown)');
+    _geminiTokens.deactivate();
     _stage = _ListenStage.idle;
     _cancelCommandSettleTimer();
     _cancelRestartDebounce();

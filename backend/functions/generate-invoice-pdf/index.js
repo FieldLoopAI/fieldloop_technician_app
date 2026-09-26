@@ -82,8 +82,14 @@ exports.handler = async (event) => {
     const approved = (changeOrders || []).filter(c => c.status === 'approved' && !c.voided_at);
     const voided = (changeOrders || []).filter(c => c.voided_at);
 
+    // Manual invoice line items — same query/total as /invoices/preview.
+    const { data: adjustments } = await supabase
+      .from('invoice_adjustments').select('*').eq('job_id', jobId).order('created_at', { ascending: true });
+    const adjustmentsTotal = (adjustments || []).reduce((s, a) => s + Number(a.amount), 0);
+
     const approvedTotal = approved.reduce((s, c) => s + Number(c.additional_amount), 0);
-    const grossTotal = Number(estimate.total_amount) + approvedTotal;
+    const grossTotal = Number(estimate.total_amount) + approvedTotal + adjustmentsTotal;
+    if (grossTotal < 0) throw new Error('Invoice total cannot be negative — check the discounts');
     const feeRate = Number(contractorFinancials.platform_fee_rate) || 0.02;
     const feeAmount = Math.round(grossTotal * feeRate * 100) / 100;
 
@@ -153,6 +159,19 @@ exports.handler = async (event) => {
         y += 20;
       });
     }
+    if (adjustments && adjustments.length > 0) {
+      doc.rect(50, y, 495, 18).fill(TEAL);
+      doc.fontSize(9).fillColor('#fff').font('Helvetica-Bold').text('ADJUSTMENTS', 58, y + 5);
+      y += 18;
+      adjustments.forEach((a, i) => {
+        const amount = Number(a.amount);
+        doc.rect(50, y, 495, 20).fill(i % 2 === 0 ? LIGHT_TEAL : '#fff');
+        doc.fontSize(9).fillColor('#222').font('Helvetica')
+          .text(a.description, 58, y + 6, { width: 400 })
+          .text(`${amount < 0 ? '-' : ''}$${Math.abs(amount).toFixed(2)}`, 480, y + 6, { width: 60, align: 'right' });
+        y += 20;
+      });
+    }
     y += 10;
 
     if (voided.length > 0) {
@@ -198,6 +217,7 @@ exports.handler = async (event) => {
       net_to_contractor: grossTotal - feeAmount,
       estimate_total: estimate.total_amount,
       approved_change_orders_total: approvedTotal,
+      adjustments_total: adjustmentsTotal,
       billable_hours: job.billable_hours,
       status: 'draft',
     }).select().single();

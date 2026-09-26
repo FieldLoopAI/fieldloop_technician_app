@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'providers/global_voice_service_provider.dart';
 import 'providers/permission_providers.dart';
 import 'routing/app_navigator_key.dart';
 import 'routing/voice_route_observer.dart';
@@ -39,6 +40,9 @@ class _FieldLoopAppState extends ConsumerState<FieldLoopApp> with WidgetsBinding
       ref.read(cameraMicProvider.notifier).refresh();
       ref.read(locationProvider.notifier).refresh();
     }
+    // Drops the pre-fetched Gemini token while backgrounded, re-fetches on
+    // return — see GlobalVoiceService.onAppLifecycleChanged.
+    ref.read(globalVoiceServiceProvider.notifier).onAppLifecycleChanged(state);
   }
 
   @override

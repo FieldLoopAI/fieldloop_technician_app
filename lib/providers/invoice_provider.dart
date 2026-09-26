@@ -1,10 +1,12 @@
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/env.dart';
+import '../models/invoice_adjustment.dart';
 import '../models/invoice_preview.dart';
 
 /// Fetches a read-only preview of what a job's invoice would look like via
@@ -108,3 +110,51 @@ Future<void> sendInvoiceSms({required String invoiceId, required String pdfUrl})
   }
   debugPrint('INVOICE: SMS send succeeded for invoice $invoiceId');
 }
+
+/// Adds a manual invoice line (a fee, or a discount when [amount] is
+/// negative) — a direct `invoice_adjustments` insert, allowed for the job's
+/// lead technician by RLS (see
+/// `supabase/migrations/20260924000000_invoice_adjustments.sql`). The caller
+/// re-fetches [fetchInvoicePreview] afterward, which is where the new line
+/// and the updated totals come from.
+Future<InvoiceAdjustment> addInvoiceAdjustment({
+  required String jobId,
+  required String description,
+  required double amount,
+}) async {
+  debugPrint('INVOICE: adding manual adjustment for job $jobId ($description, $amount)...');
+  final row = await Supabase.instance.client
+      .from('invoice_adjustments')
+      .insert({'job_id': jobId, 'description': description, 'amount': amount})
+      .select()
+      .single();
+  return InvoiceAdjustment.fromJson(row);
+}
+
+/// Removes a manual invoice line added by [addInvoiceAdjustment].
+Future<void> deleteInvoiceAdjustment(String adjustmentId) async {
+  debugPrint('INVOICE: deleting manual adjustment $adjustmentId...');
+  await Supabase.instance.client.from('invoice_adjustments').delete().eq('id', adjustmentId);
+}
+
+/// A job's manual invoice lines, for surfaces that don't hold a full
+/// [InvoicePreview] (Job Detail's Invoice tab total). Invalidated by the
+/// Invoice Review screen after every add/remove. Falls back to an empty list
+/// if the read fails — e.g. before the `invoice_adjustments` migration is
+/// applied — so the tab never breaks over an optional extra.
+final jobInvoiceAdjustmentsProvider = FutureProvider.autoDispose.family<List<InvoiceAdjustment>, String>((
+  ref,
+  jobId,
+) async {
+  try {
+    final rows = await Supabase.instance.client
+        .from('invoice_adjustments')
+        .select()
+        .eq('job_id', jobId)
+        .order('created_at', ascending: true);
+    return rows.map(InvoiceAdjustment.fromJson).toList();
+  } catch (e) {
+    debugPrint('INVOICE: could not load manual adjustments for job $jobId ($e) — treating as none');
+    return const [];
+  }
+});

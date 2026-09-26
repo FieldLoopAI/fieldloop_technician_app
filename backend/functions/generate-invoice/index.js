@@ -32,8 +32,14 @@ exports.handler = async (event) => {
     const voided = (changeOrders || []).filter(c => c.voided_at);
     const declined = (changeOrders || []).filter(c => c.status === 'declined');
 
+    // Manual invoice line items (fees/discounts) — see
+    // supabase/migrations/20260924000000_invoice_adjustments.sql.
+    const { data: adjustments } = await supabase
+      .from('invoice_adjustments').select('*').eq('job_id', jobId).order('created_at', { ascending: true });
+    const adjustmentsTotal = (adjustments || []).reduce((sum, a) => sum + Number(a.amount), 0);
+
     const approvedTotal = approved.reduce((sum, c) => sum + Number(c.additional_amount), 0);
-    const grossTotal = Number(estimate.total_amount) + approvedTotal;
+    const grossTotal = Number(estimate.total_amount) + approvedTotal + adjustmentsTotal;
             const feeRate = Number(contractorFinancials.platform_fee_rate) || 0.02;
     const feeAmount = Math.round(grossTotal * feeRate * 100) / 100;
     const netToContractor = Math.round((grossTotal - feeAmount) * 100) / 100;
@@ -47,6 +53,8 @@ exports.handler = async (event) => {
         pendingChangeOrders: pending,
         voidedChangeOrders: voided,
         declinedChangeOrders: declined,
+        adjustments: adjustments || [],
+        adjustmentsTotal,
         estimateApproved: estimate.status === 'approved',
         grossTotal,
         feeRate,

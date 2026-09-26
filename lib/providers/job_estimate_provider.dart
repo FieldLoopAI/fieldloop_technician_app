@@ -222,6 +222,41 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
     return estimate;
   }
 
+  /// Manual (typed) counterpart to [parseDictation]: creates the job's
+  /// estimate from [lineItems] entered on the manual estimate editor. Same
+  /// `/estimates/parse` route (`mode: 'manual'` — no dictation, no Groq), and
+  /// the Lambda writes the identical `job_estimates` row shape the dictated
+  /// path does, so nothing downstream can tell the two apart. Throws on
+  /// failure (the editor shows the error and keeps the technician's input);
+  /// on success the new draft becomes [state] immediately.
+  Future<void> createManual(List<EstimateLineItem> lineItems) async {
+    final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
+    if (accessToken == null) {
+      throw StateError('No active session — please sign in again.');
+    }
+    debugPrint('ESTIMATE: creating manual estimate (${lineItems.length} line item(s)) for job $jobId...');
+    final response = await http.post(
+      Uri.parse('$apiBaseUrl/estimates/parse'),
+      headers: {'Authorization': 'Bearer $accessToken', 'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'mode': 'manual',
+        'jobId': jobId,
+        'lineItems': lineItems.map((item) => item.toJson()).toList(),
+      }),
+    );
+    if (response.statusCode != 200) {
+      throw StateError('Saving the estimate failed (${response.statusCode}): ${response.body}');
+    }
+    final estimateJson = (jsonDecode(response.body) as Map<String, dynamic>)['estimate'] as Map<String, dynamic>?;
+    if (estimateJson == null) {
+      throw StateError('Estimate response missing "estimate".');
+    }
+    final estimate = JobEstimate.fromJson(estimateJson);
+    debugPrint('ESTIMATE: manual estimate ${estimate.id} created for job $jobId (total=\$${estimate.totalAmount})');
+    if (!mounted) return;
+    state = AsyncData(estimate);
+  }
+
   /// Saves a technician's review edits (Feature 1: added/removed/reworded
   /// line items, corrected amounts) straight to the `job_estimates` row —
   /// RLS now permits a direct update here, same as the read above, so no

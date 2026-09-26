@@ -8,16 +8,23 @@ import '../models/job_estimate.dart';
 import '../providers/global_voice_service_provider.dart';
 import '../providers/job_dictations_provider.dart';
 import '../providers/job_estimate_provider.dart';
+import '../providers/job_runtime_provider.dart';
 import '../providers/job_status_notifications_provider.dart';
 import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
 import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
+import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
+import '../theme/design_tokens.dart';
+import '../widgets/app_components.dart';
 import '../widgets/editable_line_item_row.dart';
+import '../widgets/empty_state_actions.dart';
 import '../widgets/primary_button.dart';
 import '../widgets/status_notification_banner.dart';
 import '../widgets/voice_phase_indicator.dart';
+import 'manual_estimate_screen.dart';
 import 'voice_command_registrar_mixin.dart';
 
 /// A single itemized estimate — deliberately one proposal, not a
@@ -66,6 +73,7 @@ class EstimateScreen extends ConsumerStatefulWidget {
 class _EstimateScreenState extends ConsumerState<EstimateScreen>
     with SafeRefDisposal<EstimateScreen>, VoiceCommandRegistrarMixin<EstimateScreen> {
   bool _sending = false;
+  bool _savingDraft = false;
   String? _sendingStatus;
   bool _showConfirmation = false;
   String? _confirmationMessage;
@@ -272,8 +280,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.16 : 20.0;
+            final horizontalPadding = responsiveGutter(constraints.maxWidth, min: 20);
 
             return SingleChildScrollView(
               padding: EdgeInsets.fromLTRB(horizontalPadding, 20, horizontalPadding, 32),
@@ -365,15 +372,57 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
   }
 
   Widget _buildNoEstimateCard() {
+    // Same active-job gate Job Detail uses for its entry points — a finished
+    // job viewed from History is read-only. (Voice dictation is removed from
+    // here until it's rebuilt on Gemini Live.)
+    final editable = activeJobStatuses.contains(ref.watch(jobRuntimeProvider(widget.jobId)).status);
     return _estimateCard(
-      const Padding(
-        padding: EdgeInsets.symmetric(vertical: 6),
-        child: Text(
-          'No estimate yet — say "FieldLoop, prepare estimate" to dictate one.',
-          style: TextStyle(color: AppColors.neutralGrey, fontSize: 13),
-        ),
+      EmptyStateActions(
+        icon: Icons.receipt_long_rounded,
+        title: 'No estimate yet',
+        hint: editable
+            ? 'Add the line items for this job. It saves as a draft you can review before sending.'
+            : 'No estimate was created for this job.',
+        actionLabel: 'Create Estimate',
+        onAction: editable
+            ? () => Navigator.of(
+                context,
+              ).push(FadeSlidePageRoute(builder: (_) => ManualEstimateScreen(jobId: widget.jobId)))
+            : null,
       ),
     );
+  }
+
+  /// Saves the draft's line-item edits WITHOUT sending — the manual edit
+  /// path for an existing draft, however it was created (dictated or typed).
+  Future<void> _saveDraftEdits(JobEstimate estimate) async {
+    final items = _editableItems
+        .map((e) => EstimateLineItem(description: e.descriptionController.text.trim(), amount: e.amount))
+        .where((item) => item.description.isNotEmpty)
+        .toList();
+    if (items.isEmpty) {
+      setState(() => _sendError = 'Add at least one line item with a description before saving.');
+      return;
+    }
+    setState(() {
+      _savingDraft = true;
+      _sendError = null;
+    });
+    try {
+      final total = items.fold<double>(0, (sum, item) => sum + item.amount);
+      await ref
+          .read(jobEstimateProvider(widget.jobId).notifier)
+          .saveLineItems(estimateId: estimate.id, lineItems: items, totalAmount: total);
+      if (!mounted) return;
+      setState(() => _savingDraft = false);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Estimate changes saved.')));
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _savingDraft = false;
+        _sendError = e is StateError ? e.message : e.toString();
+      });
+    }
   }
 
   /// Feature 1 — a `status == 'draft'` estimate: every line item is a live
@@ -389,9 +438,11 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
       children: [
         _EstimateStatusBadge(status: estimate.status, voided: estimate.isVoided),
         const SizedBox(height: 12),
-        const Text(
-          'Review the AI-parsed line items below, fix anything that\'s off, then send.',
-          style: TextStyle(fontSize: 12, color: AppColors.neutralGrey),
+        Text(
+          estimate.sourceDictationId == null
+              ? 'Review the line items below, fix anything that\'s off, then send.'
+              : 'Review the AI-parsed line items below, fix anything that\'s off, then send.',
+          style: const TextStyle(fontSize: 12, color: AppColors.neutralGrey),
         ),
         const SizedBox(height: 16),
         _OriginalDictationSection(
@@ -420,25 +471,22 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
                 ),
               ),
               const Divider(height: 20),
-              Row(
-                children: [
-                  const Text(
-                    'Total',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppColors.textDark),
-                  ),
-                  const Spacer(),
-                  Text(
-                    '\$${_editableTotal.toStringAsFixed(2)}',
-                    style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
-                  ),
-                ],
+              LabelValueRow(
+                label: const Text(
+                  'Total',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppColors.textDark),
+                ),
+                value: Text(
+                  '\$${_editableTotal.toStringAsFixed(2)}',
+                  style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
+                ),
               ),
             ],
           ),
         ),
         const SizedBox(height: 20),
         if (_sendError != null) ...[
-          Text(_sendError!, style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.w600)),
+          Text(_sendError!, style: const TextStyle(color: AppColors.statusRedText, fontSize: 13, fontWeight: FontWeight.w600)),
           const SizedBox(height: 10),
         ],
         if (_sending && _sendingStatus != null) ...[
@@ -464,10 +512,19 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
               label: 'Looks good, send to customer',
               icon: Icons.send_rounded,
               isLoading: _sending,
-              onPressed: () => _sendDraftEstimate(estimate),
+              onPressed: _savingDraft ? null : () => _sendDraftEstimate(estimate),
             ),
             if (_showConfirmation) const _ConfirmationCheck(),
           ],
+        ),
+        const SizedBox(height: 10),
+        OutlinedButton.icon(
+          onPressed: (_sending || _savingDraft) ? null : () => _saveDraftEdits(estimate),
+          icon: _savingDraft
+              ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+              : const Icon(Icons.save_outlined, size: 18),
+          label: const Text('Save changes without sending'),
+          style: secondaryActionButtonStyle,
         ),
       ],
     );
@@ -493,18 +550,15 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
               else
                 for (final item in estimate.lineItems) _LineItemRow(item: item),
               const Divider(height: 28),
-              Row(
-                children: [
-                  const Text(
-                    'Total',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppColors.textDark),
-                  ),
-                  const Spacer(),
-                  Text(
-                    '\$${estimate.totalAmount.toStringAsFixed(2)}',
-                    style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
-                  ),
-                ],
+              LabelValueRow(
+                label: const Text(
+                  'Total',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppColors.textDark),
+                ),
+                value: Text(
+                  '\$${estimate.totalAmount.toStringAsFixed(2)}',
+                  style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
+                ),
               ),
               if (estimate.isVoided) ...[
                 const SizedBox(height: 10),
@@ -527,7 +581,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
         ],
         if (_voidError != null) ...[
           const SizedBox(height: 10),
-          Text(_voidError!, style: const TextStyle(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.w600)),
+          Text(_voidError!, style: const TextStyle(color: AppColors.statusRedText, fontSize: 12, fontWeight: FontWeight.w600)),
         ],
         const SizedBox(height: 16),
         _OriginalDictationSection(
@@ -554,7 +608,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
       alignment: Alignment.centerRight,
       child: TextButton(
         onPressed: _startVoiding,
-        style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+        style: TextButton.styleFrom(foregroundColor: AppColors.statusRedText),
         child: const Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -581,7 +635,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
       decoration: BoxDecoration(
         color: const Color(0xFFFDF2F2),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.redAccent.withValues(alpha: 0.25)),
+        border: Border.all(color: AppColors.statusRedText.withValues(alpha: 0.25)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -614,7 +668,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
               const SizedBox(width: 4),
               TextButton(
                 onPressed: (_voiding || !canConfirm) ? null : () => _confirmVoid(estimate),
-                style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+                style: TextButton.styleFrom(foregroundColor: AppColors.statusRedText),
                 child: _voiding
                     ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
                     : const Text('Confirm Void'),
@@ -633,14 +687,8 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
 /// site.
 Widget _estimateCard(Widget child) {
   return Container(
-    padding: const EdgeInsets.all(18),
-    decoration: BoxDecoration(
-      color: AppColors.surface,
-      borderRadius: BorderRadius.circular(16),
-      boxShadow: [
-        BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 16, offset: const Offset(0, 6)),
-      ],
-    ),
+    padding: const EdgeInsets.all(AppSpacing.md),
+    decoration: AppDecorations.card(),
     child: child,
   );
 }
@@ -680,23 +728,23 @@ class _EstimateStatusBadge extends StatelessWidget {
     switch (status) {
       case 'draft':
         fg = AppColors.neutralGrey;
-        bg = const Color(0xFFF3F4F6);
+        bg = AppColors.statusGreyTint;
         label = 'Draft';
       case 'sent':
-        fg = AppColors.amber;
-        bg = const Color(0xFFFEF3C7);
+        fg = AppColors.statusAmberText;
+        bg = AppColors.statusAmberTint;
         label = 'Sent — awaiting customer';
       case 'approved':
-        fg = AppColors.primaryGreenDark;
-        bg = const Color(0xFFE3F5E9);
+        fg = AppColors.statusGreenText;
+        bg = AppColors.greenTint;
         label = 'Approved ✓';
       case 'declined':
         fg = AppColors.neutralGrey;
-        bg = const Color(0xFFF3F4F6);
+        bg = AppColors.statusGreyTint;
         label = 'Declined';
       default:
         fg = AppColors.neutralGrey;
-        bg = const Color(0xFFF3F4F6);
+        bg = AppColors.statusGreyTint;
         label = status;
     }
     return Container(

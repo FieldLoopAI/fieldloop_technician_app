@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/complete_setup_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
 import '../widgets/primary_button.dart';
 import 'login_screen.dart';
 
@@ -89,8 +90,7 @@ class _CompleteSetupScreenState extends ConsumerState<CompleteSetupScreen> {
         child: SafeArea(
           child: LayoutBuilder(
             builder: (context, constraints) {
-              final isTablet = constraints.maxWidth > 600;
-              final horizontalPadding = isTablet ? constraints.maxWidth * 0.22 : 24.0;
+              final horizontalPadding = responsiveGutter(constraints.maxWidth, maxContentWidth: ContentWidth.form, min: 24);
 
               return SingleChildScrollView(
                 padding: EdgeInsets.symmetric(horizontal: horizontalPadding, vertical: 32),

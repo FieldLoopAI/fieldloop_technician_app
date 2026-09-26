@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12,7 +12,8 @@ import '../providers/job_photos_provider.dart';
 import '../providers/job_voice_commands.dart';
 import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
-import '../theme/app_theme.dart';
+import '../theme/design_tokens.dart';
+import '../theme/responsive.dart';
 import '../widgets/error_banner.dart';
 import '../widgets/primary_button.dart';
 import '../widgets/voice_phase_indicator.dart';
@@ -185,90 +186,121 @@ class _PhotoPreviewScreenState extends ConsumerState<PhotoPreviewScreen>
 
   @override
   Widget build(BuildContext context) {
+    final retake = OutlinedButton.icon(
+      onPressed: _uploading ? null : _retake,
+      icon: const Icon(Icons.replay_rounded),
+      label: const Text('Retake'),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: Colors.white,
+        side: const BorderSide(color: Colors.white70),
+        minimumSize: const Size.fromHeight(54),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+      ),
+    );
+    final confirm = PrimaryButton(
+      label: 'Confirm',
+      icon: Icons.check_rounded,
+      isLoading: _uploading,
+      onPressed: _uploading ? null : _confirm,
+    );
+    final error = _error == null
+        ? null
+        : ErrorBanner(message: _error!, onDismiss: () => setState(() => _error = null));
+
+    // Full screen, on black: the captured photo gets every pixel the
+    // buttons don't need, shown whole (contain, not cropped) since the
+    // point of this step is checking the entire frame. Buttons sit beside
+    // the photo rather than on top of it — below in portrait, in a side
+    // column in landscape.
     return PopScope(
       canPop: !_uploading,
-      child: Scaffold(
-        backgroundColor: AppColors.background,
-        appBar: AppBar(
-          title: const Text('Review Photo'),
-          backgroundColor: AppColors.surface,
-          foregroundColor: AppColors.textDark,
-          elevation: 0,
-          automaticallyImplyLeading: false,
-          actions: const [
-            Padding(padding: EdgeInsets.only(right: 14), child: Center(child: VoicePhaseIndicator())),
-          ],
-        ),
-        body: SafeArea(
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              // Same tablet-aware treatment as the capture screen — on a
-              // wide viewport, full-bleed padding stretches the image and
-              // buttons uncomfortably wide.
-              final isTablet = constraints.maxWidth > 600;
-              final horizontalPadding = isTablet ? constraints.maxWidth * 0.12 : 16.0;
+      child: AnnotatedRegion<SystemUiOverlayStyle>(
+        value: SystemUiOverlayStyle.light,
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: SafeArea(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final sideColumn = constraints.maxWidth > constraints.maxHeight;
+                final photo = Image.file(File(widget.imagePath), fit: BoxFit.contain)
+                    .animate()
+                    .fadeIn(duration: 250.ms)
+                    .scale(begin: const Offset(0.96, 0.96), end: const Offset(1, 1), duration: 250.ms, curve: Curves.easeOut);
+                const header = Padding(
+                  padding: EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.sm, AppSpacing.sm, AppSpacing.sm),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Review Photo',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      DecoratedBox(
+                        decoration: BoxDecoration(color: Colors.white, shape: BoxShape.circle),
+                        child: Padding(padding: EdgeInsets.all(AppSpacing.xxs), child: VoicePhaseIndicator()),
+                      ),
+                    ],
+                  ),
+                );
 
-              return Padding(
-                padding: EdgeInsets.fromLTRB(horizontalPadding, 16, horizontalPadding, 16),
-                child: Column(
-                  children: [
-                Expanded(
-                  child:
-                      ClipRRect(
-                            borderRadius: BorderRadius.circular(20),
-                            child: Container(
-                              width: double.infinity,
-                              color: const Color(0xFF15181A),
-                              child: Image.file(File(widget.imagePath), fit: BoxFit.contain),
-                            ),
-                          )
-                          .animate()
-                          .fadeIn(duration: 250.ms)
-                          .scale(
-                            begin: const Offset(0.94, 0.94),
-                            end: const Offset(1, 1),
-                            duration: 250.ms,
-                            curve: Curves.easeOut,
-                          ),
-                ),
-                if (_error != null) ...[
-                  const SizedBox(height: 12),
-                  ErrorBanner(message: _error!, onDismiss: () => setState(() => _error = null)),
-                ],
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    Expanded(
-                      child: SizedBox(
-                        height: 54,
-                        child: OutlinedButton.icon(
-                          onPressed: _uploading ? null : _retake,
-                          icon: const Icon(Icons.replay_rounded),
-                          label: const Text('Retake'),
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: AppColors.primaryGreenDark,
-                            side: const BorderSide(color: AppColors.primaryGreen),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                            textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                if (sideColumn) {
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Expanded(child: photo),
+                      SizedBox(
+                        width: (constraints.maxWidth * 0.3).clamp(200.0, 320.0),
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.only(right: AppSpacing.md, bottom: AppSpacing.md),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              header,
+                              if (error != null) ...[error, const SizedBox(height: AppSpacing.sm)],
+                              confirm,
+                              const SizedBox(height: AppSpacing.sm),
+                              retake,
+                            ],
                           ),
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: PrimaryButton(
-                        label: 'Confirm',
-                        icon: Icons.check_rounded,
-                        isLoading: _uploading,
-                        onPressed: _uploading ? null : _confirm,
+                    ],
+                  );
+                }
+
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    MaxWidthBox(child: header),
+                    Expanded(child: photo),
+                    MaxWidthBox(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.sm, AppSpacing.md, AppSpacing.md),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            if (error != null) ...[error, const SizedBox(height: AppSpacing.sm)],
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(child: retake),
+                                const SizedBox(width: AppSpacing.sm),
+                                Expanded(child: confirm),
+                              ],
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ],
-                ),
-                  ],
-                ),
-              );
-            },
+                );
+              },
+            ),
           ),
         ),
       ),

@@ -6,6 +6,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../providers/permission_providers.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
 import '../widgets/primary_button.dart';
 import 'root_shell.dart';
 
@@ -111,8 +112,7 @@ class _PermissionsSetupScreenState extends ConsumerState<PermissionsSetupScreen>
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.15 : 20.0;
+            final horizontalPadding = responsiveGutter(constraints.maxWidth, min: 20);
 
             return SingleChildScrollView(
               padding: EdgeInsets.fromLTRB(horizontalPadding, 20, horizontalPadding, 24),

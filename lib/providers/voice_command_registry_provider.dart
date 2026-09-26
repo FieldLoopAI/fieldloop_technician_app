@@ -57,6 +57,10 @@ class VoiceCommandRegistry extends StateNotifier<Map<String, VoiceCommand>> {
   /// which only knows about that one screen's own calls.
   DateTime? _lastChangeAt;
 
+  /// Read-only, for dispatch-time diagnostics (the Gemini session's VOICE
+  /// PIPELINE log) — when the registry last changed.
+  DateTime? get lastChangeAt => _lastChangeAt;
+
   /// Below this gap between two consecutive registry changes, they're
   /// flagged as a "rapid swap" — the suspected trigger for voice going
   /// stale after quick screen transitions (e.g. Photo Preview's

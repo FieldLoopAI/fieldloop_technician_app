@@ -18,8 +18,12 @@ import '../config/env.dart';
 /// confirmation either way — the change order is saved successfully
 /// regardless of `smsSent`. Throws on failure — callers decide what to tell
 /// the technician (see `handleChangeOrderCommand` in
-/// `job_voice_commands.dart`, the only caller).
-Future<bool> createChangeOrder({required String jobId, required String description}) async {
+/// `job_voice_commands.dart`, and the manual change order form).
+///
+/// [amount] — set by the manual form only: a typed amount the Lambda uses
+/// as-is instead of extracting one from [description] with Groq. Everything
+/// else (pending status, customer approval SMS) is identical either way.
+Future<bool> createChangeOrder({required String jobId, required String description, double? amount}) async {
   final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
   if (accessToken == null) {
     throw StateError('No active session — please sign in again.');
@@ -29,7 +33,7 @@ Future<bool> createChangeOrder({required String jobId, required String descripti
   final response = await http.post(
     Uri.parse('$apiBaseUrl/change-orders/create'),
     headers: {'Authorization': 'Bearer $accessToken', 'Content-Type': 'application/json'},
-    body: jsonEncode({'jobId': jobId, 'description': description}),
+    body: jsonEncode({'jobId': jobId, 'description': description, 'amount': ?amount}),
   );
   if (response.statusCode != 200) {
     throw StateError('Saving the change order failed (${response.statusCode}): ${response.body}');

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
@@ -6,16 +7,18 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../models/change_order.dart';
 import '../models/job_photo.dart';
 import '../models/mock_job.dart';
-import '../models/mock_line_item.dart';
 import '../providers/arrival_provider.dart';
 import '../providers/auth_provider.dart';
 import '../providers/currently_viewed_job_provider.dart';
 import '../providers/estimate_invoice_providers.dart';
+import '../providers/invoice_provider.dart';
 import '../providers/global_voice_service_provider.dart';
 import '../providers/job_complete_provider.dart';
-import '../providers/job_dictations_provider.dart';
+import '../providers/job_change_orders_provider.dart';
+import '../providers/job_estimate_provider.dart';
 import '../providers/job_history_provider.dart';
 import '../providers/job_photos_provider.dart';
 import '../providers/job_runtime_provider.dart';
@@ -28,6 +31,11 @@ import '../providers/visit_tracking_service.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
+import '../theme/design_tokens.dart';
+import '../widgets/app_components.dart';
+import '../widgets/approval_status_pill.dart';
+import '../widgets/empty_state_actions.dart';
 import '../widgets/job_history_feed_timeline.dart';
 import '../widgets/job_photo_thumbnail.dart';
 import '../widgets/pending_upload_badge.dart';
@@ -38,13 +46,12 @@ import '../widgets/tap_scale.dart';
 import '../widgets/voice_phase_indicator.dart';
 import 'change_orders_screen.dart';
 import 'estimate_screen.dart';
-import 'gemini_live_test_screen.dart';
 import 'invoice_review_screen.dart';
-import 'invoice_screen.dart';
 import 'job_history_screen.dart';
+import 'manual_change_order_screen.dart';
+import 'manual_estimate_screen.dart';
 import 'photo_capture_screen.dart';
 import 'photo_viewer_screen.dart';
-import 'voice_assistant_screen.dart';
 import 'voice_command_registrar_mixin.dart';
 
 enum _DetailTab { estimate, changeOrders, invoice, history }
@@ -64,8 +71,70 @@ String _formatElapsed(Duration d) {
   return '$hours:$minutes:$seconds';
 }
 
-double _sum(List<MockLineItem> items) =>
-    items.fold<double>(0, (total, item) => total + item.amount);
+/// Same rule as ChangeOrdersScreen's running total and the invoice Lambdas:
+/// only a still-active approval (approved AND not voided) counts.
+double _approvedChangeOrdersTotal(List<ChangeOrder> changeOrders) => changeOrders
+    .where((co) => co.isApproved && !co.isVoided)
+    .fold<double>(0, (total, co) => total + co.additionalAmount);
+
+
+/// Opens the real invoice review (`/invoices/preview`) — the tap-only
+/// counterpart to the "Generate Invoice" voice/tap flow, without its spoken
+/// summary. Shows the backend's own message (e.g. no estimate yet) inline
+/// instead of navigating when the preview can't be built.
+class _ViewInvoiceButton extends ConsumerStatefulWidget {
+  const _ViewInvoiceButton({required this.jobId});
+
+  final String jobId;
+
+  @override
+  ConsumerState<_ViewInvoiceButton> createState() => _ViewInvoiceButtonState();
+}
+
+class _ViewInvoiceButtonState extends ConsumerState<_ViewInvoiceButton> {
+  bool _loading = false;
+
+  Future<void> _open() async {
+    setState(() => _loading = true);
+    try {
+      final preview = await fetchInvoicePreview(jobId: widget.jobId);
+      if (!mounted) return;
+      setState(() => _loading = false);
+      await Navigator.of(
+        context,
+      ).push(FadeSlidePageRoute(builder: (_) => InvoiceReviewScreen(jobId: widget.jobId, preview: preview)));
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(e is StateError ? e.message : "Couldn't load the invoice — try again.")));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return OutlinedButton(
+      onPressed: _loading ? null : _open,
+      style: secondaryActionButtonStyle,
+      child: _loading
+          ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+          : const Text('View Full Invoice'),
+    );
+  }
+}
+
+class _TabLoading extends StatelessWidget {
+  const _TabLoading();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.symmetric(vertical: 24),
+      child: Center(child: CircularProgressIndicator(color: AppColors.primaryGreen)),
+    );
+  }
+}
 
 class JobDetailScreen extends ConsumerStatefulWidget {
   const JobDetailScreen({super.key, required this.jobId});
@@ -80,8 +149,15 @@ class JobDetailScreen extends ConsumerStatefulWidget {
 const double _geofenceRadiusMeters = 45.0;
 
 class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
-    with SafeRefDisposal<JobDetailScreen>, VoiceCommandRegistrarMixin<JobDetailScreen> {
+    with
+        SafeRefDisposal<JobDetailScreen>,
+        VoiceCommandRegistrarMixin<JobDetailScreen>,
+        SingleTickerProviderStateMixin<JobDetailScreen> {
   _DetailTab _tab = _DetailTab.estimate;
+
+  /// Drives the tab bar's animated indicator only — [_tab] stays the source of
+  /// truth for which tab content shows.
+  late final TabController _tabController;
   Timer? _ticker;
   StreamSubscription<Position>? _positionSub;
 
@@ -135,6 +211,7 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: _DetailTab.values.length, vsync: this);
     _voiceService = capture((ref) => ref.read(globalVoiceServiceProvider.notifier));
     _visitTrackingService = capture((ref) => ref.read(visitTrackingServiceProvider));
     _viewedJobIdController = capture((ref) => ref.read(currentlyViewedJobIdProvider.notifier));
@@ -209,6 +286,7 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
         _viewedJobIdController.state = null;
       });
     }
+    _tabController.dispose();
     super.dispose();
   }
 
@@ -439,8 +517,6 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
 
     final runtime = ref.watch(jobRuntimeProvider(widget.jobId));
     final photos = ref.watch(jobPhotosProvider(widget.jobId)).valueOrNull ?? const [];
-    final estimateItems = ref.watch(estimateLineItemsProvider(widget.jobId));
-    final changeOrders = ref.watch(changeOrdersProvider(widget.jobId));
     final estimateStatus = ref.watch(estimateStatusProvider(widget.jobId));
     final invoiceStatus = ref.watch(invoiceStatusProvider(widget.jobId));
 
@@ -467,8 +543,7 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.14 : 16.0;
+            final horizontalPadding = responsiveGutter(constraints.maxWidth);
 
             return SingleChildScrollView(
               padding: EdgeInsets.fromLTRB(horizontalPadding, 16, horizontalPadding, 40),
@@ -476,35 +551,52 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   _JobHeaderCard(job: job, status: runtime.status),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: AppSpacing.md),
                   _ArrivalCard(jobId: widget.jobId, runtime: runtime),
                   if (runtime.status == JobStatus.onSite) ...[
-                    const SizedBox(height: 12),
+                    const SizedBox(height: AppSpacing.sm),
                     _VisitControlsCard(jobId: widget.jobId),
                   ],
-                  if (_voiceEligible) ...[
-                    const SizedBox(height: 16),
-                    _VoiceSessionButton(jobId: widget.jobId),
-                    const SizedBox(height: 10),
-                    _AskQuestionButton(jobId: widget.jobId),
-                    const SizedBox(height: 10),
-                    _GeminiVoiceButton(jobId: widget.jobId),
-                  ],
-                  const SizedBox(height: 24),
+                  const SizedBox(height: AppSpacing.lg),
                   _PhotoStrip(jobId: widget.jobId, photos: photos, canAddPhotos: _voiceEligible),
-                  const SizedBox(height: 28),
-                  _TabSelector(selected: _tab, onChanged: (tab) => setState(() => _tab = tab)),
-                  const SizedBox(height: 16),
-                  _TabContent(
-                    tab: _tab,
-                    job: job,
-                    estimateItems: estimateItems,
-                    changeOrders: changeOrders,
-                    estimateStatus: estimateStatus,
-                    invoiceStatus: invoiceStatus,
-                    voiceEligible: _voiceEligible,
+                  // Clear break between "this visit" (header, site status,
+                  // photos) and the job's paperwork tabs below.
+                  const SizedBox(height: AppSpacing.lg),
+                  const Divider(height: 1, thickness: 1, color: AppSurfaces.outline),
+                  const SizedBox(height: AppSpacing.md),
+                  _TabSelector(
+                    jobId: widget.jobId,
+                    controller: _tabController,
+                    onChanged: (tab) => setState(() => _tab = tab),
                   ),
-                  const SizedBox(height: 28),
+                  const SizedBox(height: AppSpacing.md),
+                  // Quick crossfade + slight rise on tab switch (200ms) —
+                  // enough to read as a change, never slow enough to wait on.
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 200),
+                    switchInCurve: Curves.easeOut,
+                    switchOutCurve: Curves.easeIn,
+                    transitionBuilder: (child, animation) => FadeTransition(
+                      opacity: animation,
+                      child: SlideTransition(
+                        position: Tween(begin: const Offset(0, 0.02), end: Offset.zero).animate(animation),
+                        child: child,
+                      ),
+                    ),
+                    layoutBuilder: (current, previous) => Stack(
+                      alignment: Alignment.topCenter,
+                      children: [...previous, ?current],
+                    ),
+                    child: _TabContent(
+                      key: ValueKey(_tab),
+                      tab: _tab,
+                      job: job,
+                      estimateStatus: estimateStatus,
+                      invoiceStatus: invoiceStatus,
+                      voiceEligible: _voiceEligible,
+                    ),
+                  ),
+                  const SizedBox(height: AppSpacing.xl),
                   _JobCompleteButton(jobId: widget.jobId, runtime: runtime),
                 ],
               ),
@@ -522,52 +614,66 @@ class _JobHeaderCard extends StatelessWidget {
   final MockJob job;
   final JobStatus status;
 
+  /// The most important card on the screen, so it gets the raised shadow and
+  /// a brand-green accent bar down its leading edge.
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 16, offset: const Offset(0, 6)),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  job.customerName,
-                  style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700, color: AppColors.textDark),
+      decoration: AppDecorations.card(shadow: AppShadows.raised),
+      clipBehavior: Clip.antiAlias,
+      child: IntrinsicHeight(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(width: 6, color: AppColors.primaryGreen),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.md, AppSpacing.md, AppSpacing.md),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(child: Text(job.customerName, style: AppText.headline)),
+                        const SizedBox(width: AppSpacing.xs),
+                        StatusPill(status: status.wireValue),
+                      ],
+                    ),
+                    const SizedBox(height: AppSpacing.sm),
+                    _HeaderInfoRow(icon: Icons.location_on_rounded, text: job.serviceAddress),
+                    const SizedBox(height: AppSpacing.xs),
+                    _HeaderInfoRow(icon: Icons.handyman_rounded, text: '${job.tradeCategory} · ${job.description}'),
+                  ],
                 ),
               ),
-              StatusPill(status: status.wireValue),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              const Icon(Icons.location_on_outlined, size: 16, color: AppColors.neutralGreyLight),
-              const SizedBox(width: 4),
-              Expanded(
-                child: Text(
-                  job.serviceAddress,
-                  style: const TextStyle(fontSize: 13.5, color: AppColors.neutralGrey),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 4),
-          Text(
-            '${job.tradeCategory} · ${job.description}',
-            style: const TextStyle(fontSize: 13.5, color: AppColors.neutralGrey),
-          ),
-        ],
+            ),
+          ],
+        ),
       ),
-    ).animate().fadeIn(duration: 300.ms).slideY(begin: 0.05, end: 0, duration: 300.ms);
+    ).animate().fadeIn(duration: 250.ms).slideY(begin: 0.04, end: 0, duration: 250.ms);
+  }
+}
+
+class _HeaderInfoRow extends StatelessWidget {
+  const _HeaderInfoRow({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(top: 1),
+          child: Icon(icon, size: 16, color: AppColors.primaryGreenDark),
+        ),
+        const SizedBox(width: AppSpacing.xs),
+        Expanded(child: Text(text, style: AppText.bodyMuted.copyWith(fontSize: 13.5))),
+      ],
+    );
   }
 }
 
@@ -1049,129 +1155,6 @@ class _ReadOnlyBadge extends StatelessWidget {
   }
 }
 
-class _VoiceSessionButton extends StatelessWidget {
-  const _VoiceSessionButton({required this.jobId});
-
-  final String jobId;
-
-  @override
-  Widget build(BuildContext context) {
-    return TapScale(
-      onTap: () => Navigator.of(
-        context,
-      ).push(FadeSlidePageRoute(builder: (_) => VoiceAssistantScreen(jobId: jobId))),
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
-        decoration: BoxDecoration(
-          color: AppColors.textDark,
-          borderRadius: BorderRadius.circular(14),
-          boxShadow: [
-            BoxShadow(color: Colors.black.withValues(alpha: 0.15), blurRadius: 16, offset: const Offset(0, 8)),
-          ],
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Container(
-                  padding: const EdgeInsets.all(6),
-                  decoration: const BoxDecoration(color: AppColors.primaryGreen, shape: BoxShape.circle),
-                  child: const Icon(Icons.mic_rounded, color: Colors.white, size: 18),
-                )
-                .animate(onPlay: (c) => c.repeat(reverse: true))
-                .scale(begin: const Offset(1, 1), end: const Offset(1.15, 1.15), duration: 900.ms),
-            const SizedBox(width: 12),
-            const Text(
-              'Start Voice Session',
-              style: TextStyle(color: Colors.white, fontSize: 15.5, fontWeight: FontWeight.w700),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// Manual tap-fallback entry point for the Gemini Live voice system — now
-/// the app's single, permanent voice system (normally reached by saying
-/// "FieldLoop"/"Loop On", see `GlobalVoiceService._triggerGeminiSession`),
-/// not a parallel beta mode any more. Kept as a tap equivalent purely
-/// because every other voice feature in this app has one (see
-/// [_AskQuestionButton] etc.) — no "BETA" badge any more, since this isn't
-/// an experiment alongside the real system, it now leads to the same real
-/// system the wake word does. Still visually distinct from the [_VoiceSessionButton]/
-/// [_AskQuestionButton] pair above (an indigo/violet accent, a different
-/// icon) so it doesn't read as a duplicate of either.
-///
-/// Pushes [GeminiLiveTestScreen] with [jobId] set (NOT `ambient` — this
-/// keeps its manual Start/Stop/log debug-style UI, unlike the wake-word
-/// path's auto-starting ambient one), which is what actually makes this
-/// the REAL job's assistant rather than the standalone debug tool: every
-/// dispatched function call gets this exact [jobId] forced into its
-/// `job_id` argument (see that screen's `_handleToolCall`), reusing the
-/// same token service / dispatcher / function set the wake-word path uses.
-/// No new voice/session logic lives here, this is a navigation entry point
-/// only. Ending the session (its own "Stop Session" button, "Loop Off"/
-/// "FieldLoop stop" spoken to Gemini, or just navigating back) pops back to
-/// this exact screen, already unaffected — see that screen's
-/// `_stopTest`/`dispose`/`_teardown`.
-class _GeminiVoiceButton extends StatelessWidget {
-  const _GeminiVoiceButton({required this.jobId});
-
-  final String jobId;
-
-  @override
-  Widget build(BuildContext context) {
-    return TapScale(
-      onTap: () => Navigator.of(
-        context,
-      ).push(FadeSlidePageRoute(builder: (_) => GeminiLiveTestScreen(jobId: jobId))),
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
-        decoration: BoxDecoration(
-          color: const Color(0xFFF3F0FF),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: const Color(0xFF7C5CFC), width: 1.5),
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.auto_awesome_rounded, color: Color(0xFF7C5CFC), size: 18),
-            const SizedBox(width: 10),
-            const Text(
-              'Voice Assistant',
-              style: TextStyle(color: Color(0xFF4B2FBD), fontSize: 14.5, fontWeight: FontWeight.w700),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// Tap fallback for the "help"/"ask"/"question" voice trigger — runs the
-/// exact same [handleAskQuestionCommand] the voice trigger does (greeting,
-/// then listen, then the troubleshooting Lambda round-trip), same fallback
-/// principle as every other voice feature in this app (see
-/// `handleDictationCommand`'s "Dictate Estimate" tap button, above).
-class _AskQuestionButton extends ConsumerWidget {
-  const _AskQuestionButton({required this.jobId});
-
-  final String jobId;
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    return SizedBox(
-      width: double.infinity,
-      child: OutlinedButton.icon(
-        onPressed: () => handleAskQuestionCommand(ref: ref, jobId: jobId),
-        icon: const Icon(Icons.help_outline_rounded, size: 18),
-        label: const Text('Ask a Question'),
-        style: _outlineButtonStyle,
-      ),
-    );
-  }
-}
-
 class _PhotoStrip extends ConsumerWidget {
   const _PhotoStrip({required this.jobId, required this.photos, required this.canAddPhotos});
 
@@ -1193,19 +1176,24 @@ class _PhotoStrip extends ConsumerWidget {
       children: [
         Row(
           children: [
-            Text(
-              'Photos (${photos.length})',
-              style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.textDark),
+            Expanded(
+              child: Text(
+                'Photos (${photos.length})',
+                style: AppText.title,
+              ),
             ),
-            const Spacer(),
-            PendingUploadBadge(jobId: jobId),
+            Flexible(child: PendingUploadBadge(jobId: jobId)),
           ],
         ),
         const SizedBox(height: 10),
         SizedBox(
-          height: 96,
+          height: 104,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
+            // Room for the thumbnails' shadows, which the default hard-edge
+            // clip would otherwise cut off.
+            clipBehavior: Clip.none,
+            padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
             itemCount: canAddPhotos ? photos.length + 1 : photos.length,
             separatorBuilder: (_, _) => const SizedBox(width: 10),
             itemBuilder: (context, index) {
@@ -1242,37 +1230,42 @@ class _PhotoStrip extends ConsumerWidget {
                 onTap: () => Navigator.of(
                   context,
                 ).push(FadeSlidePageRoute(builder: (_) => PhotoViewerScreen(photo: photo))),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(12),
-                  child: SizedBox(
-                    width: 84,
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        JobPhotoThumbnail(photo: photo),
-                        if (photo.status == JobPhotoStatus.uploading)
-                          Container(
-                            color: Colors.black.withValues(alpha: 0.35),
-                            alignment: Alignment.center,
-                            child: const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                child: Container(
+                  // Soft lift matching the new card style; the ClipRRect
+                  // inside keeps the image corners rounded.
+                  decoration: BoxDecoration(borderRadius: AppRadius.tile, boxShadow: AppShadows.card),
+                  child: ClipRRect(
+                    borderRadius: AppRadius.tile,
+                    child: SizedBox(
+                      width: 84,
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          JobPhotoThumbnail(photo: photo),
+                          if (photo.status == JobPhotoStatus.uploading)
+                            Container(
+                              color: Colors.black.withValues(alpha: 0.35),
+                              alignment: Alignment.center,
+                              child: const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                              ),
                             ),
-                          ),
-                        if (photo.status == JobPhotoStatus.failed)
-                          Container(
-                            color: Colors.black.withValues(alpha: 0.45),
-                            alignment: Alignment.center,
-                            child: const Icon(Icons.error_outline_rounded, color: Colors.white, size: 20),
-                          ),
-                        if (photo.status == JobPhotoStatus.queuedOffline)
-                          Container(
-                            color: Colors.black.withValues(alpha: 0.35),
-                            alignment: Alignment.center,
-                            child: const Icon(Icons.cloud_upload_outlined, color: Colors.white, size: 18),
-                          ),
-                      ],
+                          if (photo.status == JobPhotoStatus.failed)
+                            Container(
+                              color: Colors.black.withValues(alpha: 0.45),
+                              alignment: Alignment.center,
+                              child: const Icon(Icons.error_outline_rounded, color: Colors.white, size: 20),
+                            ),
+                          if (photo.status == JobPhotoStatus.queuedOffline)
+                            Container(
+                              color: Colors.black.withValues(alpha: 0.35),
+                              alignment: Alignment.center,
+                              child: const Icon(Icons.cloud_upload_outlined, color: Colors.white, size: 18),
+                            ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -1285,10 +1278,18 @@ class _PhotoStrip extends ConsumerWidget {
   }
 }
 
-class _TabSelector extends StatelessWidget {
-  const _TabSelector({required this.selected, required this.onChanged});
+/// Material 3 tab bar for the four job tabs: an icon per tab for fast
+/// recognition, a pill indicator that slides between tabs, and clear
+/// active/inactive weight and color. Each tab is a 48dp-tall target for
+/// one-handed / gloved use, and carries a small status hint where it helps at
+/// a glance: an amber count of change orders still awaiting the customer's
+/// approval, and the running invoice total. Reads the same real providers the
+/// tab contents do; [onChanged] is the only thing that switches tabs.
+class _TabSelector extends ConsumerWidget {
+  const _TabSelector({required this.jobId, required this.controller, required this.onChanged});
 
-  final _DetailTab selected;
+  final String jobId;
+  final TabController controller;
   final ValueChanged<_DetailTab> onChanged;
 
   static const _labels = {
@@ -1298,31 +1299,102 @@ class _TabSelector extends StatelessWidget {
     _DetailTab.history: 'Job History',
   };
 
+  static const _icons = {
+    _DetailTab.estimate: Icons.receipt_long_rounded,
+    _DetailTab.changeOrders: Icons.post_add_rounded,
+    _DetailTab.invoice: Icons.request_quote_rounded,
+    _DetailTab.history: Icons.history_rounded,
+  };
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final estimate = ref.watch(jobEstimateProvider(jobId)).valueOrNull;
+    final changeOrders = ref.watch(jobChangeOrdersProvider(jobId)).valueOrNull ?? const <ChangeOrder>[];
+    final adjustments = ref.watch(jobInvoiceAdjustmentsProvider(jobId)).valueOrNull ?? const [];
+    final pendingCount = changeOrders.where((co) => co.isPending).length;
+    final invoiceTotal = estimate == null
+        ? null
+        : estimate.totalAmount +
+              _approvedChangeOrdersTotal(changeOrders) +
+              adjustments.fold<double>(0, (sum, a) => sum + a.amount);
+
+    Widget? trailingFor(_DetailTab tab) => switch (tab) {
+      _DetailTab.changeOrders when pendingCount > 0 => _TabBadge(
+        label: '$pendingCount',
+        foreground: StatusTone.pending.foreground,
+        background: StatusTone.pending.background,
+        semanticLabel: '$pendingCount pending approval',
+      ),
+      _DetailTab.invoice when invoiceTotal != null && invoiceTotal > 0 => _TabBadge(
+        label: '\$${invoiceTotal.toStringAsFixed(0)}',
+        foreground: StatusTone.approved.foreground,
+        background: StatusTone.approved.background,
+        semanticLabel: 'total \$${invoiceTotal.toStringAsFixed(2)}',
+      ),
+      _ => null,
+    };
+
+    // 48dp touch target at normal text sizes, growing with the system text
+    // size so a large accessibility setting never clips the labels.
+    final tabHeight = math.max(48.0, MediaQuery.textScalerOf(context).scale(14) * 1.4 + 16);
+
+    return TabBar(
+      controller: controller,
+      isScrollable: true,
+      tabAlignment: TabAlignment.start,
+      padding: EdgeInsets.zero,
+      labelPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm),
+      dividerColor: Colors.transparent,
+      splashBorderRadius: BorderRadius.circular(AppRadius.pill),
+      // Soft green pill that slides under the active tab.
+      indicatorSize: TabBarIndicatorSize.tab,
+      indicator: BoxDecoration(color: AppColors.greenTint, borderRadius: BorderRadius.circular(AppRadius.pill)),
+      labelColor: AppColors.primaryGreenDark,
+      unselectedLabelColor: AppColors.neutralGrey,
+      labelStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+      unselectedLabelStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+      onTap: (index) => onChanged(_DetailTab.values[index]),
+      tabs: [
+        for (final tab in _DetailTab.values)
+          Tab(
+            height: tabHeight,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(_icons[tab], size: 18),
+                const SizedBox(width: 6),
+                Text(_labels[tab]!),
+                if (trailingFor(tab) case final trailing?) ...[const SizedBox(width: 6), trailing],
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _TabBadge extends StatelessWidget {
+  const _TabBadge({
+    required this.label,
+    required this.foreground,
+    required this.background,
+    required this.semanticLabel,
+  });
+
+  final String label;
+  final Color foreground;
+  final Color background;
+  final String semanticLabel;
+
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      child: Row(
-        children: _DetailTab.values.map((tab) {
-          final isSelected = tab == selected;
-          return Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: ChoiceChip(
-              label: Text(_labels[tab]!),
-              selected: isSelected,
-              onSelected: (_) => onChanged(tab),
-              selectedColor: AppColors.primaryGreen,
-              backgroundColor: AppColors.surface,
-              labelStyle: TextStyle(
-                color: isSelected ? Colors.white : AppColors.neutralGrey,
-                fontWeight: FontWeight.w700,
-                fontSize: 12.5,
-              ),
-              side: BorderSide(color: isSelected ? AppColors.primaryGreen : AppColors.borderGrey),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-            ),
-          );
-        }).toList(),
+    return Semantics(
+      label: semanticLabel,
+      excludeSemantics: true,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+        decoration: BoxDecoration(color: background, borderRadius: BorderRadius.circular(10)),
+        child: Text(label, style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w800, color: foreground)),
       ),
     );
   }
@@ -1330,10 +1402,9 @@ class _TabSelector extends StatelessWidget {
 
 class _TabContent extends ConsumerWidget {
   const _TabContent({
+    super.key,
     required this.tab,
     required this.job,
-    required this.estimateItems,
-    required this.changeOrders,
     required this.estimateStatus,
     required this.invoiceStatus,
     required this.voiceEligible,
@@ -1341,8 +1412,6 @@ class _TabContent extends ConsumerWidget {
 
   final _DetailTab tab;
   final MockJob job;
-  final List<MockLineItem> estimateItems;
-  final List<MockLineItem> changeOrders;
   final EstimateStatus estimateStatus;
   final InvoiceStatus invoiceStatus;
 
@@ -1356,46 +1425,43 @@ class _TabContent extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     switch (tab) {
       case _DetailTab.estimate:
+        // Real `job_estimates` data — the same provider EstimateScreen,
+        // ChangeOrdersScreen's running total and the invoice all read.
+        // Voice dictation ("Dictate Estimate") is removed from here until
+        // it's rebuilt on Gemini Live; manual entry is the one action.
+        final estimateAsync = ref.watch(jobEstimateProvider(job.id));
+        final estimate = estimateAsync.valueOrNull;
         return _SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              if (estimateItems.isEmpty)
-                const Text('No estimate yet', style: TextStyle(color: AppColors.neutralGrey))
+              if (estimateAsync.isLoading && estimate == null)
+                const _TabLoading()
+              else if (estimate == null)
+                EmptyStateActions(
+                  icon: Icons.receipt_long_rounded,
+                  title: 'No estimate yet',
+                  hint: voiceEligible
+                      ? 'Add the line items for this job. It saves as a draft you can review before sending.'
+                      : 'No estimate was created for this job.',
+                  actionLabel: 'Create Estimate',
+                  onAction: voiceEligible
+                      ? () => Navigator.of(
+                          context,
+                        ).push(FadeSlidePageRoute(builder: (_) => ManualEstimateScreen(jobId: job.id)))
+                      : null,
+                )
               else ...[
-                for (final item in estimateItems) _LineItemRow(item: item),
+                for (final item in estimate.lineItems) _LineItemRow(description: item.description, amount: item.amount),
                 const Divider(height: 24),
-                _TotalRow(label: 'Estimate total', amount: _sum(estimateItems)),
-              ],
-              const SizedBox(height: 14),
-              OutlinedButton(
-                onPressed: () => Navigator.of(
-                  context,
-                ).push(FadeSlidePageRoute(builder: (_) => EstimateScreen(jobId: job.id))),
-                style: _outlineButtonStyle,
-                child: const Text('View Full Estimate'),
-              ),
-              if (voiceEligible) ...[
-                const SizedBox(height: 10),
-                // Tap fallback for the "prepare estimate" voice command —
-                // runs the exact same handleDictationCommand the voice
-                // handler does (see job_voice_commands.dart), same fallback
-                // principle as every other voice feature in this app.
-                // Wrapped in its own Consumer since _TabContent is a plain
-                // StatelessWidget with no `ref` of its own.
-                Consumer(
-                  builder: (context, ref, _) => OutlinedButton.icon(
-                    onPressed: () => handleDictationCommand(
-                      ref: ref,
-                      jobId: job.id,
-                      commandType: DictationCommandType.prepareEstimate,
-                      prompt: 'Go ahead, describe the work and price',
-                      savedLabel: 'Estimate note saved.',
-                    ),
-                    icon: const Icon(Icons.mic_rounded, size: 18),
-                    label: const Text('Dictate Estimate'),
-                    style: _outlineButtonStyle,
-                  ),
+                _TotalRow(label: 'Estimate total', amount: estimate.totalAmount),
+                const SizedBox(height: 14),
+                OutlinedButton(
+                  onPressed: () => Navigator.of(
+                    context,
+                  ).push(FadeSlidePageRoute(builder: (_) => EstimateScreen(jobId: job.id))),
+                  style: secondaryActionButtonStyle,
+                  child: Text(estimate.isDraft && voiceEligible ? 'Review & Edit Estimate' : 'View Full Estimate'),
                 ),
               ],
             ],
@@ -1403,35 +1469,55 @@ class _TabContent extends ConsumerWidget {
         );
 
       case _DetailTab.changeOrders:
+        // Real `change_orders` rows. "Dictate Change Order" is removed until
+        // voice dictation is rebuilt on Gemini Live; manual entry is the one
+        // action (still pending + customer SMS approval, same as before).
+        final changeOrdersAsync = ref.watch(jobChangeOrdersProvider(job.id));
+        final changeOrders = changeOrdersAsync.valueOrNull ?? const <ChangeOrder>[];
+        final approvedTotal = _approvedChangeOrdersTotal(changeOrders);
+        void addChangeOrder() => Navigator.of(
+          context,
+        ).push(FadeSlidePageRoute(builder: (_) => ManualChangeOrderScreen(jobId: job.id)));
         return _SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              if (changeOrders.isEmpty)
-                const Text('No change orders yet', style: TextStyle(color: AppColors.neutralGrey))
+              if (changeOrdersAsync.isLoading && changeOrdersAsync.valueOrNull == null)
+                const _TabLoading()
+              else if (changeOrders.isEmpty)
+                EmptyStateActions(
+                  icon: Icons.post_add_rounded,
+                  title: 'No change orders yet',
+                  hint: voiceEligible
+                      ? 'Add extra work found on site. The customer is texted to approve it before it counts '
+                            'toward the total.'
+                      : 'No change orders were added to this job.',
+                  actionLabel: 'Add Change Order',
+                  onAction: voiceEligible ? addChangeOrder : null,
+                )
               else ...[
-                for (final item in changeOrders) _LineItemRow(item: item),
+                for (var i = 0; i < changeOrders.length; i++) ...[
+                  if (i > 0) const SizedBox(height: AppSpacing.xs),
+                  _ChangeOrderRow(changeOrder: changeOrders[i]),
+                ],
                 const Divider(height: 24),
-                _TotalRow(label: 'Change orders total', amount: _sum(changeOrders)),
-              ],
-              const SizedBox(height: 14),
-              OutlinedButton(
-                onPressed: () => Navigator.of(
-                  context,
-                ).push(FadeSlidePageRoute(builder: (_) => ChangeOrdersScreen(jobId: job.id))),
-                style: _outlineButtonStyle,
-                child: const Text('View Change Orders'),
-              ),
-              if (voiceEligible) ...[
-                const SizedBox(height: 10),
-                // Tap fallback for the "change order" voice command — runs
-                // the exact same handleChangeOrderCommand the voice trigger
-                // does, same fallback principle as "Dictate Estimate" above.
-                OutlinedButton.icon(
-                  onPressed: () => handleChangeOrderCommand(ref: ref, jobId: job.id),
-                  icon: const Icon(Icons.mic_rounded, size: 18),
-                  label: const Text('Add Change Order'),
-                  style: _outlineButtonStyle,
+                _TotalRow(label: 'Approved additional work', amount: approvedTotal),
+                const SizedBox(height: 14),
+                if (voiceEligible) ...[
+                  FilledButton.icon(
+                    onPressed: addChangeOrder,
+                    icon: const Icon(Icons.add_rounded, size: 20),
+                    label: const Text('Add Change Order'),
+                    style: primaryActionButtonStyle,
+                  ),
+                  const SizedBox(height: 10),
+                ],
+                OutlinedButton(
+                  onPressed: () => Navigator.of(
+                    context,
+                  ).push(FadeSlidePageRoute(builder: (_) => ChangeOrdersScreen(jobId: job.id))),
+                  style: secondaryActionButtonStyle,
+                  child: const Text('View Change Orders'),
                 ),
               ],
             ],
@@ -1439,52 +1525,60 @@ class _TabContent extends ConsumerWidget {
         );
 
       case _DetailTab.invoice:
-        final total = _sum(estimateItems) + _sum(changeOrders);
+        // Real totals — the same estimate + approved change orders + manual
+        // invoice lines the server bills (was mock line items).
+        final estimate = ref.watch(jobEstimateProvider(job.id)).valueOrNull;
+        final changeOrders = ref.watch(jobChangeOrdersProvider(job.id)).valueOrNull ?? const <ChangeOrder>[];
+        final adjustments = ref.watch(jobInvoiceAdjustmentsProvider(job.id)).valueOrNull ?? const [];
+        final total =
+            (estimate?.totalAmount ?? 0) +
+            _approvedChangeOrdersTotal(changeOrders) +
+            adjustments.fold<double>(0, (sum, a) => sum + a.amount);
         return _SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Row(
-                children: [
-                  const Text(
-                    'Payment status',
-                    style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textDark),
-                  ),
-                  const Spacer(),
-                  _InvoiceStatusBadge(status: invoiceStatus),
-                ],
-              ),
-              const SizedBox(height: 14),
-              _TotalRow(label: 'Invoice total', amount: total),
-              const SizedBox(height: 14),
-              OutlinedButton(
-                onPressed: () => Navigator.of(
-                  context,
-                ).push(FadeSlidePageRoute(builder: (_) => InvoiceScreen(jobId: job.id))),
-                style: _outlineButtonStyle,
-                child: const Text('View Full Invoice'),
-              ),
-              if (voiceEligible) ...[
-                const SizedBox(height: 10),
-                // Tap fallback for the "FieldLoop, generate invoice" voice
-                // command — runs the exact same handleGenerateInvoiceCommand
-                // the voice trigger does (real /invoices/preview Lambda call,
-                // spoken summary, then InvoiceReviewScreen), same fallback
-                // principle as "Dictate Estimate"/"Add Change Order" above.
-                // Distinct from "View Full Invoice" above, which is the
-                // older mock payment-status flow (estimate_invoice_providers.dart).
-                OutlinedButton.icon(
-                  onPressed: () => handleGenerateInvoiceCommand(
-                    ref: ref,
-                    jobId: job.id,
-                    navigate: (preview) => Navigator.of(context).push(
-                      FadeSlidePageRoute(builder: (_) => InvoiceReviewScreen(jobId: job.id, preview: preview)),
-                    ),
-                  ),
-                  icon: const Icon(Icons.mic_rounded, size: 18),
-                  label: const Text('Generate Invoice'),
-                  style: _outlineButtonStyle,
+              LabelValueRow(
+                label: const Text(
+                  'Payment status',
+                  style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textDark),
                 ),
+                value: _InvoiceStatusBadge(status: invoiceStatus),
+              ),
+              const SizedBox(height: 14),
+              if (estimate == null)
+                const EmptyStateActions(
+                  icon: Icons.request_quote_rounded,
+                  title: 'Nothing to invoice yet',
+                  hint: 'The invoice is built from the estimate and approved change orders — create the '
+                      'estimate first on the Estimate tab.',
+                )
+              else ...[
+                _TotalRow(label: 'Invoice total', amount: total),
+                const SizedBox(height: 14),
+                // Opens the REAL invoice review (was the mock-backed
+                // InvoiceScreen) — where manual fees/discounts are added.
+                _ViewInvoiceButton(jobId: job.id),
+                if (voiceEligible) ...[
+                  const SizedBox(height: 10),
+                  // Tap fallback for the "FieldLoop, generate invoice" voice
+                  // command — runs the exact same handleGenerateInvoiceCommand
+                  // the voice trigger does (real /invoices/preview Lambda call,
+                  // spoken summary, then InvoiceReviewScreen), same fallback
+                  // principle as "Dictate Estimate"/"Add Change Order" above.
+                  OutlinedButton.icon(
+                    onPressed: () => handleGenerateInvoiceCommand(
+                      ref: ref,
+                      jobId: job.id,
+                      navigate: (preview) => Navigator.of(context).push(
+                        FadeSlidePageRoute(builder: (_) => InvoiceReviewScreen(jobId: job.id, preview: preview)),
+                      ),
+                    ),
+                    icon: const Icon(Icons.mic_rounded, size: 18),
+                    label: const Text('Generate Invoice'),
+                    style: secondaryActionButtonStyle,
+                  ),
+                ],
               ],
             ],
           ),
@@ -1504,7 +1598,10 @@ class _TabContent extends ConsumerWidget {
               historyAsync.when(
                 data: (entries) {
                   final preview = entries.reversed.take(5).toList();
-                  return JobHistoryFeedTimeline(entries: preview);
+                  return JobHistoryFeedTimeline(
+                    entries: preview,
+                    photos: ref.watch(jobPhotosProvider(job.id)).valueOrNull ?? const [],
+                  );
                 },
                 loading: () => const Padding(
                   padding: EdgeInsets.symmetric(vertical: 24),
@@ -1539,14 +1636,6 @@ class _TabContent extends ConsumerWidget {
   }
 }
 
-final _outlineButtonStyle = OutlinedButton.styleFrom(
-  foregroundColor: AppColors.primaryGreenDark,
-  side: const BorderSide(color: AppColors.primaryGreen),
-  padding: const EdgeInsets.symmetric(vertical: 14),
-  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-  textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13.5),
-);
-
 class _SectionCard extends StatelessWidget {
   const _SectionCard({required this.child});
 
@@ -1556,23 +1645,18 @@ class _SectionCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 14, offset: const Offset(0, 6)),
-        ],
-      ),
+      padding: const EdgeInsets.all(AppSpacing.md),
+      decoration: AppDecorations.card(),
       child: child,
-    ).animate().fadeIn(duration: 250.ms);
+    );
   }
 }
 
 class _LineItemRow extends StatelessWidget {
-  const _LineItemRow({required this.item});
+  const _LineItemRow({required this.description, required this.amount});
 
-  final MockLineItem item;
+  final String description;
+  final double amount;
 
   @override
   Widget build(BuildContext context) {
@@ -1581,14 +1665,63 @@ class _LineItemRow extends StatelessWidget {
       child: Row(
         children: [
           Expanded(
-            child: Text(
-              item.description,
-              style: const TextStyle(fontSize: 13.5, color: AppColors.textDark),
-            ),
+            child: Text(description, style: const TextStyle(fontSize: 14, color: AppColors.textDark)),
           ),
           Text(
-            '\$${item.amount.toStringAsFixed(2)}',
-            style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: AppColors.textDark),
+            '\$${amount.toStringAsFixed(2)}',
+            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.textDark),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// One change order on the Change Orders tab: description, amount, and its
+/// approval state as a colored pill ([ApprovalStatusPill]) so pending /
+/// approved / declined reads at a glance without opening it. Rows that don't
+/// count toward "Approved additional work" (pending, declined, voided) have
+/// their amount de-emphasized and struck through when voided.
+class _ChangeOrderRow extends StatelessWidget {
+  const _ChangeOrderRow({required this.changeOrder});
+
+  final ChangeOrder changeOrder;
+
+  @override
+  Widget build(BuildContext context) {
+    final counts = changeOrder.isApproved && !changeOrder.isVoided;
+    // Its own tile (muted surface inside the tab card) so each change order
+    // scans as a separate item.
+    return Container(
+      padding: const EdgeInsets.all(AppSpacing.sm),
+      decoration: AppDecorations.tile(),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  changeOrder.description,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 14, color: AppColors.textDark),
+                ),
+                const SizedBox(height: 6),
+                ApprovalStatusPill(status: changeOrder.status, voided: changeOrder.isVoided),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          Text(
+            '\$${changeOrder.additionalAmount.toStringAsFixed(2)}',
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+              color: counts ? AppColors.textDark : AppColors.neutralGrey,
+              decoration: changeOrder.isVoided ? TextDecoration.lineThrough : null,
+            ),
           ),
         ],
       ),
@@ -1604,15 +1737,9 @@ class _TotalRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Text(label, style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.w700, color: AppColors.textDark)),
-        const Spacer(),
-        Text(
-          '\$${amount.toStringAsFixed(2)}',
-          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
-        ),
-      ],
+    return LabelValueRow(
+      label: Text(label, style: AppText.title.copyWith(fontSize: 15)),
+      value: Text('\$${amount.toStringAsFixed(2)}', style: AppText.total),
     );
   }
 }
@@ -1622,31 +1749,18 @@ class _InvoiceStatusBadge extends StatelessWidget {
 
   final InvoiceStatus status;
 
+  /// Same [StatusTone]s as change-order approval: not yet invoiced = neutral,
+  /// pending = amber, paid = green.
   @override
-  Widget build(BuildContext context) {
-    late final Color fg;
-    late final Color bg;
-    late final String label;
-    switch (status) {
-      case InvoiceStatus.notYetInvoiced:
-        fg = AppColors.neutralGrey;
-        bg = const Color(0xFFF3F4F6);
-        label = 'Not Yet Invoiced';
-      case InvoiceStatus.pending:
-        fg = AppColors.amber;
-        bg = const Color(0xFFFEF3C7);
-        label = 'Pending';
-      case InvoiceStatus.paid:
-        fg = AppColors.primaryGreenDark;
-        bg = const Color(0xFFE3F5E9);
-        label = 'Paid';
-    }
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(20)),
-      child: Text(label, style: TextStyle(color: fg, fontSize: 12, fontWeight: FontWeight.w700)),
-    );
-  }
+  Widget build(BuildContext context) => switch (status) {
+    InvoiceStatus.notYetInvoiced => const StatusChip(
+      tone: StatusTone.neutral,
+      label: 'Not Yet Invoiced',
+      icon: Icons.receipt_long_rounded,
+    ),
+    InvoiceStatus.pending => const StatusChip(tone: StatusTone.pending, label: 'Pending'),
+    InvoiceStatus.paid => const StatusChip(tone: StatusTone.approved, label: 'Paid'),
+  };
 }
 
 /// Tap fallback for the `job_complete` voice command
@@ -1822,7 +1936,7 @@ class _JobCompleteButtonState extends ConsumerState<_JobCompleteButton> {
             ),
             if (_error != null) ...[
               const SizedBox(height: 8),
-              Text(_error!, style: const TextStyle(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.w600)),
+              Text(_error!, style: const TextStyle(color: AppColors.statusRedText, fontSize: 12, fontWeight: FontWeight.w600)),
             ],
             const SizedBox(height: 12),
             Row(

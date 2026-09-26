@@ -2,7 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 
 import '../models/job_history_entry.dart';
+import '../models/job_photo.dart';
 import '../theme/app_theme.dart';
+import '../theme/design_tokens.dart';
+import 'job_photo_thumbnail.dart';
 
 String _formatTime(DateTime dt) {
   final hour12 = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
@@ -16,24 +19,36 @@ String _formatTime(DateTime dt) {
 /// matches `JobHistoryTimeline` (icon + connecting line) but works off live
 /// [JobHistoryEntry] rows instead of mock data, and makes photo entries
 /// tappable via [onTapPhoto].
+///
+/// [photos] — the job's already-loaded photo list (`jobPhotosProvider`, the
+/// same one the photo strip and [onTapPhoto] resolve against). When a photo
+/// entry's `s3ObjectKey` matches one, its node shows that photo's thumbnail
+/// instead of a plain camera icon, so the history scans at a glance. Purely
+/// presentational: no extra fetch, and entries without a match look as
+/// before.
 class JobHistoryFeedTimeline extends StatelessWidget {
-  const JobHistoryFeedTimeline({super.key, required this.entries, this.onTapPhoto});
+  const JobHistoryFeedTimeline({super.key, required this.entries, this.onTapPhoto, this.photos = const []});
 
   final List<JobHistoryEntry> entries;
   final void Function(JobHistoryEntry entry)? onTapPhoto;
+  final List<JobPhoto> photos;
 
   @override
   Widget build(BuildContext context) {
     if (entries.isEmpty) {
       return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 24),
-        child: Center(
-          child: Text(
-            'No activity yet',
-            style: TextStyle(color: AppColors.neutralGrey, fontSize: 14),
-          ),
-        ),
+        padding: EdgeInsets.symmetric(vertical: AppSpacing.lg),
+        child: Center(child: Text('No activity yet', style: AppText.bodyMuted)),
       );
+    }
+
+    JobPhoto? photoFor(JobHistoryEntry entry) {
+      final key = entry.s3ObjectKey;
+      if (key == null) return null;
+      for (final photo in photos) {
+        if (photo.s3Key == key) return photo;
+      }
+      return null;
     }
 
     return Column(
@@ -41,6 +56,8 @@ class JobHistoryFeedTimeline extends StatelessWidget {
         for (var i = 0; i < entries.length; i++)
           _TimelineTile(
             entry: entries[i],
+            photo: photoFor(entries[i]),
+            isFirst: i == 0,
             isLast: i == entries.length - 1,
             index: i,
             onTap: entries[i].isPhoto && onTapPhoto != null ? () => onTapPhoto!(entries[i]) : null,
@@ -51,40 +68,54 @@ class JobHistoryFeedTimeline extends StatelessWidget {
 }
 
 class _TimelineTile extends StatelessWidget {
-  const _TimelineTile({required this.entry, required this.isLast, required this.index, this.onTap});
+  const _TimelineTile({
+    required this.entry,
+    required this.photo,
+    required this.isFirst,
+    required this.isLast,
+    required this.index,
+    this.onTap,
+  });
 
   final JobHistoryEntry entry;
+  final JobPhoto? photo;
+  final bool isFirst;
   final bool isLast;
   final int index;
   final VoidCallback? onTap;
 
+  static const double _nodeSize = 38;
+
   @override
   Widget build(BuildContext context) {
+    final muted = entry.isVoided;
     final tile = IntrinsicHeight(
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Column(
-            children: [
-              Container(
-                width: 34,
-                height: 34,
-                decoration: BoxDecoration(
-                  color: AppColors.primaryGreen.withValues(alpha: 0.1),
-                  shape: BoxShape.circle,
-                ),
-                child: Icon(entry.icon, size: 17, color: AppColors.primaryGreen),
-              ),
-              if (!isLast)
-                Expanded(
-                  child: Container(width: 2, color: AppColors.borderGrey, margin: const EdgeInsets.symmetric(vertical: 2)),
-                ),
-            ],
+          SizedBox(
+            width: _nodeSize,
+            child: Column(
+              children: [
+                _node(muted),
+                if (!isLast)
+                  Expanded(
+                    child: Container(
+                      width: 2,
+                      margin: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
+                      decoration: BoxDecoration(
+                        color: AppSurfaces.outline,
+                        borderRadius: BorderRadius.circular(1),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: AppSpacing.sm),
           Expanded(
             child: Padding(
-              padding: EdgeInsets.only(bottom: isLast ? 0 : 20, top: 4),
+              padding: EdgeInsets.only(bottom: isLast ? 0 : AppSpacing.md, top: 2),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -94,40 +125,30 @@ class _TimelineTile extends StatelessWidget {
                       Expanded(
                         child: Text(
                           entry.description,
-                          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.textDark),
+                          style: AppText.body.copyWith(
+                            fontWeight: FontWeight.w600,
+                            color: muted ? AppColors.neutralGrey : AppColors.textDark,
+                          ),
                         ),
                       ),
                       if (entry.isVoided) ...[
                         const SizedBox(width: 6),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFF3F4F6),
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: const Text(
-                            'Voided',
-                            style: TextStyle(color: AppColors.neutralGrey, fontSize: 11, fontWeight: FontWeight.w700),
-                          ),
-                        ),
+                        const StatusChip(tone: StatusTone.neutral, label: 'Voided', icon: Icons.block_rounded),
                       ],
                       if (onTap != null)
                         const Padding(
-                          padding: EdgeInsets.only(left: 6, top: 2),
-                          child: Icon(Icons.chevron_right_rounded, size: 18, color: AppColors.neutralGreyLight),
+                          padding: EdgeInsets.only(left: 6, top: 1),
+                          child: Icon(Icons.chevron_right_rounded, size: 20, color: AppColors.neutralGrey),
                         ),
                     ],
                   ),
                   const SizedBox(height: 2),
-                  Text(
-                    _formatTime(entry.timestamp),
-                    style: const TextStyle(fontSize: 12.5, color: AppColors.neutralGreyLight),
-                  ),
+                  Text(_formatTime(entry.timestamp), style: AppText.bodyMuted.copyWith(fontSize: 12.5)),
                   if (entry.isVoided) ...[
-                    const SizedBox(height: 4),
+                    const SizedBox(height: AppSpacing.xxs),
                     Text(
                       'Void reason: ${entry.voidReason ?? '—'}',
-                      style: const TextStyle(fontSize: 12, color: AppColors.neutralGrey, fontStyle: FontStyle.italic),
+                      style: AppText.bodyMuted.copyWith(fontSize: 12, fontStyle: FontStyle.italic),
                     ),
                   ],
                 ],
@@ -142,9 +163,45 @@ class _TimelineTile extends StatelessWidget {
       color: Colors.transparent,
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
         child: tile,
       ),
-    ).animate(delay: (50 * index).ms).fadeIn(duration: 300.ms).slideX(begin: 0.05, end: 0, duration: 300.ms);
+    ).animate(delay: (40 * index).ms).fadeIn(duration: 220.ms).slideX(begin: 0.04, end: 0, duration: 220.ms);
+  }
+
+  /// The timeline node: the photo itself for a matched photo entry,
+  /// otherwise the entry's icon in a ringed circle. The newest entry
+  /// ([isFirst]) gets the filled brand accent.
+  Widget _node(bool muted) {
+    final matched = photo;
+    if (matched != null) {
+      return Container(
+        width: _nodeSize,
+        height: _nodeSize,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+          border: Border.all(color: AppSurfaces.card, width: 2),
+          boxShadow: AppShadows.card,
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: JobPhotoThumbnail(photo: matched, iconSize: 14),
+      );
+    }
+    final accent = isFirst && !muted;
+    return Container(
+      width: _nodeSize,
+      height: _nodeSize,
+      decoration: BoxDecoration(
+        color: accent ? AppColors.primaryGreen : AppColors.greenTint,
+        shape: BoxShape.circle,
+        border: Border.all(color: AppSurfaces.card, width: 3),
+        boxShadow: AppShadows.card,
+      ),
+      child: Icon(
+        entry.icon,
+        size: 17,
+        color: accent ? Colors.white : (muted ? AppColors.neutralGrey : AppColors.primaryGreenDark),
+      ),
+    );
   }
 }

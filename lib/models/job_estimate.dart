@@ -1,20 +1,35 @@
 /// A single structured line item within a [JobEstimate] — as extracted by
 /// Groq from the technician's verbatim dictation (see
-/// `backend/functions/parse-estimate-dictation`).
+/// `backend/functions/parse-estimate-dictation`), or typed in on the manual
+/// estimate editor.
+///
+/// [amount] is the line total and the ONLY value anything downstream reads
+/// (change-order running totals, `/invoices/preview`, the invoice PDF).
+/// [quantity]/[unitPrice] are optional extras the manual editor records so a
+/// line can be re-edited as qty × price; dictated items leave them null.
 class EstimateLineItem {
-  const EstimateLineItem({required this.description, required this.amount});
+  const EstimateLineItem({required this.description, required this.amount, this.quantity, this.unitPrice});
 
   final String description;
   final double amount;
+  final double? quantity;
+  final double? unitPrice;
 
   factory EstimateLineItem.fromJson(Map<String, dynamic> json) {
     return EstimateLineItem(
       description: json['description'] as String? ?? '',
       amount: (json['amount'] as num?)?.toDouble() ?? 0,
+      quantity: (json['quantity'] as num?)?.toDouble(),
+      unitPrice: (json['unit_price'] as num?)?.toDouble(),
     );
   }
 
-  Map<String, dynamic> toJson() => {'description': description, 'amount': amount};
+  Map<String, dynamic> toJson() => {
+    'description': description,
+    'amount': amount,
+    if (quantity != null) 'quantity': quantity,
+    if (unitPrice != null) 'unit_price': unitPrice,
+  };
 }
 
 /// A parsed, structured estimate for a job — the `job_estimates` row

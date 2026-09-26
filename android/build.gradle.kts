@@ -56,3 +56,16 @@ subprojects {
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
+
+// flutter_sound's plugin module depends on the prebuilt
+// `com.github.canardoux:flutter_sound_core:9.30.0` from JitPack; every
+// subproject gets the vendored, patched copy in ./flutter_sound_core instead
+// (same version, one class changed — see flutter_sound_core/README.md).
+subprojects {
+    configurations.all {
+        resolutionStrategy.dependencySubstitution {
+            substitute(module("com.github.canardoux:flutter_sound_core"))
+                .using(project(":flutter_sound_core"))
+        }
+    }
+}

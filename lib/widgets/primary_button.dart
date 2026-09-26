@@ -45,7 +45,10 @@ class _PrimaryButtonState extends State<PrimaryButton> {
         curve: Curves.easeOut,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 200),
-          height: 54,
+          // A minimum, not a fixed height: at large accessibility text
+          // sizes the label wraps and the button grows instead of clipping.
+          constraints: const BoxConstraints(minHeight: 54),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(14),
             gradient: _enabled
@@ -82,12 +85,15 @@ class _PrimaryButtonState extends State<PrimaryButton> {
                       Icon(widget.icon, color: Colors.white, size: 20),
                       const SizedBox(width: 8),
                     ],
-                    Text(
-                      widget.label,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
+                    Flexible(
+                      child: Text(
+                        widget.label,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                     ),
                   ],

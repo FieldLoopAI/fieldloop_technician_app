@@ -242,7 +242,9 @@ class _VoiceInteractionOverlayState extends ConsumerState<VoiceInteractionOverla
     final screenSize = media.size;
     final topInset = media.padding.top;
 
-    final cornerCenter = Offset(screenSize.width - 14 - _cornerSize / 2, topInset + 28);
+    // padding.right: the AppBar indicator this flies from sits clear of a
+    // landscape notch, so the start point must too.
+    final cornerCenter = Offset(screenSize.width - media.padding.right - 14 - _cornerSize / 2, topInset + 28);
     final centeredCenter = Offset(screenSize.width / 2, screenSize.height / 2 - 20);
     final currentSize = _cornerSize + (_largeSize - _cornerSize) * t;
     final currentCenter = Offset.lerp(cornerCenter, centeredCenter, t)!;

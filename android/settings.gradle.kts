@@ -24,3 +24,6 @@ plugins {
 }
 
 include(":app")
+
+// Vendored, patched flutter_sound_core — see flutter_sound_core/README.md.
+include(":flutter_sound_core")

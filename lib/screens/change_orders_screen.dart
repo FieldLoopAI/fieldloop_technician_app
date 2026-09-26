@@ -7,16 +7,24 @@ import '../models/change_order.dart';
 import '../providers/global_voice_service_provider.dart';
 import '../providers/job_change_orders_provider.dart';
 import '../providers/job_estimate_provider.dart';
+import '../providers/job_runtime_provider.dart';
 import '../providers/job_status_notifications_provider.dart';
 import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
 import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
+import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
+import '../theme/design_tokens.dart';
+import '../widgets/app_components.dart';
+import '../widgets/approval_status_pill.dart';
 import '../widgets/editable_line_item_row.dart';
+import '../widgets/empty_state_actions.dart';
 import '../widgets/primary_button.dart';
 import '../widgets/status_notification_banner.dart';
 import '../widgets/voice_phase_indicator.dart';
+import 'manual_change_order_screen.dart';
 import 'voice_command_registrar_mixin.dart';
 
 /// Review screen for every `change_orders` row on a job — pending (awaiting
@@ -29,7 +37,7 @@ import 'voice_command_registrar_mixin.dart';
 /// items use). Once a customer has approved or declined a row, it renders
 /// as plain read-only text ([_ReadOnlyLineItemRow]) — genuinely
 /// non-editable, not merely a disabled `TextField` — and its only action is
-/// starting a brand-new change order via `handleChangeOrderCommand`; an
+/// starting a brand-new change order (the manual form, for now); an
 /// approved price or scope is never edited in place. The database backs
 /// this up independently: the `change_orders` RLS UPDATE policy only
 /// permits a technician to update a row while it's still `status =
@@ -43,7 +51,7 @@ import 'voice_command_registrar_mixin.dart';
 /// A pending row's save button reads "Looks good, send to customer" to
 /// match the Estimate screen's button, but it does not actually trigger a
 /// new SMS: the customer's approval-request text already went out
-/// automatically when `handleChangeOrderCommand` created the row (see
+/// automatically when the row was created (see
 /// `backend/functions/create-change-order`), before any review could
 /// happen. There's no backend endpoint to re-send a corrected message, so
 /// the button just saves the edit and the row shows a note that a
@@ -99,6 +107,10 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
 
   @override
   List<VoiceCommand> buildVoiceCommands() => jobLifecycleVoiceCommands(ref, widget.jobId);
+
+  void _addChangeOrderManually() => Navigator.of(
+    context,
+  ).push(FadeSlidePageRoute(builder: (_) => ManualChangeOrderScreen(jobId: widget.jobId)));
 
   // Refetch-on-focus fallback for a customer's approval/decline, which
   // happens outside the app on their phone (see
@@ -293,8 +305,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.16 : 20.0;
+            final horizontalPadding = responsiveGutter(constraints.maxWidth, min: 20);
 
             return changeOrdersAsync.when(
               loading: () => const Center(child: CircularProgressIndicator(color: AppColors.primaryGreen)),
@@ -319,6 +330,9 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                     .where((co) => !co.isVoided)
                     .fold<double>(0, (sum, co) => sum + co.additionalAmount);
                 final runningTotal = estimateTotal + approvedTotal;
+                // Same active-job gate Job Detail uses for its voice/tap entry
+                // points — a finished job viewed from History is read-only.
+                final editable = activeJobStatuses.contains(ref.watch(jobRuntimeProvider(widget.jobId)).status);
 
                 return SingleChildScrollView(
                   padding: EdgeInsets.fromLTRB(horizontalPadding, 20, horizontalPadding, 32),
@@ -344,15 +358,27 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                       const SizedBox(height: 24),
                       if (changeOrders.isEmpty)
                         _card(
-                          const Padding(
-                            padding: EdgeInsets.symmetric(vertical: 6),
-                            child: Text(
-                              'No change orders yet — say "FieldLoop, change order" to dictate one.',
-                              style: TextStyle(color: AppColors.neutralGrey, fontSize: 13),
-                            ),
+                          EmptyStateActions(
+                            icon: Icons.post_add_rounded,
+                            title: 'No change orders yet',
+                            hint: editable
+                                ? 'Add extra work found on site. The customer is texted to approve it before '
+                                    'it counts toward the total.'
+                                : 'No change orders were added to this job.',
+                            actionLabel: 'Add Change Order',
+                            onAction: editable ? _addChangeOrderManually : null,
                           ),
                         )
                       else ...[
+                        if (editable) ...[
+                          FilledButton.icon(
+                            onPressed: _addChangeOrderManually,
+                            icon: const Icon(Icons.add_rounded, size: 20),
+                            label: const Text('Add Change Order'),
+                            style: primaryActionButtonStyle,
+                          ),
+                          const SizedBox(height: 20),
+                        ],
                         if (pending.isNotEmpty) ...[
                           _sectionLabel('Awaiting customer approval', AppColors.amber),
                           const SizedBox(height: 10),
@@ -449,7 +475,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
           children: [
             Row(
               children: [
-                _ChangeOrderStatusBadge(status: changeOrder.status, voided: isVoided),
+                ApprovalStatusPill(status: changeOrder.status, voided: isVoided),
                 if (changeOrder.isApproved && changeOrder.approvedAt != null) ...[
                   const SizedBox(width: 8),
                   Text(
@@ -491,7 +517,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
             if (showError) ...[
               Text(
                 _errorMessage ?? 'Something went wrong',
-                style: const TextStyle(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.w600),
+                style: const TextStyle(color: AppColors.statusRedText, fontSize: 12, fontWeight: FontWeight.w600),
               ),
               const SizedBox(height: 8),
             ],
@@ -524,7 +550,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                         if (changeOrder.isApproved) ...[
                           TextButton(
                             onPressed: isSaving ? null : () => _startVoiding(changeOrder.id),
-                            style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+                            style: TextButton.styleFrom(foregroundColor: AppColors.statusRedText),
                             child: const Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
@@ -537,7 +563,9 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                           const SizedBox(height: 4),
                         ],
                         TextButton(
-                          onPressed: () => handleChangeOrderCommand(ref: ref, jobId: widget.jobId),
+                          // Was the legacy dictation flow; manual entry until voice
+                          // dictation is rebuilt on Gemini Live.
+                          onPressed: _addChangeOrderManually,
                           child: const Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -577,7 +605,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
       decoration: BoxDecoration(
         color: const Color(0xFFFDF2F2),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.redAccent.withValues(alpha: 0.25)),
+        border: Border.all(color: AppColors.statusRedText.withValues(alpha: 0.25)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -613,7 +641,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
               const SizedBox(width: 4),
               TextButton(
                 onPressed: (isSaving || !canConfirm) ? null : () => _confirmVoid(changeOrder),
-                style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+                style: TextButton.styleFrom(foregroundColor: AppColors.statusRedText),
                 child: isSaving
                     ? const SizedBox(
                         width: 14,
@@ -637,65 +665,6 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
     final minute = local.minute.toString().padLeft(2, '0');
     final period = local.hour < 12 ? 'AM' : 'PM';
     return '$month/$day/${local.year} $hour12:$minute $period';
-  }
-}
-
-/// One change order's real `change_orders.status`, as a colored pill —
-/// matches the visual style of `_InvoiceStatusBadge` in
-/// `job_detail_screen.dart` for consistency with the rest of the app.
-class _ChangeOrderStatusBadge extends StatelessWidget {
-  const _ChangeOrderStatusBadge({required this.status, this.voided = false});
-
-  final String status;
-
-  /// True once the row's `voided_at` is set. Voiding doesn't change
-  /// `status` (a voided row is still `'approved'` — see
-  /// `ChangeOrder.isVoided`), so this badge, not the status switch below,
-  /// is what actually distinguishes an active approval from a closed-out
-  /// one.
-  final bool voided;
-
-  @override
-  Widget build(BuildContext context) {
-    late final Color fg;
-    late final Color bg;
-    late final String label;
-    if (voided) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-        decoration: BoxDecoration(color: const Color(0xFFF3F4F6), borderRadius: BorderRadius.circular(20)),
-        child: const Text(
-          'Voided',
-          style: TextStyle(color: AppColors.neutralGrey, fontSize: 12, fontWeight: FontWeight.w700),
-        ),
-      );
-    }
-    switch (status) {
-      case 'pending':
-        fg = AppColors.amber;
-        bg = const Color(0xFFFEF3C7);
-        label = 'Awaiting customer approval';
-      case 'approved':
-        fg = AppColors.primaryGreenDark;
-        bg = const Color(0xFFE3F5E9);
-        label = 'Approved ✓';
-      case 'declined':
-        fg = AppColors.neutralGrey;
-        bg = const Color(0xFFF3F4F6);
-        label = 'Declined';
-      default:
-        // Defensive: an unrecognized status should still be visible rather
-        // than silently rendering nothing, in case the backend ever adds a
-        // new status value this screen doesn't know about yet.
-        fg = AppColors.neutralGrey;
-        bg = const Color(0xFFF3F4F6);
-        label = status;
-    }
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(20)),
-      child: Text(label, style: TextStyle(color: fg, fontSize: 12, fontWeight: FontWeight.w700)),
-    );
   }
 }
 
@@ -758,18 +727,15 @@ class _RunningTotalCard extends StatelessWidget {
           const SizedBox(height: 6),
           _totalLine('Approved additional work', approvedTotal),
           const Divider(height: 24),
-          Row(
-            children: [
-              const Text(
-                'Running total',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppColors.textDark),
-              ),
-              const Spacer(),
-              Text(
-                '\$${runningTotal.toStringAsFixed(2)}',
-                style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
-              ),
-            ],
+          LabelValueRow(
+            label: const Text(
+              'Running total',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppColors.textDark),
+            ),
+            value: Text(
+              '\$${runningTotal.toStringAsFixed(2)}',
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
+            ),
           ),
         ],
       ),
@@ -777,15 +743,12 @@ class _RunningTotalCard extends StatelessWidget {
   }
 
   Widget _totalLine(String label, double amount) {
-    return Row(
-      children: [
-        Text(label, style: const TextStyle(fontSize: 13, color: AppColors.neutralGrey)),
-        const Spacer(),
-        Text(
-          '\$${amount.toStringAsFixed(2)}',
-          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.textDark),
-        ),
-      ],
+    return LabelValueRow(
+      label: Text(label, style: const TextStyle(fontSize: 13, color: AppColors.neutralGrey)),
+      value: Text(
+        '\$${amount.toStringAsFixed(2)}',
+        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.textDark),
+      ),
     );
   }
 }
@@ -795,14 +758,8 @@ class _RunningTotalCard extends StatelessWidget {
 /// consistency between the two review screens.
 Widget _card(Widget child) {
   return Container(
-    padding: const EdgeInsets.all(18),
-    decoration: BoxDecoration(
-      color: AppColors.surface,
-      borderRadius: BorderRadius.circular(16),
-      boxShadow: [
-        BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 16, offset: const Offset(0, 6)),
-      ],
-    ),
+    padding: const EdgeInsets.all(AppSpacing.md),
+    decoration: AppDecorations.card(),
     child: child,
   );
 }

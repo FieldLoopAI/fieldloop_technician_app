@@ -1,4 +1,5 @@
 import 'change_order.dart';
+import 'invoice_adjustment.dart';
 import 'job_estimate.dart';
 
 /// Read-only snapshot of what a job's invoice would look like — the
@@ -23,6 +24,7 @@ class InvoicePreview {
     required this.pendingChangeOrders,
     required this.voidedChangeOrders,
     required this.declinedChangeOrders,
+    this.adjustments = const [],
     required this.estimateApproved,
     required this.grossTotal,
     required this.feeRate,
@@ -38,6 +40,13 @@ class InvoicePreview {
   final List<ChangeOrder> pendingChangeOrders;
   final List<ChangeOrder> voidedChangeOrders;
   final List<ChangeOrder> declinedChangeOrders;
+
+  /// Manual invoice lines (fees/discounts) — already included in
+  /// [grossTotal] by `/invoices/preview`. Empty from a backend that
+  /// predates them.
+  final List<InvoiceAdjustment> adjustments;
+
+  double get adjustmentsTotal => adjustments.fold<double>(0, (sum, a) => sum + a.amount);
 
   /// Mirrors `estimate.status == 'approved'` — kept as its own field (rather
   /// than re-derived on the client) since the backend already computed it
@@ -85,6 +94,9 @@ class InvoicePreview {
       pendingChangeOrders: parseChangeOrders('pendingChangeOrders'),
       voidedChangeOrders: parseChangeOrders('voidedChangeOrders'),
       declinedChangeOrders: parseChangeOrders('declinedChangeOrders'),
+      adjustments: ((json['adjustments'] as List<dynamic>?) ?? const [])
+          .map((item) => InvoiceAdjustment.fromJson(item as Map<String, dynamic>))
+          .toList(),
       estimateApproved: json['estimateApproved'] as bool? ?? false,
       grossTotal: (json['grossTotal'] as num?)?.toDouble() ?? 0,
       feeRate: (json['feeRate'] as num?)?.toDouble() ?? 0,

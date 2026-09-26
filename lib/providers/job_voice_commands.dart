@@ -654,16 +654,37 @@ Future<void> _handleTroubleshoot(WidgetRef ref, String jobId, String question) a
 /// it's optional here since the Lambda itself falls back to
 /// 'general_contractor' when it's omitted.
 Future<String> fetchTroubleshootingAnswer({required String question, String? jobId}) async {
+  // ISSUE 3(a) (CRITICAL, CONFIRMED via f5a8bd8b-flutter_run_log.txt: this
+  // round trip took 17.7s end to end for "who is the president of India?",
+  // and has been "flagged as slow before" without ever being root-caused).
+  // A single Stopwatch spanning auth-token read -> request-sent ->
+  // response-received -> answer-parsed, each logged with its own elapsed
+  // time, so the next real log can directly tell apart dispatch-side delay
+  // (time before request_sent), network/Lambda-side delay (request_sent ->
+  // response_received — cold start, KB search, or the network itself all
+  // land here and are indistinguishable from the client alone, but this at
+  // least isolates them AS A GROUP from Dart-side delay), and
+  // response-parsing delay (should be ~instant).
+  final callStopwatch = Stopwatch()..start();
   debugPrint('VOICE: troubleshooting Lambda called for job $jobId: "$question"');
   final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
   if (accessToken == null) {
     throw StateError('No active session — please sign in again.');
   }
 
+  debugPrint(
+    'KB TIMING [get_kb_answer]: request_sent at ${DateTime.now()} (${callStopwatch.elapsedMilliseconds}ms since '
+    'fetchTroubleshootingAnswer entry) -> POST $apiBaseUrl/voice/troubleshoot',
+  );
   final response = await http.post(
     Uri.parse('$apiBaseUrl/voice/troubleshoot'),
     headers: {'Authorization': 'Bearer $accessToken', 'Content-Type': 'application/json'},
     body: jsonEncode({'question': question, 'jobId': jobId}),
+  );
+  debugPrint(
+    'KB TIMING [get_kb_answer]: response_received at ${DateTime.now()} — network round trip took '
+    '${callStopwatch.elapsedMilliseconds}ms (status=${response.statusCode}); this span is network + Lambda '
+    '(cold start/KB search) combined — the client cannot distinguish the two further than this.',
   );
   if (response.statusCode != 200) {
     throw StateError('Troubleshooting request failed (${response.statusCode}): ${response.body}');
@@ -680,5 +701,9 @@ Future<String> fetchTroubleshootingAnswer({required String question, String? job
       (decoded is Map<String, dynamic> ? decoded['answer'] as String? : null) ?? "Sorry, I couldn't find an answer.";
   debugPrint('VOICE: troubleshooting answer received for job $jobId (${answer.length} chars)');
   debugPrint('VOICE LOG: question="$question" answer="$answer"');
+  debugPrint(
+    'KB TIMING [get_kb_answer]: answer_parsed at ${DateTime.now()} — total fetchTroubleshootingAnswer duration '
+    '${callStopwatch.elapsedMilliseconds}ms',
+  );
   return answer;
 }

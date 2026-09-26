@@ -12,7 +12,10 @@ import '../providers/jobs_provider.dart';
 import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
+import '../widgets/app_components.dart';
 import '../widgets/primary_button.dart';
+import '../widgets/voice_phase_indicator.dart';
 import 'voice_command_registrar_mixin.dart';
 
 /// Job-scoped screen for voice purposes (see [buildVoiceCommands]) — same
@@ -90,12 +93,14 @@ class _InvoiceScreenState extends ConsumerState<InvoiceScreen>
         backgroundColor: AppColors.surface,
         foregroundColor: AppColors.textDark,
         elevation: 0,
+        actions: const [
+          Padding(padding: EdgeInsets.only(right: 14), child: Center(child: VoicePhaseIndicator())),
+        ],
       ),
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.16 : 20.0;
+            final horizontalPadding = responsiveGutter(constraints.maxWidth, min: 20);
 
             return SingleChildScrollView(
               padding: EdgeInsets.fromLTRB(horizontalPadding, 20, horizontalPadding, 32),
@@ -145,18 +150,15 @@ class _InvoiceScreenState extends ConsumerState<InvoiceScreen>
                           for (final item in changeOrders) _LineItemRow(item: item),
                         ],
                         const Divider(height: 28),
-                        Row(
-                          children: [
-                            const Text(
-                              'Total Due',
-                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppColors.textDark),
-                            ),
-                            const Spacer(),
-                            Text(
-                              '\$${total.toStringAsFixed(2)}',
-                              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
-                            ),
-                          ],
+                        LabelValueRow(
+                          label: const Text(
+                            'Total Due',
+                            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppColors.textDark),
+                          ),
+                          value: Text(
+                            '\$${total.toStringAsFixed(2)}',
+                            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: AppColors.primaryGreenDark),
+                          ),
                         ),
                       ],
                     ),

@@ -10,7 +10,9 @@ import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
 import '../widgets/job_history_feed_timeline.dart';
+import '../widgets/voice_phase_indicator.dart';
 import 'photo_viewer_screen.dart';
 import 'voice_command_registrar_mixin.dart';
 
@@ -65,7 +67,7 @@ class _JobHistoryScreenState extends ConsumerState<JobHistoryScreen>
     // Ensures the photo list this job's photo entries resolve against (see
     // _openPhoto) is loaded/cached ahead of any tap, same provider Job
     // Detail's photo strip watches.
-    ref.watch(jobPhotosProvider(job.id));
+    final photos = ref.watch(jobPhotosProvider(job.id)).valueOrNull ?? const [];
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -74,19 +76,21 @@ class _JobHistoryScreenState extends ConsumerState<JobHistoryScreen>
         backgroundColor: AppColors.surface,
         foregroundColor: AppColors.textDark,
         elevation: 0,
+        actions: const [
+          Padding(padding: EdgeInsets.only(right: 14), child: Center(child: VoicePhaseIndicator())),
+        ],
       ),
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isTablet = constraints.maxWidth > 600;
-            final horizontalPadding = isTablet ? constraints.maxWidth * 0.18 : 20.0;
+            final horizontalPadding = responsiveGutter(constraints.maxWidth, min: 20);
             return RefreshIndicator(
               onRefresh: () => ref.refresh(jobHistoryFeedProvider(job.id).future),
               child: SingleChildScrollView(
                 physics: const AlwaysScrollableScrollPhysics(),
                 padding: EdgeInsets.fromLTRB(horizontalPadding, 20, horizontalPadding, 32),
                 child: historyAsync.when(
-                  data: (entries) => JobHistoryFeedTimeline(entries: entries, onTapPhoto: _openPhoto),
+                  data: (entries) => JobHistoryFeedTimeline(entries: entries, onTapPhoto: _openPhoto, photos: photos),
                   loading: () => const Padding(
                     padding: EdgeInsets.symmetric(vertical: 40),
                     child: Center(child: CircularProgressIndicator()),

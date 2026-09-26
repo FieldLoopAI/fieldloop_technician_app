@@ -8,6 +8,7 @@ import '../providers/auth_provider.dart';
 import '../providers/permission_providers.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../theme/app_theme.dart';
+import '../theme/responsive.dart';
 import '../widgets/primary_button.dart';
 import 'complete_setup_screen.dart';
 import 'permissions_setup_screen.dart';
@@ -109,8 +110,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> with SingleTickerProv
         child: SafeArea(
           child: LayoutBuilder(
             builder: (context, constraints) {
-              final isTablet = constraints.maxWidth > 600;
-              final horizontalPadding = isTablet ? constraints.maxWidth * 0.22 : 24.0;
+              final horizontalPadding = responsiveGutter(constraints.maxWidth, maxContentWidth: ContentWidth.form, min: 24);
 
               return SingleChildScrollView(
                 padding: EdgeInsets.symmetric(horizontal: horizontalPadding, vertical: 32),

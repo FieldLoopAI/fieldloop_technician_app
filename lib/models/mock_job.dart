@@ -92,6 +92,16 @@ class MockJob {
   final String id;
   final String jobIdPublic;
   final String customerName;
+
+  /// The display fallback [MockJob.fromMap] stores for a missing text column.
+  /// Other code compares against this exact string, so it is kept as-is.
+  static const notProvided = 'Not provided';
+
+  /// Whether [customerName] is a real name rather than the [notProvided]
+  /// fallback — lets UI show the fallback muted instead of as data.
+  bool get hasCustomerName => customerName.trim().isNotEmpty && customerName != notProvided;
+
+  bool get hasJobCode => jobIdPublic.trim().isNotEmpty && jobIdPublic != notProvided;
   final String serviceAddress;
   final String description;
   final String tradeCategory;
@@ -158,7 +168,7 @@ class MockJob {
     return MockJob(
       id: id,
       jobIdPublic: (map['job_id_public'] as String?) ?? 'Not provided',
-      customerName: (map['customer_name'] as String?) ?? 'Not provided',
+      customerName: _customerNameFrom(map) ?? notProvided,
       serviceAddress: (map['service_address'] as String?) ?? 'Not provided',
       description: (map['description'] as String?) ?? '',
       tradeCategory: (map['trade_category'] as String?) ?? 'Not provided',
@@ -173,6 +183,23 @@ class MockJob {
       billableHours: _parseNullableDouble(map['billable_hours'], id, 'billable_hours'),
     );
   }
+}
+
+/// The customer's display name: a direct `customer_name` column if a row
+/// has one, otherwise the related `customers.household_name` — which is
+/// where it actually lives, embedded by the job queries (see `_jobColumns`
+/// in `jobs_provider.dart`). Blank values count as missing, so the
+/// [MockJob.notProvided] fallback only appears when there genuinely is no
+/// name, never over real data.
+String? _customerNameFrom(Map<String, dynamic> map) {
+  final customer = map['customers'];
+  for (final candidate in [
+    map['customer_name'],
+    if (customer is Map) customer['household_name'],
+  ]) {
+    if (candidate is String && candidate.trim().isNotEmpty) return candidate.trim();
+  }
+  return null;
 }
 
 /// Parses a nullable numeric column. Handles the common Postgrest quirk of

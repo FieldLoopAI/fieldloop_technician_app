@@ -31,9 +31,13 @@ class PendingUploadBadge extends ConsumerWidget {
         children: [
           const Icon(Icons.cloud_upload_outlined, size: 13, color: AppColors.amber),
           const SizedBox(width: 4),
-          Text(
-            '$count photo${count == 1 ? '' : 's'} pending upload',
-            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.amber),
+          Flexible(
+            child: Text(
+              '$count photo${count == 1 ? '' : 's'} pending upload',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.amber),
+            ),
           ),
         ],
       ),

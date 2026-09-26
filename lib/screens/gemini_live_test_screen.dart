@@ -1,22 +1,32 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' show FrameTiming;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_sound/flutter_sound.dart';
-import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../config/env.dart';
 import '../providers/global_voice_service_provider.dart';
+import '../providers/voice_command_registry_provider.dart';
+import '../services/command_intent_matcher.dart';
+import '../services/completion_claim_detector.dart';
+import '../services/conversational_utterance.dart';
+import '../services/echo_override_policy.dart';
+import '../services/echo_sequence_matcher.dart';
 import '../services/gemini_function_dispatcher.dart';
+import '../services/pending_call_fillers.dart';
+import '../services/photo_decision_classifier.dart';
+import '../services/transliterated_greeting.dart';
+import '../services/trigger_phrase_matcher.dart';
 import '../theme/app_theme.dart';
 import '../widgets/voice_phase_indicator.dart';
 
@@ -70,7 +80,21 @@ import '../widgets/voice_phase_indicator.dart';
 ///    see the dated note on [_geminiModel] for why, and for the Day 2
 ///    function-calling caveat that comes with it.
 class GeminiLiveTestScreen extends ConsumerStatefulWidget {
-  const GeminiLiveTestScreen({super.key, this.jobId, this.ambient = false, this.onAmbientSessionEnded});
+  const GeminiLiveTestScreen({
+    super.key,
+    this.jobId,
+    this.ambient = false,
+    this.onAmbientSessionEnded,
+    this.tokenFuture,
+  });
+
+  /// The Gemini token for this screen's FIRST session, already requested by
+  /// the caller — [GlobalVoiceService._triggerGeminiSession] claims it the
+  /// instant the wake word is heard (usually the pre-fetched spare), before
+  /// the wake-word recognizer has even released the mic. Null (the manual
+  /// entry points) or any later session: taken from the same cache at
+  /// start time instead. Tokens are single-use, so this is never reused.
+  final Future<String>? tokenFuture;
 
   /// When given, every dispatched function call gets its `job_id` argument
   /// forced to this value (see `_GeminiLiveTestScreenState._handleToolCall`)
@@ -166,7 +190,45 @@ enum _ScreenTask {
   /// `capture_photo` succeeded â€” the just-captured still is the real
   /// content to show, awaiting confirm/retake.
   cameraCaptured,
+
+  /// P2: an `open_camera` has genuinely STARTED but the controller hasn't
+  /// reported ready yet. Previously this whole window — measured at 9-30s
+  /// on real hardware — was [none], i.e. the technician stared at the
+  /// unchanged screen behind the ambient overlay with no indication
+  /// anything was happening, then a camera appeared. That reads as broken
+  /// regardless of the eventual frame rate (which measures a healthy
+  /// ~50-57fps once live).
+  ///
+  /// Shows a real "opening the camera" surface, and is replaced by
+  /// [cameraLive] the INSTANT a preview texture exists — see
+  /// `GeminiCameraSession.onPreviewAvailable`, which fires before the
+  /// dispatch even returns. Deliberately a SEPARATE state from
+  /// [cameraLive] rather than an early flip to it: every capture guard in
+  /// this file keys off [cameraLive] meaning "the camera is genuinely
+  /// open", and the VIEW is what this unblocks early, never the ACTION.
+  cameraOpening,
+
+  /// A close has been requested (go_back out of the camera flow) and the
+  /// native camera is still being released. Set the INSTANT the close is
+  /// triggered — before the async release is awaited — and moved to [none]
+  /// only once that release actually resolves. Without it the screen kept
+  /// showing the live preview (still `cameraLive`) for the whole multi-
+  /// second release and then cut abruptly to nothing, and backing out looked
+  /// no different from a frozen camera. Has its own "Closing the camera…"
+  /// surface, distinct from [cameraOpening]'s, so leaving never looks like
+  /// opening. No camera action is allowed in this state: every capture
+  /// guard keys off [cameraLive], and open_camera's guard requires [none].
+  cameraClosing,
 }
+
+/// Who cancelled a slow camera open — decides what (if anything) is said
+/// and where the screen goes. See `_updateScreenTaskForToolCall`'s
+/// `cancelled` branch.
+enum _CameraOpenCancelIntent { user, retry, goBack }
+
+/// Caption escalation on the "Opening the camera…" surface — normal opens
+/// finish well inside this.
+const Duration _cameraOpenSlowCaptionAfter = Duration(seconds: 4);
 
 const int _inputSampleRateHz = 16000;
 const int _outputSampleRateHz = 24000;
@@ -221,6 +283,25 @@ const String _systemInstruction =
     'When a technician wants to take a photo, call open_camera, then ask if they\'re ready before calling '
     'capture_photo. After capturing, ask whether to upload or retake before calling confirm_photo_upload or '
     'retake_photo accordingly. Never skip the confirmation step. '
+    // P0 TRUST FIX — see [photoCompletionClaimPhrases]'s doc comment for
+    // the confirmed bug (two false "it's captured"/"both taken" claims in
+    // one session with zero real captures). Stated as a vocabulary ban
+    // rather than a behavioral request, because "only say it when it's
+    // true" leaves the model to judge what's true from conversational
+    // memory — which is exactly the faculty that produced the lie. The app
+    // speaks every genuine completion itself, word for word, through a
+    // constrained instruction issued only after the real function
+    // returned success, so there is nothing for the free-text path to add.
+    'ABSOLUTE RULE — NEVER CLAIM A PHOTO ACTION HAPPENED. You are forbidden from saying, in your own words, '
+    'that a photo has been captured, taken, snapped, uploaded, saved, attached, kept, retaken, or discarded. '
+    'Those words describe completed actions, and you are never the component that knows whether one '
+    'completed. The app tells you, word for word, exactly what to say whenever a photo action genuinely '
+    'succeeds; if you have not just been given such a script to read, then as far as you are concerned '
+    'nothing has happened yet, no matter what the conversation seems to imply. Never say "it\'s captured", '
+    '"both taken", "I\'ve uploaded it", "that\'s saved", or anything with the same meaning on your own '
+    'initiative. If the technician asks whether a photo was taken or uploaded, do not answer from memory — '
+    'say you\'ll check, and call get_job_timeline_answer or get_last_photo. Describing an action you are '
+    'about to perform is fine ("opening the camera now"); describing one as already done is not. '
     'When the technician wants to log a quick observation or note about the site (not a priced estimate or '
     'change order), call site_condition. '
     'When the technician asks to see or review something (the estimate, change orders, the invoice, job '
@@ -249,6 +330,19 @@ const String _systemInstructionReminder =
     'REMINDER: you are ONLY a job-specific voice assistant with the exact capabilities listed above - if '
     'asked what you can help with, list those specific capabilities, never give a generic AI assistant '
     'answer. If asked to take a photo, always call open_camera - never claim you cannot take photos. '
+    // P1 FIX: the line above only explicitly reinforced open_camera — a
+    // technician report described Gemini instead hedging specifically on
+    // the CAPTURE step ("I'm unable to capture photos" / "I can't actually
+    // take the picture") right as the deterministic system was opening the
+    // camera or capturing successfully in the background. capture_photo/
+    // confirm_photo_upload/retake_photo are just as real and working as
+    // open_camera — restated explicitly by name so this same hedging gap
+    // can't recur for any of the other three camera-flow functions.
+    'The same is true for every other step of that flow: capture_photo, confirm_photo_upload, and '
+    'retake_photo are all real, working functions too - never claim you cannot capture, take, upload, or '
+    'retake a photo, or that the technician should use their device\'s own camera app instead. If a photo '
+    'action has already happened (you were told a function succeeded), acknowledge what actually happened - '
+    'never contradict it by claiming the capability does not exist. '
     // PART 3 (client reliability fix — client reported Gemini giving
     // generic/made-up answers instead of either a real KB-vetted answer or
     // an honest decline): explicit, unambiguous restatement of the
@@ -259,7 +353,32 @@ const String _systemInstructionReminder =
     'You must NEVER answer a technician\'s question directly from your own knowledge. For any question about '
     'the job, procedures, materials, or troubleshooting, you must call get_kb_answer or '
     'get_job_timeline_answer. If neither returns an answer, say you don\'t have that information and to check '
-    'with a supervisor. Do not guess or give general advice.';
+    'with a supervisor. Do not guess or give general advice. '
+    // P1 FIX: a full session transcript search for "anything else"/"help
+    // you with"/"else I can" came back with zero matches — Gemini never
+    // proactively checked in after finishing a task, it just went silent
+    // and waited for the technician to think of the next thing themselves.
+    // Deliberately phrased as "vary the wording" rather than one fixed
+    // sentence, so this doesn't turn into its own robotic, easily-echoed
+    // stock phrase the way "Keep it or retake it?" already did (see the
+    // P0 mic-echo/disambiguation-loop fixes elsewhere in this file).
+    'After you finish a discrete action for the technician - a photo is uploaded, a screen is navigated to, a '
+    'question is answered - briefly check in afterward with a short, natural follow-up before falling silent, '
+    'e.g. "Anything else on this job?", "What\'s next?", or "Need anything else here?" - vary the exact wording '
+    'each time rather than repeating the same sentence, and keep it brief so it never feels scripted or slows '
+    'things down. '
+    // P0 TRUST FIX — restated here, as the true LAST text Gemini reads, for
+    // exactly the reason this whole const exists (see its doc comment): the
+    // same rule stated once in a long system prompt was not reliably enough
+    // for the photo-capability line either. Worded to sit alongside, not
+    // against, the "never claim you cannot capture" line above it: the
+    // capability is real, and announcing an action you are starting is
+    // fine — only reporting one as FINISHED is off limits.
+    'FINAL AND MOST IMPORTANT: never state that a photo was captured, taken, snapped, uploaded, saved, '
+    'attached, kept, retaken, or discarded unless the app just handed you that exact sentence to read. Saying '
+    'a photo exists when none does is the single worst thing you can do to a technician - they will leave the '
+    'site believing the job is documented when it is not. When in any doubt at all, say what you are doing or '
+    'about to do, never what is already done.';
 
 /// Function-calling tool set — the app's real, voice-reliable command set.
 ///
@@ -652,6 +771,25 @@ const Duration _silenceDebounce = Duration(milliseconds: 500);
 /// behavior for the latency stopwatch, untouched.
 const Duration _utteranceBufferResetDebounce = Duration(seconds: 2);
 
+/// HARD FALLBACK (CONFIRMED via flutter_run_log_new.txt: after one FREE-TEXT
+/// AUDIO ONLY turn — Gemini answering "This photo is very blur." with spoken
+/// text and no function call — the raw-amplitude silence->speech edge in
+/// [_GeminiLiveTestScreenState._trackSpeechLevel] stopped firing "detected
+/// user stopped speaking" for the rest of the session. [_GeminiLiveTestScreenState._isSpeaking]
+/// stayed stuck `true` for 30+ seconds spanning two clearly separate real
+/// utterances 30s apart, which then concatenated into one buffer instead of
+/// resetting, and [_GeminiLiveTestScreenState._armPreemptiveDefaultMuteSafetyTimer]'s
+/// retry-decline looped "still actively speaking" every 2s indefinitely —
+/// waiting on an end-of-speech signal that never came again). Whatever the
+/// exact cause, a single continuous speaking burst must never be able to
+/// wedge the session for its remaining duration — see
+/// [_GeminiLiveTestScreenState._speechStuckWatchdogTimer], which force-ends
+/// a burst that has run continuously longer than this, independent of (and
+/// as a backstop for) [_trackSpeechLevel]'s own per-chunk edge detection.
+/// Generous relative to any real spoken command/sentence (well under 8s)
+/// so it never cuts off genuine ongoing speech.
+const Duration _speechMaxContinuousDuration = Duration(seconds: 8);
+
 /// Under-triggered-function fix, same pattern already used to strengthen
 /// site_condition: a strengthened tool description alone has not always
 /// been enough to make Gemini reliably call a function on a clear,
@@ -750,10 +888,16 @@ class _TranscriptTrigger {
   /// instead) — for a function whose real-world phrasing is too
   /// grammatically unpredictable for a fixed phrase list to reasonably
   /// enumerate (confirmed case: "when did we get arrived", genuinely mangled
-  /// ASR output for get_job_timeline_answer's arrival-time question). Given
-  /// the SAME normalized/space-padded text [matches] itself checks against
-  /// [phrases].
-  final bool Function(String normalizedPaddedText)? extraMatcher;
+  /// ASR output for get_job_timeline_answer's arrival-time question).
+  ///
+  /// P0 FIX (see [matches]): given the STEMMED, space-padded text — e.g.
+  /// "let's take a photo" arrives as `' let s tak a photo '` — so word-form
+  /// drift ("taking"/"takes"/"took") reaches these matchers too, not just
+  /// the phrase list. Every matcher wired in below therefore stems its own
+  /// literals with `stemTriggerPhrase` before comparing;
+  /// [_looksLikeArrivalTimeQuestion] needs no change (its `' when '` is
+  /// stem-stable and its `\barriv` prefix regex already covers every form).
+  final bool Function(String stemmedPaddedText)? extraMatcher;
 
   String buffer = '';
   bool resolvedForCurrentUtterance = false;
@@ -770,16 +914,37 @@ class _TranscriptTrigger {
     resolvedForCurrentUtterance = false;
   }
 
-  /// Same broad, NOT exact-phrase, whole-word/phrase pattern match as
-  /// [_GeminiLiveTestScreenState._looksLikeViewEstimateRequest] — lowercased,
-  /// stripped to letters/spaces, space-padded substring checks against each
-  /// multi-word phrase in [phrases] — PLUS [extraMatcher], when given.
+  /// P0 FIX (CONFIRMED from a real session: the technician's capture
+  /// attempt reached this matcher as "All right, taking the picture may."
+  /// and matched NOTHING — no photo, and no "I didn't understand" either,
+  /// for a long time afterwards). This used to be a literal, space-padded
+  /// SUBSTRING check: `' take the picture '` simply is not a substring of
+  /// `' all right taking the picture may '`, so a single verb-form drift
+  /// silently dropped a real command on the floor. Real ASR output does
+  /// that routinely — word-form drift, inserted filler, trailing noise.
+  ///
+  /// Now delegates to `trigger_phrase_matcher.dart`
+  /// ([matchAnyTriggerPhrase]), which stems both sides, tolerates one
+  /// inserted filler word, and tolerates a single-character garble in long
+  /// content words — while deliberately keeping articles, negation, and
+  /// scope words load-bearing, so every prior confirmed regression fix that
+  /// depends on those distinctions still holds. See that library's doc
+  /// comment and `test/trigger_phrase_matcher_test.dart` for the full
+  /// both-directions contract.
+  ///
+  /// The match is logged with the phrase that fired and whether it needed
+  /// the fuzzy path, so the next real run's log answers "did loosening the
+  /// matcher actually change anything here" directly instead of by
+  /// inference.
   bool matches(String text) {
-    final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ');
-    final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
-    final padded = ' ${words.join(' ')} ';
-    if (phrases.any((phrase) => padded.contains(' $phrase '))) return true;
-    return extraMatcher?.call(padded) ?? false;
+    final phraseMatch = matchAnyTriggerPhrase(text, phrases);
+    if (phraseMatch != null) {
+      if (!phraseMatch.exact) {
+        debugPrint('FUZZY TRIGGER MATCH [$name]: ${phraseMatch.describe()} matched in "$text"');
+      }
+      return true;
+    }
+    return extraMatcher?.call(stemmedPaddedTriggerText(text)) ?? false;
   }
 }
 
@@ -855,6 +1020,12 @@ const List<String> _cameraActionIntentWords = [
 /// [logLabel], when given, identifies the trigger in the match log line —
 /// see that log line for exactly which noun/action-word pair fired, so this
 /// is directly verifiable from the next run's log instead of inferred.
+/// P0 FIX: [paddedText] is now the STEMMED padded text (see
+/// [_TranscriptTrigger.extraMatcher]), so every literal this checks is run
+/// through [stemTriggerPhrase] first — "taking a picture" reaches here as
+/// `' tak a pictur '` and must still find noun="picture" + action="take".
+/// The `excludeIfContains` veto gets the same treatment, so "the last
+/// pictures" still vetoes on `last` exactly as before.
 bool _looksLikeNounPlusActionIntent(
   String paddedText, {
   required List<String> nouns,
@@ -863,11 +1034,11 @@ bool _looksLikeNounPlusActionIntent(
   String? logLabel,
 }) {
   for (final word in excludeIfContains) {
-    if (paddedText.contains(' $word ')) return false;
+    if (paddedText.contains(' ${stemTriggerPhrase(word)} ')) return false;
   }
   String? matchedNoun;
   for (final noun in nouns) {
-    if (paddedText.contains(' $noun ')) {
+    if (paddedText.contains(' ${stemTriggerPhrase(noun)} ')) {
       matchedNoun = noun;
       break;
     }
@@ -875,14 +1046,17 @@ bool _looksLikeNounPlusActionIntent(
   if (matchedNoun == null) return false;
   final label = logLabel == null ? '' : ' [$logLabel]';
   for (final word in actionWords) {
-    if (paddedText.contains(' $word ')) {
+    if (paddedText.contains(' ${stemTriggerPhrase(word)} ')) {
       debugPrint(
         'LOOSE NAV MATCH$label: noun="$matchedNoun" + action="$word" matched in "$paddedText"',
       );
       return true;
     }
   }
-  if (paddedText.contains(' screen ') || paddedText.contains(' page ')) {
+  // Stemmed too ("page" -> "pag", "pages" -> "pag") — a bare literal here
+  // would silently stop matching now that [paddedText] arrives stemmed.
+  if (paddedText.contains(' ${stemTriggerPhrase('screen')} ') ||
+      paddedText.contains(' ${stemTriggerPhrase('page')} ')) {
     debugPrint(
       'LOOSE NAV MATCH$label: noun="$matchedNoun" + bare screen/page reference matched in "$paddedText"',
     );
@@ -972,8 +1146,16 @@ const List<String> _capturePhotoIndicatorPhrases = [
   'take it',
   'capture it',
   'snap it',
-  'go ahead',
-  'ready',
+  // P0 FIX (CONFIRMED via flutter_run_log_new.txt, build #65): 'go ahead'
+  // used to live here as a plain phrase too (alongside bare 'ready',
+  // removed one round earlier for the identical reason) — both match as a
+  // substring ANYWHERE, including inside Gemini's own coaching phrases
+  // ("go ahead and take another one when you're ready", "The camera's
+  // actually open now — go ahead when you're ready."). An echo of either
+  // phrase slipping past the backstop would fire an unwanted
+  // capture_photo directly. Both now live ONLY in the dedicated
+  // standalone-utterance-only check in [_looksLikeCapturePhotoConfirmation]
+  // — see that function's doc comment.
   // BUG 3 (real session evidence): broadened from the original five after
   // confirming the technician's actual phrasing wasn't fully covered.
   'take the photo',
@@ -988,6 +1170,15 @@ const List<String> _capturePhotoIndicatorPhrases = [
   'take picture',
   'capture the picture',
   'snap the picture',
+  // "image" alongside photo/picture (CONFIRMED miss: "Yes, I am ready. Take
+  // the image." with the camera live fell through to the fuzzy intent
+  // layer, which resolved it to open_camera and got "the camera's already
+  // open" instead of a photo). Same article rule as the photo/picture
+  // entries: "the image" is this shot, "an image" stays open_camera's.
+  'take the image',
+  'take image',
+  'capture the image',
+  'snap the image',
   // NOTE: 'confirm'/'keep it'/'upload it' ALSO appear in
   // [_photoConfirmIndicatorPhrases] (confirm_photo_upload's own trigger,
   // guarded on `_ScreenTask.cameraCaptured`) — not a copy-paste duplicate.
@@ -1024,13 +1215,48 @@ bool _looksLikeCapturePhotoConfirmation(String paddedText) {
     'let s take a photo',
     'let s take a picture',
   ];
+  // P0 FIX: [paddedText] arrives STEMMED (see
+  // [_TranscriptTrigger.extraMatcher]), so every literal here is stemmed
+  // too. This makes the open_camera veto STRONGER, not weaker — "let's be
+  // taking a photo" now vetoes exactly like "let's take a photo" already
+  // did, instead of slipping past into a real, unconfirmed shutter.
   for (final phrase in openCameraOnlyPhrases) {
-    if (paddedText.contains(' $phrase ')) return false;
+    if (paddedText.contains(' ${stemTriggerPhrase(phrase)} ')) return false;
   }
-  const shutterConfirmWords = ['capture', 'snap', 'take it', 'ready', 'confirm', 'go ahead', 'keep it'];
+  // The same negation veto the phrase-list path applies (see
+  // `trigger_phrase_matcher.dart`): "no, don't capture it" must never fire
+  // a real shutter just because the word "capture" is in it.
+  const shutterConfirmWords = ['capture', 'snap', 'take it', 'confirm', 'keep it'];
   for (final word in shutterConfirmWords) {
-    if (paddedText.contains(' $word ')) {
-      debugPrint('LOOSE CAPTURE MATCH: shutter/confirm word "$word" matched in "$paddedText"');
+    if (!paddedText.contains(' ${stemTriggerPhrase(word)} ')) continue;
+    if (triggerPhraseIsNegated(paddedText, word)) {
+      debugPrint('LOOSE CAPTURE MATCH: shutter/confirm word "$word" found but NEGATED in "$paddedText" — not firing');
+      continue;
+    }
+    debugPrint('LOOSE CAPTURE MATCH: shutter/confirm word "$word" matched in "$paddedText"');
+    return true;
+  }
+  // P0 FIX (CONFIRMED via flutter_run_log_new.txt, builds #61 and #65):
+  // bare "ready" and "go ahead" used to be plain shutterConfirmWords/phrase-
+  // list entries, matching as a substring inside ANY sentence containing
+  // them — including Gemini's own coaching phrases ("...when you're
+  // ready", "go ahead and take another one...", "The camera's actually
+  // open now — go ahead when you're ready.") and their mic-echoed,
+  // ASR-drifted transcriptions. Both only count now when one of them is
+  // (up to a couple of short filler words) essentially the WHOLE
+  // utterance — a technician actually saying "ready"/"go ahead" — not a
+  // word or two buried inside a much longer sentence. Checked against the
+  // ORIGINAL (untrimmed-to-just-letters) word count so "I'm ready"/"yeah
+  // go ahead" still count as short even though the apostrophe/comma add a
+  // token.
+  final words = paddedText.trim().split(RegExp(r'\s+')).where((w) => w.isNotEmpty).toList();
+  if (words.length <= 3) {
+    if (words.contains('ready')) {
+      debugPrint('LOOSE CAPTURE MATCH: standalone "ready" utterance ("$paddedText")');
+      return true;
+    }
+    if (paddedText.contains(' go ahead ')) {
+      debugPrint('LOOSE CAPTURE MATCH: standalone "go ahead" utterance ("$paddedText")');
       return true;
     }
   }
@@ -1094,6 +1320,44 @@ const List<String> _nonInformationalFillerPhrases = [
 const String _kbCatchAllBoundaryDeclineText =
     "I'm sorry, I can only help with things related to this job — I can't answer that.";
 
+/// P0 TRUST FIX (CONFIRMED, twice in ONE real session): Gemini's free-text
+/// response path narrated photo outcomes that never happened — "It's
+/// captured." and, later, "Both taken. Anything else you need help with?"
+/// in a session where `capture_photo` never once succeeded.
+///
+/// The primary fix is architectural and lives in [_systemInstruction] /
+/// [_systemInstructionReminder]: completed-action vocabulary is reserved
+/// for the deterministic constrained-instruction path
+/// ([_GeminiLiveTestScreenState._informGeminiToSpeakVerbatim]), which only
+/// ever runs after a real function actually returned success. The runtime
+/// backstop behind that instruction is
+/// [_GeminiLiveTestScreenState._auditGeminiCompletionClaim], which detects
+/// claims via `completion_claim_detector.dart` — split out into its own
+/// file, with its own regression tests, for the same reason
+/// `photo_decision_classifier.dart` was.
+///
+/// How long after a genuine success a completed-action claim stays
+/// licensed. Generous on purpose — the point is to catch claims with NO
+/// corresponding success at all (the confirmed bug), not to police a
+/// technician taking a while to answer a follow-up question after a real
+/// capture.
+const Duration _photoCompletionClaimWindow = Duration(seconds: 60);
+
+/// Minimum spacing between spoken corrections, so a correction can never
+/// feed itself into a loop if a future edit accidentally gives the
+/// correction text claim vocabulary of its own.
+const Duration _photoCompletionClaimCorrectionDebounce = Duration(seconds: 20);
+
+/// Spoken through the SAME constrained verbatim path as every other canned
+/// line. Deliberately contains NONE of the vocabulary in
+/// [photoCompletionClaimPhrases] — it must be impossible for this
+/// correction to trip the very audit that produced it — and deliberately
+/// does not coach a phrase back at the technician, since Gemini's own
+/// scripted phrases echoing off the speaker into the mic is a separate,
+/// already-confirmed failure mode (see [_looksLikeGeminiEcho]).
+const String _photoCompletionClaimCorrectionText =
+    "Sorry, I misspoke — that hasn't actually happened yet. Tell me when you're ready and I'll do it.";
+
 /// PART L item 1 (CONFIRMED via 4127d46d-flutter_run_log.txt: "I see you
 /// good egg." — STT's mangled transcription of what was clearly meant to be
 /// a change-orders request — has no usable keywords at all no matter how
@@ -1105,9 +1369,92 @@ const String _kbCatchAllBoundaryDeclineText =
 /// ran and had nothing to say, e.g. a real off-topic question like "who is
 /// the president of India"): THIS case is "I couldn't even tell what you
 /// said," not "I understood you and it's out of scope," so it invites a
-/// retry with concrete examples instead of flatly declining.
-const String _unrecognizedUtteranceRetryText =
-    "Sorry, I didn't catch that — you can say things like 'show me the change orders' or 'take a photo'.";
+/// retry with concrete examples instead of flatly declining. (The actual
+/// wording now rotates through [_unrecognizedUtteranceReplies].)
+
+/// ISSUE 2 (CONFIRMED via fbd877f0-flutter_run_log.txt: "एक फोटो" —
+/// Devanagari script — appeared as a real `inputTranscription` chunk mid-
+/// session despite the setup message's `inputAudioTranscription.
+/// languageCodes: ['en-US']`). Confirmed against the current Live API
+/// reference (`ai.google.dev/api/live`, `AudioTranscriptionConfig`):
+/// `languageCodes` is documented as a HINT ("providing hints about the
+/// languages present in the audio"), not a hard constraint — omitted or
+/// not, the server can still auto-detect/switch script mid-session, and
+/// there is no stricter locking parameter exposed by this API today. Every
+/// trigger's own matcher in this file strips non-`[a-z ]` characters during
+/// normalization (see [_TranscriptTrigger.matches] and every
+/// `_looksLikeXRequest`), which means non-Latin-script text doesn't fail to
+/// match so much as silently vanish into an empty/whitespace string first —
+/// no matter how loose a future matcher gets, it can never recover from
+/// that. Checked on every raw `inputTranscription` chunk, BEFORE any
+/// normalization/trigger logic sees it, so this is caught explicitly
+/// instead of silently discarded as an empty match.
+///
+/// A simple Unicode-range presence check, deliberately not a full
+/// language/script classifier — ASCII English text can never contain any
+/// of these codepoints, so a single hit is already unambiguous signal, per
+/// this project's own logs having shown Hindi (Devanagari), Korean
+/// (Hangul), and Japanese (Hiragana/Katakana/CJK) script at various points.
+/// Cyrillic, Arabic, and Thai ranges are included defensively even though
+/// not yet observed in a real log. Spanish is deliberately OUT of scope —
+/// it uses the same Latin script as English (just different words), which
+/// no Unicode range check can ever distinguish; that's a genuinely
+/// different (language, not script) problem.
+bool _looksLikeNonLatinScriptTranscription(String text) {
+  for (final rune in text.runes) {
+    if (_isNonLatinScriptRune(rune)) return true;
+  }
+  return false;
+}
+
+/// Common English function words — a chunk of 4+ words containing none of
+/// these (6+ words) is very unlikely to be English speech (see
+/// [_looksLikeNonEnglishLatinTranscription]).
+const Set<String> _commonEnglishWords = {
+  'the', 'a', 'an', 'and', 'or', 'to', 'of', 'in', 'on', 'for', 'is', 'it', 'i', 'you', 'we', 'me', 'my',
+  'this', 'that', 'can', 'do', 'be', 'are', 'was', 'what', 'how', 'show', 'take', 'photo', 'picture', 'yes',
+  'no', 'okay', 'with', 'at', 'have', 'let', 'go', 'see', 'want', 'need', 'hear', 'tell', 'about', 'job',
+  'change', 'orders', 'order', 'estimate', 'invoice', 'history', 'last', 'camera', 'open', 'capture', 'ready',
+  'confirm', 'back', 'please', 'now', 'who', 'why', 'when', 'where', 'which', 'here', 'there', 'not', 'so',
+};
+
+/// Widened drift check (build #38: "can you hear me" transcribed as Spanish
+/// "¿Qué tal me veo?" — Latin script, so [_looksLikeNonLatinScriptTranscription]
+/// can't see it). Two cheap signals: Spanish inverted punctuation or any
+/// accented Latin letters (U+00C0–U+024F; English speech transcripts
+/// essentially never contain them), or a 4+ word chunk with zero common
+/// English words (6+ words, to keep partial command chunks safe).
+/// Deliberately conservative — a false positive costs one
+/// "didn't catch that" retry.
+bool _looksLikeNonEnglishLatinTranscription(String text) {
+  for (final rune in text.runes) {
+    if (rune == 0xBF || rune == 0xA1) return true; // ¿ ¡
+    if (rune >= 0xC0 && rune <= 0x24F && rune != 0xD7 && rune != 0xF7) return true;
+  }
+  final words = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ').split(RegExp(r'\s+')).where((w) => w.isNotEmpty).toList();
+  if (words.length >= 6 && !words.any(_commonEnglishWords.contains)) return true;
+  return false;
+}
+
+bool _isNonLatinScriptRune(int rune) {
+  // Devanagari (Hindi, Marathi, etc.)
+  if (rune >= 0x0900 && rune <= 0x097F) return true;
+  // Hangul Jamo, Compatibility Jamo, and precomposed syllables (Korean)
+  if (rune >= 0x1100 && rune <= 0x11FF) return true;
+  if (rune >= 0x3130 && rune <= 0x318F) return true;
+  if (rune >= 0xAC00 && rune <= 0xD7A3) return true;
+  // Hiragana + Katakana (Japanese)
+  if (rune >= 0x3040 && rune <= 0x30FF) return true;
+  // CJK Unified Ideographs (Chinese/Japanese/Korean kanji/hanja)
+  if (rune >= 0x4E00 && rune <= 0x9FFF) return true;
+  // Cyrillic (Russian and others)
+  if (rune >= 0x0400 && rune <= 0x04FF) return true;
+  // Arabic
+  if (rune >= 0x0600 && rune <= 0x06FF) return true;
+  // Thai
+  if (rune >= 0x0E00 && rune <= 0x0E7F) return true;
+  return false;
+}
 
 /// The literal strings the KB backend (`ask-troubleshooting/index.js`'s
 /// own "not available" decline) and its Dart caller's own missing-answer
@@ -1235,8 +1582,18 @@ const Duration _metaCapabilityDebounce = Duration(seconds: 5);
 const List<String> _acknowledgePresenceIndicatorPhrases = [
   'can you hear me',
   'can you bear me',
+  'can you hear',
+  'do you hear me',
+  'did you hear me',
+  'hear me',
   'are you there',
+  'are you listening',
+  'are you still there',
+  'is anyone there',
+  'anyone there',
   'you there',
+  'you with me',
+  'testing',
   'hello',
   'hi',
   'hey',
@@ -1245,7 +1602,32 @@ const List<String> _acknowledgePresenceIndicatorPhrases = [
 /// See [_acknowledgePresenceIndicatorPhrases]'s doc comment — spoken
 /// verbatim (never paraphrased), same "speak this word for word" pattern
 /// as [_metaCapabilityCannedResponse].
-const String _acknowledgePresenceCannedResponse = 'Yes, I can hear you. How can I help with the job?';
+const List<String> _acknowledgePresenceResponses = [
+  "Yes, I can hear you. What do you need on the job?",
+  "I'm here, loud and clear. What can I do for you?",
+  "Yep, I'm listening. What's next?",
+  "I hear you. Want the estimate, the change orders, or a photo?",
+];
+
+int _presenceReplyCursor = 0;
+int _retryReplyCursor = 0;
+
+/// Rotates through the replies so repeated presence checks don't get the
+/// identical sentence every time.
+String _nextAcknowledgePresenceResponse() =>
+    _acknowledgePresenceResponses[_presenceReplyCursor++ % _acknowledgePresenceResponses.length];
+
+/// Natural-sounding replacement for a single fixed "didn't catch that" line —
+/// used ONLY when nothing could be routed (garbled/drifted transcription).
+/// Off-topic refusal ([_kbCatchAllBoundaryDeclineText]) is unchanged.
+const List<String> _unrecognizedUtteranceReplies = [
+  "I heard you say something, but I'm not sure what you need — want me to show the estimate, change orders, or take a photo?",
+  "Sorry, that didn't come through clearly. Could you say it again? I can show the estimate, change orders, or take a photo.",
+  "I missed that one. Try me again — for example, show the job history or take a photo.",
+];
+
+String _nextUnrecognizedUtteranceReply() =>
+    _unrecognizedUtteranceReplies[_retryReplyCursor++ % _unrecognizedUtteranceReplies.length];
 
 /// CONFIRMED gap: get_job_timeline_answer had NO deterministic backstop at
 /// all before this — never built during the earlier "extend to every
@@ -1307,62 +1689,6 @@ const List<String> _intentionalGoBackPhrases = [
   'return to the job',
 ];
 
-/// Reliability audit finding (CHECK 4): `capture_photo`'s required
-/// follow-up decision — confirm_photo_upload or retake_photo — had NO
-/// deterministic backstop at all, unlike view_estimate and go_back's
-/// camera-flow trigger. Same "strengthened description alone has not
-/// proven reliable enough" reasoning as those two. See
-/// [_GeminiLiveTestScreenState._looksLikePhotoConfirmRequest].
-const List<String> _photoConfirmIndicatorPhrases = [
-  'keep it',
-  'save it',
-  'upload it',
-  'looks good',
-  'that works',
-  'use that',
-  'keep that',
-  'yes keep',
-  // CONFIRMED gap: zero occurrences of confirm_photo_upload firing in a
-  // real session where a photo was captured — broadened to the technician's
-  // actual observed phrasing.
-  'confirm',
-  // VERIFIED via a standalone normalize/match check (not assumed): the
-  // input-side normalization (`replaceAll(RegExp('[^a-z ]'), ' ')`) turns
-  // an apostrophe into a SPACE, not nothing — "that's good" normalizes to
-  // "that s good" (three words), NOT "thats good" (two words, no space).
-  // Caught this the hard way: an earlier version of this phrase list used
-  // 'thats good' (matching this file's existing 'doesnt'/'whats'-style
-  // no-apostrophe convention elsewhere) and a real match-logic test proved
-  // it NEVER matches "That's good". Since it's unverified whether Gemini's
-  // real transcription ever emits the apostrophe at all, both normalized
-  // forms are listed so this matches either way.
-  'that s good',
-  'thats good',
-  'yes upload',
-  'use this one',
-];
-
-/// See [_photoConfirmIndicatorPhrases]'s doc comment. Checked the same
-/// whole-word/phrase way — see
-/// [_GeminiLiveTestScreenState._looksLikePhotoRetakeRequest].
-const List<String> _photoRetakeIndicatorPhrases = [
-  'retake',
-  'try again',
-  'take another',
-  'redo that',
-  'redo it',
-  'doesnt look right',
-  'take it again',
-  'no retake',
-  // CONFIRMED gap: zero occurrences of retake_photo firing in a real
-  // session — broadened to the technician's actual observed phrasing.
-  'retake it',
-  'no good',
-  'delete it',
-  'take another one',
-  'do it again',
-];
-
 /// Debounce for the deterministic photo-decision trigger — if Gemini
 /// already called confirm_photo_upload or retake_photo more recently than
 /// this, the trigger assumes it's already being handled and stays out of
@@ -1396,24 +1722,37 @@ const String _inactivityWarningText =
 /// `gemini_function_dispatcher.dart`) — camera HAL init time genuinely
 /// varies and is not fully eliminated even after the overlap-rejection fix.
 /// Rather than leaving the technician silently staring at a stuck screen,
-/// [_GeminiLiveTestScreenState._dispatchWithOpenCameraSafeguards] races the
-/// real `open_camera` dispatch against these two independent thresholds:
-///  - [_openCameraAckDelay]: still open after this long -> speak
-///    [_openCameraAckText] so it doesn't feel broken.
-///  - [_openCameraHardTimeout]: still open after this much longer -> give up
-///    waiting, tell Gemini to ask the technician to retry, and log it
-///    clearly as a timeout (never a silent hang). The real dispatch keeps
-///    running in the background after this point; see that method's own
-///    doc comment for how its eventual outcome is handled.
-const Duration _openCameraAckDelay = Duration(seconds: 5);
-const Duration _openCameraHardTimeout = Duration(seconds: 15);
+/// [_GeminiLiveTestScreenState._dispatchWithOpenCameraSafeguards] speaks
+/// [_openCameraAckText] at [_openCameraAckDelay] if it's still not done, so
+/// it doesn't feel broken.
+///
+/// P0 FIX (CONFIRMED via flutter_run_log_new.txt, build #65): a SECOND
+/// threshold used to exist here too — a 15s hard timeout that gave up
+/// WAITING on the real dispatch (via `Future.timeout`) and told Gemini to
+/// tell the technician the camera open had failed, while the real
+/// `CameraController.initialize()` call kept running, unabortable, in the
+/// background. Camera-open time is NOT reliably under 15s (this exact run
+/// measured ~20.1s), so the timeout routinely fired while the real open was
+/// still genuinely in progress — the technician heard "opening the camera
+/// timed out — try again," then 5 seconds later heard "the camera's
+/// actually open now," two directly contradictory messages about the same
+/// action. Removed rather than fixed in place: the `camera` plugin's public
+/// API has no way to actually cancel/abort an in-flight `initialize()` call
+/// (Dart Futures aren't preemptible, and there's no cancellation token to
+/// pass it), so the ONLY two honest options were "stop lying about having
+/// timed out" (this) or "make the timeout genuinely stop the operation it
+/// claims to have given up on" (not achievable without patching the
+/// plugin) — a timeout that doesn't actually stop the thing it timed out is
+/// worse than no timeout at all. `open_camera` now simply awaits the real
+/// call, exactly like every other camera-flow function already does.
+final Duration _openCameraAckDelay = pendingCallFillers['open_camera']!.delay;
 
 /// See [_openCameraAckDelay]'s doc comment. Sent to Gemini as a
 /// `clientContent` "say exactly this" instruction — same mechanism as
 /// [_inactivityWarningText]/[_GeminiLiveTestScreenState._fireInactivityWarning],
 /// not a separate on-device TTS call, for the same mic-lock-contention
 /// reasoning given there.
-const String _openCameraAckText = 'Just a moment, opening the camera.';
+final String _openCameraAckText = pendingCallFillers['open_camera']!.text;
 
 class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   final FlutterSoundRecorder _recorder = FlutterSoundRecorder();
@@ -1461,6 +1800,164 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// state has to survive between separate Gemini function calls. One
   /// instance per session (this State object); disposed in [_teardown].
   final GeminiCameraSession _cameraSession = GeminiCameraSession();
+
+  /// P2 — whether a camera-opening function (`open_camera`/`retake_photo`)
+  /// has genuinely RETURNED SUCCESS, as opposed to merely having produced a
+  /// preview texture. [_screenTask] reaching [_ScreenTask.cameraLive] now
+  /// means "there is something to look at" and can happen many seconds
+  /// earlier; this means "the camera is fully initialized and armed", which
+  /// is what `capture_photo`'s guard actually requires. Set and cleared
+  /// only in [_updateScreenTaskForToolCall], alongside [_screenTask] itself.
+  bool _cameraOpenConfirmed = false;
+
+  /// When the current "Opening the camera…" surface went up (reset on a
+  /// retry) — drives the caption escalation and the Retry/Cancel offer in
+  /// [_buildCameraTaskBody]. [_cameraOpeningTicker] just rebuilds once a
+  /// second while that surface is showing, so the caption can change.
+  DateTime? _cameraOpeningStartedAt;
+  Timer? _cameraOpeningTicker;
+  bool _cameraOpenIsRetry = false;
+
+  /// See [_CameraOpenCancelIntent]; consumed when the cancelled dispatch
+  /// returns.
+  _CameraOpenCancelIntent? _cameraOpenCancelIntent;
+
+  void _startCameraOpeningTicker() {
+    _cameraOpeningStartedAt ??= DateTime.now();
+    _cameraOpeningTicker?.cancel();
+    _cameraOpeningTicker = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted || _screenTask != _ScreenTask.cameraOpening) {
+        timer.cancel();
+        _cameraOpeningTicker = null;
+        _cameraOpeningStartedAt = null;
+        _cameraOpenIsRetry = false;
+        return;
+      }
+      setState(() {});
+    });
+  }
+
+  /// Retry/Cancel on a slow open — see [GeminiCameraSession.cancelPendingOpen]
+  /// for why neither can abort the native call itself.
+  void _onSlowCameraOpenAction({required bool retry}) {
+    final intent = retry ? _CameraOpenCancelIntent.retry : _CameraOpenCancelIntent.user;
+    if (!_cameraSession.cancelPendingOpen()) {
+      _log_('CAMERA OPEN: ${intent.name} tapped but no open is pending any more — ignoring');
+      return;
+    }
+    _cameraOpenCancelIntent = intent;
+    _log_('CAMERA OPEN: technician tapped ${retry ? 'RETRY' : 'CANCEL'} on a slow open');
+  }
+
+  Future<void> _startCameraOpenRetry() async {
+    final jobId = widget.jobId;
+    if (!mounted || jobId == null) return;
+    _log_('CAMERA OPEN: retrying — the new open queues behind the abandoned one and starts once the camera is free');
+    await _executeDeterministic(
+      _deterministicTriggers['open_camera']!,
+      args: {'job_id': jobId},
+      buildSpokenText: (result) => _defaultDeterministicSpokenText(
+        name: 'open_camera',
+        humanAction: 'take a photo',
+        appAction: 'opened the camera for you',
+        result: result,
+      ),
+    );
+  }
+
+  // ===========================================================================
+  // P1 — camera-open latency, speculative prewarm
+  // CONFIRMED, three rounds running: `native_open_still_pending` heartbeat
+  // logging shows the ENTIRE open delay (5-30s across runs, 13.66s in the
+  // most recent one) is 100% inside native CameraX's own
+  // `controller.initialize()` — no Dart-side scheduling drift, nothing
+  // reorderable within `open_camera`'s own call. Confirmed real-device
+  // (SM A507FN, not an emulator — `flutter devices` lists a real model/
+  // serial, never an `emulator-XXXX` id). With no further sub-step to
+  // optimize, the only remaining lever is TIMING: start that same
+  // expensive native call BEFORE the technician asks, so its cost overlaps
+  // ordinary conversation/screen dwell time instead of blocking a real
+  // request. See [_maybePrewarmCameraController].
+  // ===========================================================================
+
+  /// Whether the camera controller currently open (or opening) was started
+  /// SPECULATIVELY by [_maybePrewarmCameraController], not by a genuine
+  /// open_camera request yet. While true, [GeminiCameraSession
+  /// .onOpenStarted]/`onPreviewAvailable`/`onOpenSettled` all suppress
+  /// their usual ambient-UI transition (the technician hasn't asked for
+  /// the camera — showing it would be actively confusing) while letting
+  /// the REAL native work proceed normally in the background. Cleared the
+  /// instant a GENUINE open_camera request is handled (see
+  /// [_dispatchWithOpenCameraSafeguards]'s open_camera branch) — from that
+  /// point on, every callback behaves exactly as it always has, and
+  /// [GeminiCameraSession.open]'s own new "already initialized, reuse it"
+  /// fast path means the technician gets the ALREADY-PAID controller
+  /// immediately instead of waiting through a second real:with real cost.
+  bool _cameraSpeculativelyPrewarming = false;
+
+  /// Bounds how long a SPECULATIVE prewarm is allowed to hold the camera
+  /// hardware open with nothing actually using it — cancelled the instant
+  /// a real open_camera request arrives (see
+  /// [_dispatchWithOpenCameraSafeguards]). If nobody ever asks for the
+  /// camera this session, releases it automatically rather than holding it
+  /// claimed (and drawing power, and potentially contending with some
+  /// other app/screen that wants it) for the rest of a long conversation
+  /// that never ends up needing a photo.
+  Timer? _cameraPrewarmAutoReleaseTimer;
+
+  /// How long a session waits after a successful speculative prewarm
+  /// before releasing an unused camera. Generous — most conversations that
+  /// WILL involve a photo reach that point well within this window; if
+  /// not, releasing costs nothing worse than if prewarm had never
+  /// happened (a later real request just re-opens from scratch, exactly
+  /// as it always has).
+  static const Duration _cameraPrewarmAutoReleaseDelay = Duration(seconds: 90);
+
+  /// Starts the REAL native camera open — the actual expensive
+  /// `controller.initialize()` call, not just the cheap device-enumeration
+  /// [GeminiCameraSession.prewarm] already does — speculatively, the
+  /// instant the voice session becomes active, rather than waiting for the
+  /// technician to ask. Unconditional (not gated on any "camera intent
+  /// detected" heuristic): this app's whole purpose is job-photo
+  /// documentation, so the large majority of sessions plausibly involve at
+  /// least one photo, and a speculative open that turns out unused is
+  /// bounded and cheap (see [_cameraPrewarmAutoReleaseDelay]) — a
+  /// narrower heuristic trying to guess intent from a partial transcript
+  /// would only add its own false-negative risk (deciding NOT to prewarm
+  /// a session that, moments later, genuinely does ask for a photo) for a
+  /// benefit this bounded-cost approach already gets more reliably.
+  ///
+  /// Silent by design — see [_cameraSpeculativelyPrewarming]'s doc
+  /// comment: nothing about this should be visible to the technician
+  /// unless/until they actually ask for the camera.
+  void _maybePrewarmCameraController() {
+    final jobId = widget.jobId;
+    if (jobId == null) return; // Standalone mode has no job to attach a photo to.
+    _cameraSpeculativelyPrewarming = true;
+    _log_('CAMERA PREWARM: starting the real controller.initialize() speculatively at session start (job $jobId) — silent until a real request arrives.');
+    unawaited(
+      _cameraSession.open(ref, jobId).then((_) {
+        if (!mounted || !_cameraSpeculativelyPrewarming) return;
+        _log_(
+          'CAMERA PREWARM: complete and sitting ready, unused — will auto-release in '
+          '${_cameraPrewarmAutoReleaseDelay.inSeconds}s unless a real open_camera request arrives first.',
+        );
+        _cameraPrewarmAutoReleaseTimer?.cancel();
+        _cameraPrewarmAutoReleaseTimer = Timer(_cameraPrewarmAutoReleaseDelay, () {
+          _cameraPrewarmAutoReleaseTimer = null;
+          if (!mounted || !_cameraSpeculativelyPrewarming) return;
+          _log_('CAMERA PREWARM: never used this session — releasing the speculatively-opened camera now.');
+          _cameraSpeculativelyPrewarming = false;
+          unawaited(_cameraSession.dispose());
+        });
+      }, onError: (Object e) {
+        // Already logged in detail by GeminiCameraSession's own open()
+        // path and by [GeminiCameraSession.onOpenSettled] above — a failed
+        // prewarm is harmless, a real request later just opens normally.
+        _log_('CAMERA PREWARM: failed ($e) — harmless, a real open_camera request will simply open it itself.');
+      }),
+    );
+  }
 
   /// Tracks how many view_estimate/view_change_orders/view_invoice/
   /// view_job_history screens are currently pushed on top of this ambient
@@ -1584,6 +2081,36 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   Timer? _preemptiveDefaultMuteSafetyTimer;
   static const Duration _preemptiveDefaultMuteSafetyDelay = Duration(seconds: 2);
 
+  /// ISSUE 1(b) (CONFIRMED via fbd877f0-flutter_run_log.txt): once
+  /// [_maybeFallBackToKbAnswerCatchAll] actually dispatches a real
+  /// get_kb_answer call, [_preemptiveDefaultMuteSafetyTimer] defers
+  /// indefinitely (see [_armPreemptiveDefaultMuteSafetyTimer]) rather than
+  /// ever speaking the wrong "didn't catch that" line over a real answer
+  /// still on its way — but that indefinite defer has no ceiling of its
+  /// own to prove/bound it. This is that ceiling: a SEPARATE, purely
+  /// diagnostic timer, longer than [_preemptiveDefaultMuteSafetyDelay] and
+  /// the near-0ms routing decision in (a), armed the instant a real
+  /// get_kb_answer dispatch starts. If it fires, the KB call is still
+  /// genuinely pending — logged so that's visible, but deliberately NEVER
+  /// speaks a fallback message itself (that would risk exactly the
+  /// wrong-message bug this issue fixes); the real answer, whenever it
+  /// arrives, is still what gets spoken.
+  Timer? _kbAnswerWaitSafetyTimer;
+  static const Duration _kbAnswerWaitSafetyDelay = Duration(seconds: 6);
+
+  /// ISSUE 1(a) — timestamp of the most recent silence->speech-end edge
+  /// that fired [_finalizeUtteranceEndDeterministicTriggers] (i.e. the
+  /// instant this app considers the current utterance actually OVER).
+  /// [_maybeFallBackToKbAnswerCatchAll] logs the elapsed time from here to
+  /// its own routing decision, so the next real log can directly confirm
+  /// that decision is near-instant — a LOCAL branch, not something that
+  /// should ever take multiple seconds on its own (see that method's doc
+  /// comment for the CONFIRMED regression this was added to disprove: the
+  /// real delay was a longer utterance still being spoken past
+  /// [_preemptiveDefaultMuteSafetyDelay]'s fixed window, not this decision
+  /// itself being slow).
+  DateTime? _utteranceEndDetectedAt;
+
   /// PART J item 1 (CONFIRMED regression via 44c910b3-flutter_run_log.txt:
   /// a single "can you hear me" utterance fired THREE DETERMINISTIC
   /// INTERRUPT calls back-to-back — preemptive_default_mute, then
@@ -1624,8 +2151,47 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// flushed makes every entry here stale — discarded the next time a chunk
   /// arrives and this generation no longer matches (see
   /// [_onResponseAudioChunk]), not kept around indefinitely.
-  final List<({Uint8List bytes, String? mimeType})> _pendingPcmChunksAwaitingReinit = [];
+  ///
+  /// P0 FIX (CONFIRMED regression: a technician's "Can you hear me?"
+  /// produced TWO server turns — Gemini's own free-text reply, then, after
+  /// the deterministic acknowledge_presence trigger caught up and
+  /// interrupted, the correct canned reply — both still sitting UNFLUSHED
+  /// in this SAME list, generation-tagged but with no way to tell WHICH
+  /// TURN a given entry belonged to. When [_auditGeminiDuplicateResponse]
+  /// correctly identified the second turn as a near-duplicate of the
+  /// first and tried to drop "the rest of this turn," there was no way to
+  /// do that selectively — every entry here, from EITHER turn, looked
+  /// identical. Net result: NOTHING played; the technician heard silence
+  /// after a completely ordinary question). [turnId] closes that gap —
+  /// see [_currentResponseTurnId]'s doc comment for how it's assigned, and
+  /// [_auditGeminiDuplicateResponse] for how it's used to purge ONLY the
+  /// specific turn being suppressed, never an earlier turn's still-queued,
+  /// still-wanted audio.
+  final List<({Uint8List bytes, String? mimeType, int turnId})> _pendingPcmChunksAwaitingReinit = [];
   int _pendingPcmChunksGeneration = 0;
+
+  /// P0 FIX — see [_pendingPcmChunksAwaitingReinit]'s doc comment. A
+  /// purely CLIENT-SIDE counter, distinct from [_pcmReinitGeneration]
+  /// (which tracks native player teardown/rebuild cycles, a different
+  /// axis): this tracks which CONVERSATIONAL TURN a chunk belongs to, so a
+  /// later per-turn decision (right now, only [_auditGeminiDuplicateResponse]'s
+  /// suppression) can target exactly the right entries in
+  /// [_pendingPcmChunksAwaitingReinit] without touching any other turn's.
+  ///
+  /// Bumped in two places, both safe to double-bump (an extra, redundant
+  /// bump only means an id is "used up" slightly early — it can never
+  /// cause two DIFFERENT turns to incorrectly share one id, which is the
+  /// only failure mode that would actually matter here):
+  ///  1. [_interruptGeminiForDeterministicTrigger] — the moment the app
+  ///     itself decides "whatever was in flight is now stale, something
+  ///     new is coming" (covers both the unconditional preemptive mute on
+  ///     every new utterance, and any specific trigger's own interrupt
+  ///     immediately before it sends its instruction).
+  ///  2. [_logAndResetTurnShape] — every genuine server turn boundary
+  ///     (`turnComplete`/`interrupted`), so a turn Gemini starts on its
+  ///     own (not preceded by an app-side interrupt — e.g. two genuinely
+  ///     separate spontaneous replies) still gets its own id.
+  int _currentResponseTurnId = 0;
 
   /// PART G item 1 (CONFIRMED regression via real log evidence:
   /// acknowledge_presence and meta_capability each matched correctly and
@@ -1789,6 +2355,51 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       (_deterministicTriggers['get_last_photo']?.resolvedForCurrentUtterance ?? false) ||
       (_deterministicTriggers['get_job_timeline_answer']?.resolvedForCurrentUtterance ?? false);
 
+  /// True from the instant ANY trigger commits to the current utterance
+  /// (each sets its own resolved flag synchronously at match time) until
+  /// the next genuinely new utterance — unlike
+  /// [_utteranceAlreadyResolvedByTrigger] alone, which only turns true once
+  /// a fired trigger's async dispatch succeeds. See the evaluation loop in
+  /// [_onInputTranscription].
+  /// A guard-failed match's clarification reply (e.g. "the camera's already
+  /// open"), queued during this chunk's evaluation loop — see the guard
+  /// branch in [_maybeTriggerDeterministic].
+  void Function()? _pendingGuardFailedReply;
+
+  /// Set once a queued guard-failed reply has actually been spoken this
+  /// utterance. Deliberately NOT part of [_anyTriggerCommittedThisUtterance]:
+  /// a later chunk of the same utterance ("…capture it") must still be able
+  /// to fire a real trigger. It only stops the reply repeating and keeps
+  /// the KB catch-all / safety-timeout from also answering.
+  bool _guardFailedReplySpokenThisUtterance = false;
+
+  bool get _anyTriggerCommittedThisUtterance =>
+      _utteranceAlreadyResolvedByTrigger || _otherSpecificTriggerAlreadyResolvedThisUtterance;
+
+  /// ISSUE 1 fix — see the toolCall-suppression call site in
+  /// [_handleToolCall] for the CONFIRMED duplicate-dispatch bug this
+  /// closes. Unlike [_otherSpecificTriggerAlreadyResolvedThisUtterance]
+  /// (which answers "did ANY OTHER trigger already claim this utterance"),
+  /// this answers "did THIS APP'S OWN trigger already fire THIS EXACT
+  /// function name for the current utterance" — the specific check needed
+  /// to recognize a genuine Gemini toolCall as redundant with (not merely
+  /// unrelated to) this app's own deterministic firing.
+  bool _alreadyResolvedByAppTriggerThisUtterance(String name) {
+    switch (name) {
+      case 'view_estimate':
+        return _viewEstimateDetectionResolvedForCurrentUtterance;
+      case 'get_job_details':
+        return _getJobDetailsDetectionResolvedForCurrentUtterance;
+      case 'go_back':
+        return _goBackTriggerResolvedForCurrentUtterance;
+      case 'confirm_photo_upload':
+      case 'retake_photo':
+        return _photoDecisionResolvedForCurrentUtterance;
+      default:
+        return _deterministicTriggers[name]?.resolvedForCurrentUtterance ?? false;
+    }
+  }
+
   /// FIX 2: timestamp of the most recent `view_*` function success — set in
   /// [_handleToolCall]. `null` means no cooldown is active (either no
   /// view_* has succeeded yet this session, or [_isGoBackInCooldown]'s
@@ -1833,8 +2444,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   DateTime? _lastGoBackActivityAt;
 
   /// Reliability audit (CHECK 4): accumulates the current utterance's
-  /// transcript for [_looksLikePhotoConfirmRequest]/[_looksLikePhotoRetakeRequest]
-  /// — same per-utterance accumulate/reset pattern as
+  /// transcript for [classifyPhotoDecision] — same per-utterance
+  /// accumulate/reset pattern as
   /// [_viewEstimateDetectionBuffer], reset on the same silence->speech edge
   /// in [_trackSpeechLevel]. Only ever accumulated while [_screenTask] is
   /// [_ScreenTask.cameraCaptured] — see [_maybeDetectPhotoDecision].
@@ -1854,6 +2465,98 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// given captured photo — whichever ran most recently means "Gemini (or
   /// a previous firing) is already handling this photo's decision."
   DateTime? _lastPhotoDecisionActivityAt;
+
+  /// P0 FIX (CONFIRMED via flutter_run_log_new.txt, build #61): the "ask
+  /// for a clear repeat" resolution for [PhotoDecision.ambiguous] could
+  /// loop indefinitely — Gemini's own repeated clarification prompt ("Keep
+  /// it or retake it?") is short enough, and itself matches BOTH keep and
+  /// retake evidence, to legitimately win the "a short command must always
+  /// beat an echo guess" exemption in [_looksLikeGeminiEcho] (see that
+  /// method's doc comment) — so the mic picking up Gemini's own re-prompt
+  /// just re-triggers the SAME ambiguous result, forever, with no bounded
+  /// exit. A real run looped ~50s across two full ambiguous cycles before
+  /// the echo backstop happened to catch a LONGER echoed sentence and only
+  /// then went quiet — never actually resolving the decision; the tester
+  /// had to manually abort.
+  ///
+  /// Counts consecutive ambiguous hits for the SAME pending photo (reset to
+  /// 0 the instant a real decision dispatches, or a fresh photo is
+  /// captured — see both reset sites). At
+  /// [_photoDecisionAmbiguousEscalationThreshold], the prompt switches to a
+  /// stricter one AND matching switches to
+  /// `classifyStrictBareWordPhotoDecision` — the next utterance must be
+  /// JUST the bare word "keep"/"confirm" or JUST "retake" (nothing else) to
+  /// resolve. This breaks the loop even without a perfect echo fix: an
+  /// echoed FULL sentence (the strict prompt or the original question)
+  /// always has extra words around "keep"/"retake", so it can never satisfy
+  /// a bare-word-only check.
+  int _photoDecisionAmbiguousStreak = 0;
+  static const int _photoDecisionAmbiguousEscalationThreshold = 2;
+
+  /// P0 FIX (CONFIRMED, a real session): the escalation above has no decay
+  /// — once triggered, it stays in strict bare-word-only mode for the REST
+  /// of this photo's decision window, with the only reset being a FRESH
+  /// capture_photo. A real cascade (Gemini's own "Keep it or retake it?"
+  /// confirmation echoing back uncaught, THEN this trigger's own
+  /// clarification reprompt — [_photoDecisionAmbiguousPrompt] — ALSO
+  /// echoing back, two ambiguous hits in rapid succession) reached the
+  /// threshold, and everything the technician said for the rest of that
+  /// decision — "This looks good.", "Keep this for rock." (STT garble of
+  /// a bare "keep") — matched NOTHING, even though the NORMAL
+  /// (non-escalated) classifier already covers both a plain "looks good"
+  /// and a bare "keep" fine on their own. With the deterministic layer
+  /// permanently locked out, the utterance fell through to Gemini's own
+  /// free text, which then claimed "I've saved that photo" with no real
+  /// upload behind it — the escalation meant to protect this decision
+  /// ended up being the direct cause of the trust violation.
+  ///
+  /// [_lastPhotoDecisionAmbiguousAt] + this decay window is the fix: after
+  /// this long with no NEW ambiguous hit, the streak resets and the next
+  /// utterance gets the full, normal evidence-scoring classifier back. A
+  /// genuine rapid-fire echo cascade still reaches the threshold and
+  /// escalates well within this window (a real cascade closes in a couple
+  /// of seconds, not many) — this only ever matters once that cascade has
+  /// clearly stopped and the technician is speaking freely again.
+  static const Duration _photoDecisionAmbiguousStreakDecay = Duration(seconds: 12);
+  DateTime? _lastPhotoDecisionAmbiguousAt;
+
+  /// See [_photoDecisionAmbiguousStreak]'s doc comment.
+  String _photoDecisionAmbiguousPrompt() {
+    if (_photoDecisionAmbiguousStreak >= _photoDecisionAmbiguousEscalationThreshold) {
+      return "I keep hearing both. Please say ONLY the word 'keep', or ONLY the word 'retake' — nothing else.";
+    }
+    return "Sorry, I heard both keep and retake in that — which do you want: keep this photo, or retake it?";
+  }
+
+  /// See [_photoDecisionAmbiguousStreak]'s doc comment — active only once
+  /// escalated. Deliberately whole-buffer, not substring: allows trivial
+  /// filler ("um", "okay") around the bare word since a technician saying
+  /// it under repeated pressure plausibly hedges slightly, but anything
+  /// resembling a full sentence (in particular either question being
+  /// echoed back) has far more non-filler words than this tolerates and
+  /// correctly falls through to [PhotoDecision.none]. See
+  /// `classifyStrictBareWordPhotoDecision` in `photo_decision_classifier.dart`
+  /// (moved there, alongside [classifyPhotoDecision], for the same
+  /// unit-testability reasons — see `test/photo_decision_classifier_test.dart`).
+
+  /// BUG 5 FIX — see [_unrecognizedReplyForCurrentState]'s doc comment. True
+  /// from the instant [_executeDeterministicPhotoDecision] starts dispatching
+  /// confirm_photo_upload/retake_photo until it genuinely finishes (success
+  /// OR failure — see that method's `finally`), which can take many seconds
+  /// (compression + S3 upload). [_screenTask] alone can't gate this: it only
+  /// leaves [_ScreenTask.cameraCaptured] on SUCCESS, not on dispatch start.
+  bool _photoDecisionDispatchInFlight = false;
+
+  /// UI only: true for the whole confirm_photo_upload dispatch (compress +
+  /// upload), so the Review Photo surface can show an "Uploading…" overlay
+  /// alongside the spoken pending-call filler — see [_buildCameraTaskBody].
+  bool _photoUploadInFlight = false;
+
+  /// Reset to `false` every time [_photoDecisionDispatchInFlight] becomes
+  /// `true` — lets [_unrecognizedReplyForCurrentState] speak the "still
+  /// working on that" acknowledgment at most once per dispatch instead of
+  /// repeating it for every stray unresolved utterance during a long upload.
+  bool _photoDecisionDispatchAcknowledgedUnresolved = false;
 
   /// Mirrors [GeminiNavigationSession.onActiveChanged] — see that field's
   /// doc comment for why this ambient screen must render NOTHING (see
@@ -1901,6 +2604,26 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// — see that constant's doc comment for the bug this fixes.
   DateTime? _lastSpeechActivityAt;
   DateTime? _speechStoppedAt;
+
+  /// LATENCY metric only: end of the latest speech burst whose audio
+  /// actually reached Gemini, and when the current utterance's first real
+  /// transcript arrived. Both cleared at each new utterance and once a
+  /// latency is logged. See the LATENCY computation in [_onResponseAudioChunk].
+  DateTime? _latencySpeechEndAt;
+  DateTime? _latencyTranscriptAt;
+
+  /// See [_speechMaxContinuousDuration]'s doc comment. Set only on the
+  /// false->true edge of [_isSpeaking] (mirrors [_lastSpeechActivityAt]'s own
+  /// edge-only semantics), cleared to `null` whenever [_isSpeaking] goes back
+  /// to false — by the natural silence timer in [_trackSpeechLevel] or by
+  /// [_speechStuckWatchdogTimer] itself force-ending a wedged burst.
+  DateTime? _speechBurstStartedAt;
+
+  /// Ticks once a second for the whole lifetime of the mic stream (started in
+  /// [_startMicStreaming], cancelled in [_teardown]) — see
+  /// [_speechMaxContinuousDuration]'s doc comment for why this backstop
+  /// exists independently of [_trackSpeechLevel]'s own edge detection.
+  Timer? _speechStuckWatchdogTimer;
   Duration? _lastLatency;
   int _audioChunksSent = 0;
   int _responseChunksReceived = 0;
@@ -1930,9 +2653,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// stuck queued behind that traffic). PART N item 3 (CONFIRMED via
   /// 3ebd9995-flutter_run_log.txt: capture_photo's own native shutter call
   /// took 38s the same way, having never gotten this same protection —
-  /// generalized/renamed from `_cameraOpenInProgress` accordingly): set the
-  /// instant EITHER open_camera's OR capture_photo's real native dispatch
-  /// starts, BEFORE anything else that call does — see
+  /// generalized/renamed from `_cameraOpenInProgress` accordingly). BUG 2
+  /// FIX (CONFIRMED via flutter_run_log_new.txt, build #56): widened again
+  /// to confirm_photo_upload — its own `compressWithFile` platform-channel
+  /// call showed the identical symptom (8.3s for a sub-1MP JPEG that should
+  /// compress in well under 200ms), and the same protection here also
+  /// closes the window for a stray "new utterance" reset to fire mid-upload
+  /// at all (see [_trackSpeechLevel]'s BUG 4 FIX doc comment). Set the
+  /// instant open_camera's, capture_photo's, OR confirm_photo_upload's real
+  /// native dispatch starts, BEFORE anything else that call does — see
   /// [_dispatchWithOpenCameraSafeguards] — and cleared once that call
   /// reports back (success, failure, or open_camera's own hard timeout
   /// giving up waiting; capture_photo has no such timeout of its own, so
@@ -1948,6 +2677,26 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// hardware call is mid-flight anyway, and the relevant spoken
   /// acknowledgment is sent only once this flag clears again.
   bool _cameraNativeCallInProgress = false;
+
+  /// P0 FIX (CONFIRMED on a real SM-A507FN: a 55.03s `takePicture()` call
+  /// dropped 80+ response chunks — total silence for the whole call). While
+  /// `true`, [_onResponseAudioChunk] lets audio through DESPITE
+  /// [_cameraNativeCallInProgress], so the one filler line
+  /// [_speakPendingCallFiller] asked for is actually heard. Every other gate
+  /// ([_suppressResponseAudioForDeterministic] in particular, which the
+  /// filler's own interrupt arms to cut off whatever stale turn was in
+  /// flight) still applies. Previously the open_camera ack WAS sent, but
+  /// its audio hit the hard-pause drop like everything else.
+  ///
+  /// Cleared on the `turnComplete`/`interrupted` that follows the filler's
+  /// first audible chunk ([_fillerAudioStarted]), or when the native call
+  /// itself finishes — whichever comes first.
+  bool _fillerPassthroughActive = false;
+
+  /// See [_fillerPassthroughActive]: distinguishes the stale turn's own
+  /// `interrupted` ack (arrives BEFORE any filler audio) from the filler
+  /// turn's `turnComplete`.
+  bool _fillerAudioStarted = false;
 
   /// PART M (CONFIRMED via 204dd37f-flutter_run_log.txt: camera-open time
   /// improved 71.4s -> 30.8s after [_cameraNativeCallInProgress]'s audio hard-stop,
@@ -1980,13 +2729,6 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   String? _cameraOpenRealCallOutcome;
 
   /// True the instant [_teardown] starts running, for the FIRST time this
-  /// session — never reset afterward. See [_teardown]'s own doc comment on
-  /// this field for why the late-completion `open_camera` handler needs it
-  /// specifically (distinguishing "screenTask reads none because nothing
-  /// happened yet" from "screenTask reads none because teardown just reset
-  /// it").
-  bool _teardownStarted = false;
-
   /// PART C item 6: whether the CURRENT turn (since the last turnComplete/
   /// interrupted) has included a real `toolCall` message / any spoken
   /// audio or output transcription text — reset at every turn boundary by
@@ -2020,6 +2762,83 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         });
       },
     );
+    // P2 (see [_ScreenTask.cameraOpening]) — the camera surface is driven
+    // straight off the real controller lifecycle now, not off the dispatch
+    // returning. `onOpenStarted` puts a real "opening" surface up
+    // immediately; `onPreviewAvailable` swaps in the live preview the
+    // instant a texture exists, which on a slow open is many seconds before
+    // `open_camera`'s own success payload comes back through
+    // [_updateScreenTaskForToolCall].
+    _cameraSession.onOpenStarted = () {
+      if (!mounted) return;
+      // P1 FIX — see [_cameraSpeculativelyPrewarming]'s doc comment: a
+      // speculative prewarm's own open must never show the "opening the
+      // camera" surface — the technician hasn't asked for the camera yet.
+      // The native work still proceeds normally in the background; only
+      // the UI-visible transition is suppressed.
+      if (_cameraSpeculativelyPrewarming) {
+        _log_('screen task: open_camera prewarm STARTED silently (speculative — no UI change until a real request)');
+        return;
+      }
+      if (_screenTask != _ScreenTask.none) return;
+      _log_('screen task: open_camera STARTED -> ${_ScreenTask.cameraOpening} (showing the opening surface now, not after the controller reports ready)');
+      setState(() => _screenTask = _ScreenTask.cameraOpening);
+      _startCameraOpeningTicker();
+      _pausedVoiceService?.setScreenTaskActive(true);
+    };
+    _cameraSession.onPreviewAvailable = () {
+      if (!mounted) return;
+      if (_cameraSpeculativelyPrewarming) {
+        _log_('screen task: camera preview prewarmed and ready (speculative — no UI change until a real request)');
+        return;
+      }
+      if (_screenTask != _ScreenTask.cameraOpening && _screenTask != _ScreenTask.none) return;
+      _log_('screen task: camera preview texture available -> ${_ScreenTask.cameraLive} (view unblocked; capture stays gated on open_camera\'s own success)');
+      setState(() => _screenTask = _ScreenTask.cameraLive);
+      _pausedVoiceService?.setScreenTaskActive(true);
+      final requestedAt = _openCameraDispatchedAt;
+      _pipelineLog(
+        'camera_preview_live',
+        requestedAt == null
+            ? 'preview live (no open_camera dispatch recorded)'
+            : 'preview live ${DateTime.now().difference(requestedAt).inMilliseconds}ms after open_camera was '
+                  'dispatched — see PHOTO TIMING [open_camera] queue_wait_done / controller_initialize_done for the split',
+      );
+      // Painted and interactive: the first frame after the switch to the
+      // live preview has actually rendered.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || requestedAt == null) return;
+        _pipelineLog(
+          'camera_preview_painted',
+          'first frame with the live preview rendered ${DateTime.now().difference(requestedAt).inMilliseconds}ms after '
+              'open_camera was dispatched',
+        );
+      });
+    };
+    // The guaranteed counterpart to `onOpenStarted` — see
+    // [GeminiCameraSession.onOpenSettled]. Without this, an open that throws
+    // somewhere that returns before [_updateScreenTaskForToolCall] runs
+    // (e.g. [_executeDeterministic]'s own catch block) would strand the
+    // "opening the camera" surface for the rest of the session. A SUCCESS
+    // needs nothing here: `onPreviewAvailable` has already moved the task on.
+    _cameraSession.onOpenSettled = (error) {
+      if (!mounted || error == null) return;
+      _cameraOpenConfirmed = false;
+      // A prewarm that fails is a non-event UI-wise (nothing was ever
+      // shown) — just clear the flag so a LATER real request retries the
+      // open itself, from a clean slate, rather than being stuck thinking
+      // a (failed) prewarm already handled it.
+      if (_cameraSpeculativelyPrewarming) {
+        _log_('screen task: open_camera prewarm FAILED silently ($error) — a real request later will retry normally.');
+        _cameraSpeculativelyPrewarming = false;
+        return;
+      }
+      if (_screenTask != _ScreenTask.cameraOpening) return;
+      _log_('screen task: open_camera FAILED before any preview existed ($error) -> ${_ScreenTask.none} — clearing the opening surface.');
+      setState(() => _screenTask = _ScreenTask.none);
+      _pausedVoiceService?.setScreenTaskActive(false);
+    };
+    WidgetsBinding.instance.addTimingsCallback(_onFrameTimings);
     if (widget.ambient) {
       // Deferred to a post-frame callback — same reasoning as every other
       // "write provider state / start real work right as a screen first
@@ -2035,8 +2854,54 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeTimingsCallback(_onFrameTimings);
     _teardown();
     super.dispose();
+  }
+
+  /// PREVIEW SMOOTHNESS SAMPLING (replaces the removed `preview_fps` logger,
+  /// which used `startImageStream` — and thereby forced the camera plugin to
+  /// marshal full YUV frames to Dart on the main thread, itself a cause of
+  /// "Skipped N frames"). This measures the app's real Flutter frame
+  /// timings via the engine's batched [FrameTiming] callback instead: zero
+  /// per-frame native work. Only sampled while the live preview is showing
+  /// ([_ScreenTask.cameraLive]); one summary line per ~1s window.
+  int _fpsWindowFrames = 0;
+  int _fpsWindowSlowFrames = 0;
+  int _fpsWindowWorstMs = 0;
+  DateTime? _fpsWindowStartedAt;
+
+  void _onFrameTimings(List<FrameTiming> timings) {
+    // P1: sampled during [_ScreenTask.cameraOpening] too, not just once the
+    // preview is live. The open window is exactly where the "is the camera
+    // slow, or are we starving the thread that would service it" question
+    // lives (see `controller.initialize()`'s heartbeat in
+    // `gemini_function_dispatcher.dart`) — and this is the UI-thread half
+    // of that same measurement, from the other side of the platform channel.
+    if (_screenTask != _ScreenTask.cameraLive && _screenTask != _ScreenTask.cameraOpening) {
+      _fpsWindowStartedAt = null;
+      return;
+    }
+    final now = DateTime.now();
+    _fpsWindowStartedAt ??= now;
+    for (final t in timings) {
+      final totalMs = t.totalSpan.inMilliseconds;
+      _fpsWindowFrames++;
+      if (totalMs > 32) _fpsWindowSlowFrames++;
+      if (totalMs > _fpsWindowWorstMs) _fpsWindowWorstMs = totalMs;
+    }
+    final windowMs = now.difference(_fpsWindowStartedAt!).inMilliseconds;
+    if (windowMs < 1000) return;
+    final fps = _fpsWindowFrames * 1000 / windowMs;
+    debugPrint(
+      'PHOTO TIMING [preview_fps]: at $now (screenTask=${_screenTask.name}) — $_fpsWindowFrames frames in '
+      '${windowMs}ms (~${fps.toStringAsFixed(1)} fps), $_fpsWindowSlowFrames slow (>32ms), worst frame '
+      '${_fpsWindowWorstMs}ms',
+    );
+    _fpsWindowFrames = 0;
+    _fpsWindowSlowFrames = 0;
+    _fpsWindowWorstMs = 0;
+    _fpsWindowStartedAt = now;
   }
 
   /// Base [_systemInstruction] plus, only in job-scoped mode
@@ -2070,6 +2935,31 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     });
   }
 
+  /// P1 FIX (CONFIRMED via flutter_run_log_new.txt, build #61): the ~5.36s
+  /// gap between `platform_capture_call_start` (Dart calling
+  /// `controller.takePicture()`) and native `takePictureInternal` actually
+  /// starting — the true root cause of the "10.5s/16.8s takePicture()"
+  /// finding, NOT native camera latency at all (every CXCP capture-pipeline
+  /// step inside that window logs in single-digit milliseconds once it
+  /// finally starts) — was every "inlineData received"/"GEMINI SAID"
+  /// fragment STILL calling [_log_] (a full `setState` widget rebuild) on
+  /// every single chunk, unconditionally, even while
+  /// [_cameraNativeCallInProgress] is hard-pausing everything else for
+  /// exactly this reason. This is the SAME class of bug ISSUE 3(c) already
+  /// fixed for [_onResponseAudioChunk]'s own drop-branch logging (see that
+  /// method's doc comment) — that fix just didn't cover these two
+  /// unconditional call sites, which fire even MORE often (every chunk,
+  /// not just every dropped one) and were still competing directly with
+  /// the camera preview's own rendering and the platform channel's ability
+  /// to promptly dispatch `takePicture()` to native code. Same
+  /// timestamp-prefixed format as [_log_], purely logcat/debugPrint — no
+  /// `setState`, so no on-screen debug-log-list entry (same tradeoff
+  /// ISSUE 3(c) already made and this file already accepts).
+  void _logNoState(String message) {
+    final ts = DateTime.now().toIso8601String().substring(11, 23);
+    debugPrint('GEMINI LIVE TEST: [$ts] $message');
+  }
+
   Future<void> _startTest() async {
     if (_phase == _TestPhase.connecting || _phase == _TestPhase.connected) return;
 
@@ -2088,6 +2978,21 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     });
     _log_('Start Test tapped');
 
+    // P1 — pay the camera's one-time device-enumeration cost NOW, in the
+    // background, while the token fetch and WebSocket connect are already
+    // in flight and nobody is waiting on a camera. CONFIRMED to be 2.4-9s of
+    // real platform-channel work on this device, and previously paid inside
+    // the very first open_camera of the process, on the critical path. See
+    // `GeminiCameraSession.prewarm`.
+    unawaited(GeminiCameraSession.prewarm(ref));
+    // P1 — go further: speculatively pay the REAL, expensive
+    // controller.initialize() cost too (confirmed, three rounds running,
+    // to be 100% of the actual camera-open delay — see
+    // [_maybePrewarmCameraController]'s own doc comment), not just cheap
+    // enumeration, so it overlaps ordinary conversation time instead of
+    // blocking the technician's actual request.
+    _maybePrewarmCameraController();
+
     // FIX 3 (confirmed: ~5.6s of the ~7.4s wake-word-to-ready time was this
     // token fetch alone, sequenced AFTER the voice-service pause and mic
     // permission check below for no reason — none of the three depend on
@@ -2100,15 +3005,22 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // observe it) — the real result/error is still fully handled there;
     // Futures support multiple independent listeners, so this doesn't
     // swallow anything the try/catch below needs to see.
-    final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
-    final tokenFuture = accessToken == null ? null : _requestGeminiToken(accessToken);
-    if (tokenFuture != null) {
-      unawaited(tokenFuture.catchError((_) => ''));
-      _log_(
-        'requesting Gemini ephemeral token from $apiBaseUrl/voice/gemini-token (started now, in parallel with '
-        'voice-service pause + mic permission check below) ...',
-      );
+    //
+    // The token now usually comes from GlobalVoiceService's pre-fetched
+    // spare (see GeminiTokenCache) — the wake-word path claims it before
+    // this screen even mounts and hands it in as [widget.tokenFuture];
+    // otherwise it's taken from the same cache here, which falls back to
+    // fetching on demand exactly as this used to.
+    final Future<String> tokenFuture;
+    final widgetToken = widget.tokenFuture;
+    if (widgetToken != null && !_widgetTokenConsumed) {
+      _widgetTokenConsumed = true;
+      tokenFuture = widgetToken;
+    } else {
+      tokenFuture = ref.read(globalVoiceServiceProvider.notifier).takeGeminiToken();
     }
+    unawaited(tokenFuture.catchError((_) => ''));
+    _log_('Gemini token requested (pre-fetched spare if available, else from $apiBaseUrl/voice/gemini-token)');
 
     // Genuinely pauses the existing FieldLoop wake-word loop (real mic
     // release, not just ignoring its output — see
@@ -2124,13 +3036,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // comment for why.
     _pausedVoiceService = ref.read(globalVoiceServiceProvider.notifier);
     await _pausedVoiceService!.pauseForExternalSession('gemini_live_session');
-    _pausedVoiceService!.setExternalSessionPhase(VoicePhase.processing);
+    // `listening`, continuing what the wake word already showed (see
+    // GlobalVoiceService's wake-word branch) rather than dropping to
+    // "Thinking..." for the length of session setup: from here the mic is
+    // captured into [_preSetupAudio] and sent once the session is ready, so
+    // the technician genuinely is being listened to. [_applyVoicePhase]
+    // takes over at setupComplete.
+    _pausedVoiceService!.setExternalSessionPhase(VoicePhase.listening);
 
     try {
-      if (accessToken == null || tokenFuture == null) {
-        throw StateError('No Supabase session — log in before running this test.');
-      }
-
       // flutter_sound does not request/check mic permission itself (per its
       // own docs) — that's explicitly the app's responsibility.
       final permissionStatus = await Permission.microphone.request();
@@ -2139,8 +3053,17 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         throw StateError('Microphone permission denied.');
       }
 
+      // Start capturing NOW — the wake-word recognizer has released the mic
+      // (pauseForExternalSession above) — instead of after the token, the
+      // WebSocket handshake and setupComplete. Until setupComplete arrives
+      // the audio goes into [_preSetupAudio] and is sent first, in order,
+      // once the session can take it; see [_startMicCapture]. Not awaited:
+      // opening the recorder runs alongside the token/handshake below.
+      _micCaptureFuture = _startMicCapture();
+      unawaited(_micCaptureFuture!.catchError((_) {}));
+
       final token = await tokenFuture;
-      _log_('token received (${_redact(token)})');
+      _log_('token received');
 
       if (!mounted) return;
       setState(() => _phase = _TestPhase.connecting);
@@ -2155,7 +3078,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       final connectionUri = _geminiLiveUri(token);
       final redactedDisplayUri = connectionUri.replace(queryParameters: {
         for (final e in connectionUri.queryParameters.entries)
-          e.key: (e.key == 'access_token' || e.key == 'key') ? _redact(e.value) : e.value,
+          e.key: (e.key == 'access_token' || e.key == 'key') ? '<redacted>' : e.value,
       });
       _log_('opening WebSocket: $redactedDisplayUri');
       debugPrint(
@@ -2295,6 +3218,48 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           // native-audio-model carve-out.
           'inputAudioTranscription': {
             'languageCodes': ['en-US'],
+            // ISSUE 2(a) mitigation (CONFIRMED via fbd877f0-flutter_run_log.txt
+            // and a fresh check against the current Live API reference,
+            // ai.google.dev/api/live, AudioTranscriptionConfig): `languageCodes`
+            // is documented as a HINT ("providing hints about the languages
+            // present in the audio"), not a hard constraint, and there is no
+            // stricter locking parameter this API exposes — auto language/
+            // script switching mid-session (confirmed: Hindi/Devanagari
+            // appeared here despite `languageCodes: ['en-US']`) is a real,
+            // documented constraint of this API today, not something fully
+            // fixable app-side. `customVocabulary` IS a legitimate, documented
+            // AudioTranscriptionConfig field ("phrases to bias the speech
+            // recognition model toward recognizing specific terms") — biasing
+            // toward this app's actual short command vocabulary makes the
+            // ambiguous, easily-misheard SHORT utterances (a single word or
+            // two, the exact shape most prone to drifting into another
+            // script/language) more likely to resolve as the English command
+            // they almost certainly were, without pretending to solve the
+            // general problem. See [_looksLikeNonLatinScriptTranscription]'s
+            // doc comment for the pragmatic app-side mitigation this pairs
+            // with for whatever this can't catch.
+            'customVocabulary': [
+              'take a photo',
+              'take a picture',
+              'open the camera',
+              'capture it',
+              'snap it',
+              'ready',
+              'confirm',
+              'keep it',
+              'keep this photo',
+              'upload it',
+              'retake',
+              'retake it',
+              'retake this photo',
+              'take another photo',
+              'show me the estimate',
+              'show me the invoice',
+              'show me the change orders',
+              'show me the job history',
+              'show me the last photo',
+              'go back',
+            ],
           },
           // FIX 1: enables `serverContent.outputTranscription` — a
           // transcript of GEMINI'S OWN spoken audio, not the technician's.
@@ -2363,7 +3328,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         '${(jsonDecode(setupMessage) as Map<String, dynamic>)['setup']['toolConfig']?['functionCallingConfig']?['mode'] ?? 'ABSENT'}, '
         'toolConfig.allowedFunctionNames.count='
         '${((jsonDecode(setupMessage) as Map<String, dynamic>)['setup']['toolConfig']?['functionCallingConfig']?['allowedFunctionNames'] as List?)?.length ?? 0}, '
-        'inputAudioTranscription.languageCodes=[en-US], outputAudioTranscription=enabled, '
+        'inputAudioTranscription.languageCodes=[en-US], inputAudioTranscription.customVocabulary.count='
+        '${((jsonDecode(setupMessage) as Map<String, dynamic>)['setup']['inputAudioTranscription']?['customVocabulary'] as List?)?.length ?? 0}, '
+        'outputAudioTranscription=enabled, '
         'contextWindowCompression=trigger 6000/target 3000 tokens, '
         'systemInstruction.length=${_effectiveSystemInstruction.length} chars — see '
         '"GEMINI FULL SYSTEM INSTRUCTION BEING SENT" just above for the full text)',
@@ -2396,12 +3363,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       if (!mounted) return;
       setState(() => _phase = _TestPhase.connected);
     } catch (e, stackTrace) {
-      debugPrint('GEMINI LIVE TEST ERROR: $e\n$stackTrace');
-      _log_('ERROR: $e');
+      final message = _scrubCredentials(e);
+      debugPrint('GEMINI LIVE TEST ERROR: $message\n$stackTrace');
+      _log_('ERROR: $message');
       if (!mounted) return;
       setState(() {
         _phase = _TestPhase.error;
-        _errorMessage = e.toString();
+        _errorMessage = message;
       });
       await _teardown();
     }
@@ -2423,48 +3391,132 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     );
   }
 
-  Future<String> _requestGeminiToken(String supabaseAccessToken) async {
-    final uri = Uri.parse('$apiBaseUrl/voice/gemini-token');
-    final response = await http.post(uri, headers: {'Authorization': 'Bearer $supabaseAccessToken'});
-    if (response.statusCode != 200) {
-      throw StateError('gemini-token request failed (${response.statusCode}): ${response.body}');
-    }
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
-    final token = decoded['token'] as String?;
-    if (token == null || token.isEmpty) {
-      throw StateError('gemini-token response missing "token": ${response.body}');
-    }
-    return token;
-  }
+  /// Whether [widget.tokenFuture] has been used — tokens are single-use, so
+  /// only the first session this screen starts may use it.
+  bool _widgetTokenConsumed = false;
 
-  String _redact(String value) {
-    if (value.length <= 8) return '<redacted, len=${value.length}>';
-    return '${value.substring(0, 4)}...${value.substring(value.length - 4)} (len=${value.length})';
-  }
+  /// Mic audio captured before the session could accept it (the token,
+  /// WebSocket handshake and `setupComplete` still in flight), sent first,
+  /// in order, the moment it can — see [_startMicCapture]/[_flushPreSetupAudio].
+  final ListQueue<Uint8List> _preSetupAudio = ListQueue<Uint8List>();
+  int _preSetupAudioBytes = 0;
+  int _preSetupAudioDroppedBytes = 0;
 
-  Future<void> _startMicStreaming() async {
+  /// True from the moment capture starts until [_flushPreSetupAudio] runs;
+  /// while true, mic chunks go to [_preSetupAudio] instead of the socket.
+  bool _bufferingPreSetupAudio = false;
+
+  /// The in-flight/finished [_startMicCapture] for the current session.
+  Future<void>? _micCaptureFuture;
+
+  /// Bumped by [_teardown] so a capture still opening when the session ends
+  /// stops instead of starting the recorder for a session that's gone.
+  int _micCaptureGeneration = 0;
+
+  /// Cap on [_preSetupAudio]: 8s of 16kHz mono pcm16 = 256KB. The measured
+  /// worst case from wake word to `setupComplete` was ~6.2s (SM-X230 trace);
+  /// 8s covers that plus the start of a command spoken straight after the
+  /// wake word, without letting an unusually slow setup grow the buffer
+  /// unbounded. Past the cap the OLDEST audio is dropped, so what's kept is
+  /// always contiguous with the live audio that follows it — a gap in the
+  /// middle of an utterance would hurt recognition more than a lost start.
+  static const int _preSetupAudioMaxBytes = _inputSampleRateHz * 2 * 8;
+
+  int _pcmBytesToMs(int bytes) => bytes * 1000 ~/ (_inputSampleRateHz * 2);
+
+  /// Opens the recorder and starts capturing into [_preSetupAudio] — started
+  /// by [_startTest] right after the mic permission check, in parallel with
+  /// the token/handshake, rather than after `setupComplete`.
+  Future<void> _startMicCapture() async {
+    final generation = _micCaptureGeneration;
     _log_('opening flutter_sound recorder session...');
     await _recorder.openRecorder();
     _recorderOpen = true;
+    // _teardown waits for this future before closing the recorder, so
+    // bailing here leaves it to close the (opened, not started) recorder.
+    if (generation != _micCaptureGeneration) return;
+
+    _preSetupAudio.clear();
+    _preSetupAudioBytes = 0;
+    _preSetupAudioDroppedBytes = 0;
+    _bufferingPreSetupAudio = true;
 
     final controller = StreamController<Uint8List>();
     _micStreamController = controller;
     _micSub = controller.stream.listen(
-      _onMicChunk,
+      _onRawMicChunk,
       onError: (Object e, StackTrace stackTrace) {
         debugPrint('GEMINI LIVE TEST ERROR (mic stream): $e\n$stackTrace');
         _log_('ERROR (mic stream): $e');
       },
     );
 
-    _log_('starting mic stream (pcm16, ${_inputSampleRateHz}hz, mono)...');
+    // P0 FIX (CONFIRMED via flutter_run_log_new.txt, build #61): the mic
+    // was opened with `AudioSource.defaultSource` (flutter_sound's own
+    // default — never explicitly set here before), which on Android does
+    // NOT guarantee acoustic echo cancellation. With Gemini's own TTS
+    // playing through the phone's speaker while this mic is simultaneously
+    // listening, its own voice leaking back in and getting transcribed as
+    // if the technician said it is a real, reproducible failure mode (see
+    // [_looksLikeGeminiEcho]'s app-side text-matching backstop) — a genuine
+    // capture_photo fired from the mic picking up Gemini's own "...go ahead
+    // and take another one when you're ready" tail. `voice_communication`
+    // maps to Android's `MediaRecorder.AudioSource.VOICE_COMMUNICATION`,
+    // documented to apply acoustic echo cancellation/automatic gain control
+    // when available on the device — exactly this two-way voice scenario.
+    // This suppresses the leak at the SOURCE, before it ever reaches
+    // transcription, instead of relying solely on the app-side text-match
+    // backstop to catch it after the fact.
+    //
+    // P0 AUDIO-ECHO investigation (a later round — the confirmed 3x-repeat
+    // bug was STILL reproducing despite the above): checked whether this
+    // app could go further and explicitly attach
+    // `android.media.audiofx.AcousticEchoCanceler` to this recording
+    // session, as an additional, more aggressive AEC layer on top of what
+    // `voice_communication` already requests from the platform.
+    // CONFIRMED NOT FEASIBLE without forking a third-party dependency:
+    // `AcousticEchoCanceler.create(audioSessionId)` requires the specific
+    // native `AudioRecord`'s session id, and neither flutter_sound's
+    // public Dart API (`FlutterSoundRecorder` — checked its full public
+    // surface) nor its Android implementation (checked
+    // `flutter_sound-9.30.0`'s own Java sources) exposes one — the real
+    // `AudioRecord` is created inside `flutter_sound_core`, a compiled AAR
+    // pulled from JitPack, not source available in this repo/pub cache to
+    // patch. `AudioSource.voice_communication` (below) already engages
+    // Android's platform-level AEC pipeline automatically wherever the
+    // device supports it — genuinely THE mechanism the report asks for,
+    // just not layerable a second time from this app without that fork.
+    // Given that, the achievable, highest-impact fix this round is on the
+    // TIMING side instead — see [_resumeGraceDelay]'s doc comment for the
+    // adaptive mic-resume fix, plus the duplicate-response safety net (see
+    // [_auditGeminiDuplicateResponse]) as defense in depth.
+    _log_('starting mic stream (pcm16, ${_inputSampleRateHz}hz, mono, audioSource=voice_communication)...');
     await _recorder.startRecorder(
       codec: Codec.pcm16,
       toStream: controller.sink,
       sampleRate: _inputSampleRateHz,
       numChannels: 1,
+      audioSource: AudioSource.voice_communication,
     );
-    _pausedVoiceService?.setExternalSessionPhase(VoicePhase.listening);
+  }
+
+  /// Runs on `setupComplete`: the session can take audio now. Sends
+  /// everything captured so far, then switches to live streaming.
+  Future<void> _startMicStreaming() async {
+    final generation = _micCaptureGeneration;
+    // Normally already capturing since before the token arrived; this only
+    // starts it here for a session that somehow skipped [_startTest]'s call.
+    await (_micCaptureFuture ??= _startMicCapture());
+    if (generation != _micCaptureGeneration) return;
+
+    _flushPreSetupAudio();
+
+    // See [_speechMaxContinuousDuration]'s doc comment — armed for the whole
+    // mic-streaming lifetime, cancelled in [_teardown] alongside [_silenceTimer].
+    _speechStuckWatchdogTimer?.cancel();
+    _speechStuckWatchdogTimer = Timer.periodic(const Duration(seconds: 1), (_) => _checkSpeechStuckWatchdog());
+
+    _syncVoicePhase();
 
     // Original Day 2 spec: the silence auto-timeout starts counting the
     // moment the session actually becomes active — i.e. right here, once the
@@ -2472,6 +3524,43 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // back when the WebSocket merely connected or the setup message was
     // sent (neither of which means anyone can be heard yet).
     _resetInactivityTimer(reason: 'session became active');
+  }
+
+  /// Every recorder chunk lands here: held in [_preSetupAudio] until the
+  /// session is ready, then passed straight to [_onMicChunk].
+  void _onRawMicChunk(Uint8List chunk) {
+    if (!_bufferingPreSetupAudio) {
+      _onMicChunk(chunk);
+      return;
+    }
+    _preSetupAudio.addLast(chunk);
+    _preSetupAudioBytes += chunk.length;
+    while (_preSetupAudioBytes > _preSetupAudioMaxBytes && _preSetupAudio.length > 1) {
+      final dropped = _preSetupAudio.removeFirst();
+      _preSetupAudioBytes -= dropped.length;
+      _preSetupAudioDroppedBytes += dropped.length;
+    }
+  }
+
+  /// Sends the buffered pre-setup audio through the normal [_onMicChunk]
+  /// path (so speech-level tracking sees the start of the utterance too),
+  /// oldest first, then switches to live. Fully synchronous: recorder
+  /// chunks arrive as separate stream events, so none can be delivered in
+  /// the middle of this — buffered audio always goes out before live audio,
+  /// with nothing dropped or sent twice at the switch.
+  void _flushPreSetupAudio() {
+    final chunks = _preSetupAudio.length;
+    final bytes = _preSetupAudioBytes;
+    while (_preSetupAudio.isNotEmpty) {
+      _onMicChunk(_preSetupAudio.removeFirst());
+    }
+    _preSetupAudioBytes = 0;
+    _bufferingPreSetupAudio = false;
+    _log_(
+      'pre-setup mic audio sent: $chunks chunks / ${_pcmBytesToMs(bytes)}ms captured before the session was ready'
+      '${_preSetupAudioDroppedBytes > 0 ? ' (oldest ${_pcmBytesToMs(_preSetupAudioDroppedBytes)}ms dropped over the 8s cap)' : ''}'
+      ' — streaming live from here',
+    );
   }
 
   void _onMicChunk(Uint8List chunk) {
@@ -2543,6 +3632,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
     if (amplitude > _speechRmsThreshold) {
       final now = DateTime.now();
+      // P0 AUDIO-ECHO FIX — see [_maybeResumeOutgoingAudio]'s doc comment
+      // for the full mechanism this feeds. Recorded UNCONDITIONALLY here
+      // (paused or not — this is the one place raw mic amplitude is
+      // already computed for every chunk, echo-relevant or not) so the
+      // outgoing-mic resume logic can ask "has the mic genuinely gone
+      // quiet" using REAL signal from the mic itself, instead of trusting
+      // a single fixed timer to have guessed the right wait every time.
+      _lastLoudMicChunkAt = now;
       // Reset the inactivity timer only on the silence->speech EDGE (not
       // every chunk while already speaking, which would churn the timer
       // dozens of times a second and flood the log for no benefit), and
@@ -2590,6 +3687,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // positive — there is no in-progress utterance's buffer content this
       // could wrongly discard.
       if (isGenuinelyNewUtterance) {
+        _utteranceSeq++;
+        _currentUtteranceStartedAt = now;
+        _latencySpeechEndAt = null;
+        _latencyTranscriptAt = null;
+        _finalizedCurrentUtterance = false;
+        _lateTranscriptFinalizeTimer?.cancel();
+        _lateTranscriptFinalizeTimer = null;
+        _stopAwaitingLateTranscript('new utterance started');
+        _pipelineLog('utterance_start', 'mic heard speech after silence (outgoingAudioPaused=$_outgoingAudioPaused)');
         debugPrint(
           'DETERMINISTIC RESET: new utterance — clearing all trigger buffers/resolved flags '
           '(outgoingAudioPaused=$_outgoingAudioPaused)',
@@ -2619,22 +3725,38 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         // a genuinely new utterance, not the more frequent mid-utterance
         // reset in [_clearAllTriggerBuffersAfterSuccess].
         _utteranceAlreadyResolvedByTrigger = false;
+        _guardFailedReplySpokenThisUtterance = false;
+        _pendingGuardFailedReply = null;
+        // P0 FIX — see [_awaitingFirstTranscriptOfUtterance]. Only when mic
+        // audio is actually reaching Gemini: while [_outgoingAudioPaused],
+        // Gemini can't be answering this speech (and it's most likely our
+        // own playback echoing back anyway).
+        if (!_outgoingAudioPaused) _beginAwaitingFirstTranscript();
         // PART J item 1 — see [_pcmReinitIssuedForCurrentUtterance]'s doc
         // comment: same lifecycle as the flag just above — a genuinely new
         // utterance is allowed exactly one more real PCM reinit.
         _pcmReinitIssuedForCurrentUtterance = false;
-        // Hygiene: any chunk still queued from the previous utterance's
-        // reinit (should be rare/empty by now — that reinit normally
-        // completes and flushes well within the 2s new-utterance debounce)
-        // is stale the instant a new utterance starts; never carry it into
-        // this one.
-        if (_pendingPcmChunksAwaitingReinit.isNotEmpty) {
-          _log_(
-            'PCM QUEUE: discarding ${_pendingPcmChunksAwaitingReinit.length} queued response chunk(s) still '
-            'pending from the previous utterance — a new utterance just started.',
-          );
-          _pendingPcmChunksAwaitingReinit.clear();
-        }
+        // BUG 4 FIX (CONFIRMED via flutter_run_log_new.txt, build #56):
+        // queued PCM audio used to be discarded RIGHT HERE, on the same
+        // raw-amplitude edge as the text-buffer reset above — but unlike
+        // those buffers (genuinely safe to clear on any 2s-silence gap,
+        // real speech or not), a queued PCM chunk can be a just-generated,
+        // not-yet-played response to something the app ITSELF just did
+        // (e.g. confirm_photo_upload's own "I've uploaded the photo"
+        // confirmation, queued behind that action's own PCM reinit).
+        // Discarding real, wanted audio on nothing but background mic noise
+        // — no real transcript text required — silently ate that exact
+        // confirmation once, 100% reproducibly. The discard now happens in
+        // [_muteImmediatelyOnFirstChunkOfUtterance] instead, gated on a
+        // genuinely new utterance's first REAL transcript chunk arriving,
+        // not a bare amplitude blip. See that method's own doc comment.
+      }
+      // See [_speechMaxContinuousDuration]'s doc comment: edge-only, exactly
+      // like [_lastSpeechActivityAt] below it — marks when THIS burst began,
+      // not refreshed on every chunk while already speaking.
+      if (!_isSpeaking) {
+        _speechBurstStartedAt = now;
+        _speechBurstReachedGemini = !_outgoingAudioPaused;
       }
       _lastSpeechActivityAt = now;
       _isSpeaking = true;
@@ -2653,13 +3775,45 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _silenceTimer = null;
     } else if (_isSpeaking) {
       _silenceTimer ??= Timer(_silenceDebounce, () {
-        _isSpeaking = false;
-        _speechStoppedAt = DateTime.now();
         _silenceTimer = null;
-        _log_('detected user stopped speaking — latency stopwatch started');
-        _finalizeUtteranceEndDeterministicTriggers();
+        _markStoppedSpeaking(reason: 'detected user stopped speaking — latency stopwatch started');
       });
     }
+  }
+
+  /// The one place [_isSpeaking] transitions back to `false` — used by both
+  /// the natural silence-timer edge above and [_speechStuckWatchdogTimer]'s
+  /// hard fallback, so the two paths can never drift apart (same log shape,
+  /// same [_speechStoppedAt]/[_speechBurstStartedAt] bookkeeping, same
+  /// [_finalizeUtteranceEndDeterministicTriggers] call).
+  void _markStoppedSpeaking({required String reason}) {
+    _isSpeaking = false;
+    _speechStoppedAt = DateTime.now();
+    // LATENCY metric only — see [_latencySpeechEndAt]. Only speech Gemini
+    // actually received can be what it is answering.
+    if (_speechBurstReachedGemini) _latencySpeechEndAt = _speechStoppedAt;
+    _speechBurstStartedAt = null;
+    _log_(reason);
+    _finalizeUtteranceEndDeterministicTriggers();
+  }
+
+  /// See [_speechMaxContinuousDuration]'s doc comment — the hard fallback
+  /// itself. Ticked every second by [_speechStuckWatchdogTimer] for as long
+  /// as the mic is streaming; a no-op unless a single continuous burst has
+  /// genuinely overrun the ceiling, which never happens for real speech.
+  void _checkSpeechStuckWatchdog() {
+    if (!_isSpeaking) return;
+    final burstStartedAt = _speechBurstStartedAt;
+    if (burstStartedAt == null) return;
+    final burstDuration = DateTime.now().difference(burstStartedAt);
+    if (burstDuration < _speechMaxContinuousDuration) return;
+    _silenceTimer?.cancel();
+    _silenceTimer = null;
+    _markStoppedSpeaking(
+      reason: 'SPEECH WATCHDOG: forcing "stopped speaking" after a ${burstDuration.inMilliseconds}ms continuous '
+          'burst — the normal silence->speech edge in _trackSpeechLevel never fired one on its own (see '
+          '_speechMaxContinuousDuration\'s doc comment).',
+    );
   }
 
   double _sqrt(double value) {
@@ -2685,16 +3839,30 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   ///    edge ([_trackSpeechLevel])
   ///  - every transcribed chunk of the technician's real speech
   ///    ([_onInputTranscription])
-  ///  - a response STARTING playback ([_onResponseAudioChunk], the
-  ///    outgoing-mic-audio PAUSE) and FINISHING playback
-  ///    ([_maybeResumeOutgoingAudio], the RESUME) — so a long Gemini
-  ///    response with little raw silence around it never starves the timer
   ///  - a toolCall message arriving, AND each function call within it
   ///    succeeding ([_onServerMessage]/[_handleToolCall])
+  ///
+  /// P0 FIX (CONFIRMED regression, REMOVED): response audio STARTING/
+  /// FINISHING playback ([_onResponseAudioChunk]'s PAUSE /
+  /// [_maybeResumeOutgoingAudio]'s RESUME) used to ALSO reset both timers
+  /// here — "so a long Gemini response with little raw silence around it
+  /// never starves the timer." That made the close timer effectively
+  /// unreachable: [_fireInactivityWarning] speaks its OWN warning through
+  /// this exact pause->resume cycle, so the warning re-armed its own full
+  /// 50s/60s window every time it spoke — confirmed via a real session
+  /// where it looped three times over ~75s and the session never closed.
+  /// The genuine "a long real response/action must not look like silence"
+  /// concern is still covered, without this self-defeating property, by
+  /// [_inFlightFunctionCalls] suspending both timers for the DISPATCH
+  /// portion of any real action, and by the genuine technician input that
+  /// started the exchange having already reset the full window before
+  /// Gemini ever began responding.
+  ///
   /// Cancels any previously scheduled pair first so a reset always restarts
   /// the full window rather than layering timers on top of each other. The
   /// 50s warning/60s close should therefore only ever fire after genuinely
-  /// continuous silence from BOTH the technician and Gemini for that full
+  /// continuous silence from the TECHNICIAN (Gemini's own speech no longer
+  /// counts, and never should — see the removal above) for that full
   /// duration.
   void _resetInactivityTimer({required String reason}) {
     _inactivityWarningTimer?.cancel();
@@ -2744,6 +3912,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _logCrossRef('FUNCTION CALL STARTED', reason);
     _inactivityWarningTimer?.cancel();
     _inactivityTimeoutTimer?.cancel();
+    _syncVoicePhase();
   }
 
   /// Marks one function call as finished (success or failure) — the instant
@@ -2757,6 +3926,83 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (_inFlightFunctionCalls == 0) {
       _resetInactivityTimer(reason: 'last in-flight function call finished ($reason)');
     }
+    _syncVoicePhase();
+  }
+
+  /// ISSUE 2 (HIGH PRIORITY, CONFIRMED via f5a8bd8b-flutter_run_log.txt): a
+  /// get_kb_answer dispatch for an abandoned "who is the president of
+  /// India?" question, started at 11:42:39.823, didn't resolve until
+  /// 11:42:57.497 — by which point the technician had moved on and said
+  /// "I want to take a photo," which resolved and started speaking "Camera's
+  /// open..." at 11:42:57.592. The ancient KB answer arrived right in that
+  /// window and interrupted the fresh camera confirmation mid-word. Every
+  /// real dispatch (a deterministic trigger firing OR a genuine Gemini
+  /// toolCall — see every call site that reads/writes this) is assigned the
+  /// next value here, captured at the INSTANT it begins (before any await),
+  /// so dispatches are ordered by when the technician's request actually
+  /// started, not by when their (possibly much slower) backend call happens
+  /// to finish.
+  int _dispatchGenerationCounter = 0;
+
+  /// The highest [_dispatchGenerationCounter] value among dispatches that
+  /// have SUCCEEDED so far (result received with no `error`) — see
+  /// [_recordDispatchSucceeded]. A dispatch whose own generation is LOWER
+  /// than this by the time IT resolves started before, and is now stale
+  /// relative to, a request the technician has since made and already had
+  /// answered — see [_discardIfStaleDispatch].
+  int _latestSucceededDispatchGeneration = 0;
+
+  /// Which trigger/function name achieved [_latestSucceededDispatchGeneration]
+  /// — purely for the "superseded by X" half of the
+  /// "STALE TRIGGER RESOLUTION DISCARDED" log line.
+  String? _latestSucceededDispatchTriggerName;
+
+  /// When [_latestSucceededDispatchGeneration] was recorded — purely so a
+  /// later stale resolution can log how many ms after being superseded it
+  /// actually resolved, straight from real timestamps.
+  DateTime? _latestSucceededDispatchAt;
+
+  /// Call at the very start of every real dispatch (deterministic trigger
+  /// firing, KB catch-all firing, or a genuine Gemini toolCall dispatching),
+  /// before any `await` — captures this dispatch's place in the technician's
+  /// real request order. See [_dispatchGenerationCounter]'s doc comment.
+  int _beginNewDispatchGeneration() => ++_dispatchGenerationCounter;
+
+  /// Call once a dispatch genuinely SUCCEEDS (result received, no `error`
+  /// key), before speaking/interrupting for it — records that this is now
+  /// the newest successfully-resolved request, so any OLDER, still-pending
+  /// dispatch that resolves later can recognize itself as stale. A no-op if
+  /// an even newer dispatch already succeeded first (never moves generation
+  /// backward).
+  void _recordDispatchSucceeded(int generation, String triggerName) {
+    if (generation <= _latestSucceededDispatchGeneration) return;
+    _latestSucceededDispatchGeneration = generation;
+    _latestSucceededDispatchTriggerName = triggerName;
+    _latestSucceededDispatchAt = DateTime.now();
+  }
+
+  /// Call right before a dispatch's resolution would interrupt/speak
+  /// (`_informGeminiToSpeakVerbatim` or equivalent) — `true` means a NEWER
+  /// dispatch has already succeeded since this one started, so this
+  /// resolution is stale and must be discarded rather than interrupting or
+  /// overwriting whatever the newer one is currently saying. Logs the exact
+  /// "STALE TRIGGER RESOLUTION DISCARDED" line ISSUE 2 asks for either way
+  /// this is used, so it's directly greppable in the next real log.
+  bool _discardIfStaleDispatch({required int generation, required String triggerName}) {
+    if (generation >= _latestSucceededDispatchGeneration) return false;
+    final supersededBy = _latestSucceededDispatchTriggerName ?? 'a newer trigger';
+    final supersededAt = _latestSucceededDispatchAt;
+    final elapsedMs = supersededAt == null ? null : DateTime.now().difference(supersededAt).inMilliseconds;
+    _log_(
+      'STALE TRIGGER RESOLUTION DISCARDED: $triggerName resolved '
+      '${elapsedMs == null ? '' : '${elapsedMs}ms '}after being superseded by $supersededBy — not interrupting '
+      'current speech.',
+    );
+    debugPrint(
+      'PHOTO TIMING [stale_trigger]: $triggerName (generation $generation) discarded — superseded by '
+      '$supersededBy (generation $_latestSucceededDispatchGeneration)',
+    );
+    return true;
   }
 
   /// FIX 3: prints a `debugPrint` line in the EXACT SAME `[t=<epoch ms>]`
@@ -2802,6 +4048,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     debugPrint('GEMINI LIVE INACTIVITY: warning fired (${_inactivityWarningDelay.inSeconds}s of silence)');
     _log_('inactivity warning: ${_inactivityWarningDelay.inSeconds}s of silence — asking Gemini to speak the warning');
     _informGeminiToSpeakVerbatim(_inactivityWarningText, reason: 'inactivity_warning');
+    // Distinct, greppable line requested for the next real test — this fires
+    // purely from [_inactivityWarningTimer]'s own wall-clock Timer, driven by
+    // [_resetInactivityTimer] (see that method's doc comment): NOT gated on
+    // [_isSpeaking] or any other transient per-utterance flag.
+    debugPrint('INACTIVITY WARNING: spoken');
   }
 
   /// Fires at [_inactivityTimeoutDelay] into a silent session — no
@@ -2814,43 +4065,51 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _inactivityTimeoutTimer = null;
     debugPrint('GEMINI LIVE INACTIVITY: ${_inactivityTimeoutDelay.inSeconds}s silence timeout reached — closing session');
     _log_('inactivity timeout: ${_inactivityTimeoutDelay.inSeconds}s of silence — closing session (same as Loop Off)');
-    unawaited(_stopTest());
+    // Distinct, greppable line requested for the next real test — same
+    // wall-clock-only guarantee as [_fireInactivityWarning]'s own line above.
+    debugPrint('INACTIVITY: auto-closing session');
+    unawaited(_stopTest(reason: 'inactivity timeout'));
   }
 
-  /// Sends Gemini a `clientContent` turn instructing it to speak [text]
-  /// verbatim over its own Live conversation turn — same mechanism as
-  /// [_fireInactivityWarning], factored out so [_dispatchWithOpenCameraSafeguards]
-  /// can reuse it for the FIX 2 open_camera acknowledgment without
-  /// duplicating the message shape.
-  void _speakAcknowledgment(String text) {
-    _informGeminiToSpeakVerbatim(text, reason: 'acknowledgment');
+  /// Speaks [text] while [name]'s native call still has all audio hard-
+  /// paused — see [_fillerPassthroughActive] for how its audio gets past
+  /// that pause, and `pending_call_fillers.dart` for the lines/thresholds.
+  /// Sent with `isFiller: true` so it never replaces
+  /// [_lastVerbatimScriptText]: the completion-claim audit's scripted-line
+  /// exemption and the leak-retry must keep pointing at the last REAL
+  /// scripted line, not a "still working" filler.
+  void _speakPendingCallFiller(String name, String text) {
+    if (!_cameraNativeCallInProgress) return;
+    _fillerPassthroughActive = true;
+    _fillerAudioStarted = false;
+    debugPrint('PENDING CALL FILLER [$name]: speaking "$text" at ${DateTime.now()} — passthrough open');
+    _informGeminiToSpeakVerbatim(text, reason: 'pending_call_filler[$name]', isFiller: true);
+  }
+
+  void _endFillerPassthrough(String reason) {
+    if (!_fillerPassthroughActive) return;
+    _fillerPassthroughActive = false;
+    _fillerAudioStarted = false;
+    debugPrint('PENDING CALL FILLER: passthrough closed ($reason) at ${DateTime.now()}');
   }
 
   /// FIX 2: every function EXCEPT `open_camera` dispatches exactly as
-  /// before — this only adds the acknowledgment/hard-timeout safeguards
-  /// around `open_camera` itself, since that's the one call the reliability
-  /// audit found can occasionally run far longer than the ~2-3s typical
-  /// case. See [_openCameraAckDelay]/[_openCameraHardTimeout]'s doc comments
-  /// for the thresholds.
+  /// before — this only adds the acknowledgment safeguard around
+  /// `open_camera` itself, since that's the one call the reliability audit
+  /// found can occasionally run far longer than the ~2-3s typical case. See
+  /// [_openCameraAckDelay]'s doc comment for the threshold, and that same
+  /// doc comment for why the hard-timeout this method used to ALSO race
+  /// against was removed entirely (P0 FIX, build #65) rather than fixed in
+  /// place — it produced two directly contradictory spoken messages about
+  /// the same open_camera call.
   ///
   /// The real dispatch (`dispatchGeminiFunctionCall`) is started
-  /// immediately and never cancelled outright — Dart's `Future`s aren't
-  /// preemptible, and the underlying call is a real platform camera
-  /// operation mid-flight, not something safe to abandon in place. Instead:
-  ///  - at [_openCameraAckDelay], if it hasn't finished, [_speakAcknowledgment]
-  ///    fires so the technician hears something instead of dead air.
-  ///  - at [_openCameraHardTimeout], if it STILL hasn't finished, this method
-  ///    stops WAITING on it (via [Future.timeout]) and returns a
-  ///    `status: timeout` response so `_handleToolCall` can tell Gemini to
-  ///    ask the technician to try again — logged clearly as
-  ///    "HARD TIMEOUT", never a silent hang.
-  /// The real call keeps running in the background after that; its eventual
-  /// outcome is only logged (never re-surfaced to Gemini — the technician
-  /// has already been told to retry). If it eventually SUCCEEDS after the
-  /// timeout already fired, the now-unused open `CameraController` is
-  /// disposed immediately here (rather than left to leak until some future
-  /// `open_camera` call's own `_discardPending()` happens to clean it up),
-  /// so the camera hardware is freed for a retry as soon as possible.
+  /// immediately and simply awaited — Dart's `Future`s aren't preemptible,
+  /// and the underlying call is a real platform camera operation mid-
+  /// flight, not something safe to abandon in place. At [_openCameraAckDelay],
+  /// if it hasn't finished yet, [_speakPendingCallFiller] fires so the
+  /// technician hears something instead of dead air; there is no second,
+  /// later threshold that gives up on it.
   Future<Map<String, dynamic>> _dispatchWithOpenCameraSafeguards({
     required String name,
     required Map<String, dynamic> args,
@@ -2873,17 +4132,53 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // just the identical "stop all audio feed processing until the
       // native call resolves" protection, reusing the exact same
       // flag/mechanism rather than a second, uncoordinated one.
-      final needsAudioHardPause = name == 'capture_photo';
+      //
+      // BUG 2 FIX (CONFIRMED via flutter_run_log_new.txt, build #56):
+      // confirm_photo_upload's OWN compress step showed the exact same
+      // symptom — `compressPhotoForUpload`'s single `compressWithFile` call
+      // (a platform-channel call into native Android, same category as
+      // `takePicture()`) took 8311ms for a 328KB/1280x720 JPEG that decodes
+      // and re-encodes in well under 200ms on its own, with zero GC pauses
+      // or dropped frames logged during that window — the signature of the
+      // SAME native-main-thread contention `capture_photo` already needed
+      // this exact protection for, not genuine compression cost. Extending
+      // it to confirm_photo_upload also closes BUG 4/5's window for free:
+      // with mic RMS tracking AND incoming-audio processing both hard-
+      // stopped for the whole compress+upload duration, no background noise
+      // can trigger a stray "new utterance" reset or a confusing keep/retake
+      // reprompt while the upload is genuinely in flight — the real spoken
+      // "I've uploaded the photo" confirmation is only ever requested AFTER
+      // this method (and therefore this hard-pause) has already returned.
+      final needsAudioHardPause = name == 'capture_photo' || name == 'confirm_photo_upload';
       if (needsAudioHardPause) {
         _cameraNativeCallInProgress = true;
+        _syncVoicePhase();
         _preemptiveDefaultMuteSafetyTimer?.cancel();
         _preemptiveDefaultMuteSafetyTimer = null;
         _log_(
-          'capture_photo: hard-pausing ALL audio feed processing until the native shutter call reports back '
-          '— see PART N item 3.',
+          '$name: hard-pausing ALL audio feed processing until the native call reports back — see PART N item 3 '
+          '/ BUG 2 FIX.',
         );
-        debugPrint('PHOTO TIMING [capture_photo]: audio_hard_pause_engaged at ${DateTime.now()}');
+        debugPrint('PHOTO TIMING [$name]: audio_hard_pause_engaged at ${DateTime.now()}');
       }
+      // P0 FIX — see [_fillerPassthroughActive]: a slow native call gets one
+      // spoken filler instead of total silence for however long it takes.
+      final filler = needsAudioHardPause ? pendingCallFillers[name] : null;
+      final fillerTimer = filler == null
+          ? null
+          : Timer(filler.delay, () {
+              debugPrint('PHOTO TIMING [$name]: filler threshold (${filler.delay.inMilliseconds}ms) reached — still pending');
+              _speakPendingCallFiller(name, filler.text);
+            });
+      // One follow-up for a call that's still going much later — see
+      // `pendingCallFollowUpFillers`. Same passthrough, same cancel point.
+      final followUp = needsAudioHardPause ? pendingCallFollowUpFillers[name] : null;
+      final followUpTimer = followUp == null
+          ? null
+          : Timer(followUp.delay, () {
+              debugPrint('PHOTO TIMING [$name]: follow-up filler threshold (${followUp.delay.inSeconds}s) reached — still pending');
+              _speakPendingCallFiller(name, followUp.text);
+            });
       try {
         final passthroughResult = await dispatchGeminiFunctionCall(
           ref: ref,
@@ -2895,12 +4190,41 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         debugPrint('PHOTO TIMING [_dispatchWithOpenCameraSafeguards]: passthrough for "$name" returned: $passthroughResult');
         return passthroughResult;
       } finally {
+        fillerTimer?.cancel();
+        followUpTimer?.cancel();
         if (needsAudioHardPause) {
           _cameraNativeCallInProgress = false;
-          debugPrint('PHOTO TIMING [capture_photo]: audio_hard_pause_released at ${DateTime.now()}');
+          _syncVoicePhase();
+          _endFillerPassthrough('$name native call finished');
+          debugPrint('PHOTO TIMING [$name]: audio_hard_pause_released at ${DateTime.now()}');
         }
       }
     }
+
+    // ISSUE 2 item 2 instrumentation: the true entry point of the open_camera
+    // handler, timestamped in the SAME "PHOTO TIMING [open_camera]: ... at
+    // <DateTime>" convention as `audio_hard_pause_engaged` a few lines below
+    // and `dispatching_native_open_call`/`controller_initialized` in
+    // `gemini_function_dispatcher.dart` — so the next real log can compute,
+    // directly from timestamps rather than inferred from code reading,
+    // exactly how many milliseconds elapse between the handler being entered
+    // and the audio hard-pause actually taking effect (should be ~0, since
+    // nothing awaits between the two), and separately how long
+    // `dispatching_native_open_call` sits queued after that before the
+    // native side picks it up.
+    debugPrint('PHOTO TIMING [open_camera]: handler_entry at ${DateTime.now()}');
+
+    // P1 FIX — see [_cameraSpeculativelyPrewarming]'s doc comment: this is
+    // a GENUINE open_camera request, so from this point on the camera
+    // controller (whether it's already sitting prewarmed, still opening,
+    // or not started at all yet) is no longer speculative — every
+    // [onOpenStarted]/[onPreviewAvailable] callback from here onward must
+    // actually update the ambient UI. Cleared BEFORE the dispatch below so
+    // there's no window where a callback fired by THIS call could still be
+    // wrongly suppressed as speculative.
+    _cameraSpeculativelyPrewarming = false;
+    _cameraPrewarmAutoReleaseTimer?.cancel();
+    _cameraPrewarmAutoReleaseTimer = null;
 
     // PART K (CONFIRMED 71.4s regression — see [_cameraNativeCallInProgress]'s
     // doc comment): set BEFORE `dispatchGeminiFunctionCall` is even called,
@@ -2912,6 +4236,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // pointless now and would only speak the boundary decline over a
     // response that's about to come from a totally different function.
     _cameraNativeCallInProgress = true;
+    _syncVoicePhase();
     _preemptiveDefaultMuteSafetyTimer?.cancel();
     _preemptiveDefaultMuteSafetyTimer = null;
     _log_(
@@ -2966,81 +4291,24 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         'open_camera: still opening after ${_openCameraAckDelay.inSeconds}s — speaking acknowledgment '
         '("$_openCameraAckText") so it doesn\'t feel stuck',
       );
-      _speakAcknowledgment(_openCameraAckText);
+      _speakPendingCallFiller('open_camera', _openCameraAckText);
     });
 
+    // P0 FIX (build #65) — see [_dispatchWithOpenCameraSafeguards]'s own
+    // doc comment: no `.timeout()` wrapper anymore. Simply awaits the real
+    // call, exactly like every other camera-flow function already does —
+    // however long it genuinely takes, the technician gets ONE true
+    // outcome, never a "timed out" message contradicted moments later by
+    // "actually open now" for the same action.
     try {
-      return await realCall.timeout(
-        _openCameraHardTimeout,
-        onTimeout: () {
-          debugPrint('PHOTO TIMING [open_camera]: HARD TIMEOUT at ${stopwatch.elapsedMilliseconds}ms — giving up waiting, telling Gemini to ask for a retry');
-          _log_(
-            'open_camera: HARD TIMEOUT after ${_openCameraHardTimeout.inSeconds}s (real call still running in '
-            'background) — returning status=timeout so Gemini tells the technician to try again',
-          );
-          unawaited(
-            realCall.then(
-              (result) async {
-                debugPrint(
-                  'PHOTO TIMING [open_camera]: late completion after timeout at '
-                  '${stopwatch.elapsedMilliseconds}ms — succeeded ($result)',
-                );
-                // PART K fix (CONFIRMED regression: this used to ALWAYS
-                // dispose the now-open controller — throwing away a
-                // successfully-opened camera and forcing the technician
-                // through a second ~15-70s wait on manual retry, even though
-                // the hardware work itself is genuinely done). If the
-                // technician is still on the same screen (nothing else
-                // happened while we waited — no OTHER screen task took over,
-                // and this widget is still alive), hand them the live
-                // preview instead: the same screen-task bookkeeping a normal
-                // in-time success gets via `_updateScreenTaskForToolCall`,
-                // plus a short spoken heads-up since they were already told
-                // to retry a moment ago. Only dispose if they've genuinely
-                // moved on (a different screen task is active, or the
-                // session ended) — that controller really is orphaned then.
-                if (!mounted || _teardownStarted || _screenTask != _ScreenTask.none) {
-                  _log_(
-                    'open_camera: late success after its own timeout, but the screen has moved on '
-                    '(screenTask=$_screenTask, mounted=$mounted, teardownStarted=$_teardownStarted) — '
-                    'disposing the now-unused controller.',
-                  );
-                  await _cameraSession.dispose();
-                  return;
-                }
-                _log_(
-                  'open_camera: late success after its own timeout — technician still on the same screen, '
-                  'handing them the live preview instead of discarding it.',
-                );
-                if (mounted) setState(() => _screenTask = _ScreenTask.cameraLive);
-                _pausedVoiceService?.setScreenTaskActive(true);
-                _informGeminiToSpeakVerbatim(
-                  "The camera's actually open now — go ahead when you're ready.",
-                  reason: 'open_camera_late_success',
-                );
-              },
-              onError: (Object e, StackTrace st) {
-                debugPrint(
-                  'PHOTO TIMING [open_camera]: late completion after timeout at '
-                  '${stopwatch.elapsedMilliseconds}ms — FAILED: $e',
-                );
-                _log_('open_camera: late failure after its own timeout: $e');
-              },
-            ),
-          );
-          return <String, dynamic>{
-            'status': 'timeout',
-            'job_id': args['job_id'],
-            'message': 'Opening the camera timed out after ${_openCameraHardTimeout.inSeconds} seconds — ask the '
-                'technician to try again.',
-          };
-        },
-      );
+      return await realCall;
     } finally {
-      // PART K — see [_cameraNativeCallInProgress]'s doc comment: resume normal
-      // audio processing the instant we're done waiting on this call,
-      // whether it finished normally or the hard timeout gave up on it.
+      // PART K — see [_cameraNativeCallInProgress]'s doc comment: resume
+      // normal audio processing the instant the real call genuinely
+      // finishes.
       _cameraNativeCallInProgress = false;
+      _syncVoicePhase();
+      _endFillerPassthrough('open_camera native call finished');
       ackTimer.cancel();
     }
   }
@@ -3084,7 +4352,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         debugPrint('TOKEN COUNT this turn: ${usageMetadata['totalTokenCount']}');
       }
       if (decoded.containsKey('sessionResumptionUpdate')) {
-        _log_('sessionResumptionUpdate (informational, harmless — session resumption handle): ${decoded['sessionResumptionUpdate']}');
+        // P1 FIX — see [_logNoState]'s doc comment: fires roughly once a
+        // second throughout an active session (far more often than the
+        // "usageMetadata"/once-per-turn line just above), explicitly
+        // labeled informational/harmless — a `setState` for this is pure
+        // main-thread cost with no corresponding value.
+        _logNoState('sessionResumptionUpdate (informational, harmless — session resumption handle): ${decoded['sessionResumptionUpdate']}');
       }
       if (decoded.containsKey('goAway')) {
         _log_('goAway received — server will close the connection soon: ${decoded['goAway']}');
@@ -3150,7 +4423,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
             // "audio/pcm;rate=24000" — logged once per chunk so it can be
             // read directly off the device rather than assumed.
             final otherInlineDataFields = Map<String, dynamic>.from(inlineData ?? {})..remove('data');
-            _log_(
+            // P1 FIX — see [_logNoState]'s doc comment: this fires on
+            // EVERY chunk, unconditionally, at normal cadence every
+            // 10-100ms during active playback — a `setState` here is
+            // exactly the main-thread contention that delayed
+            // `takePicture()`'s own platform-channel dispatch by 5+
+            // seconds in a real run.
+            _logNoState(
               'inlineData received: mimeType=$mimeType, otherFields=$otherInlineDataFields, '
               'data length=${data.length} base64 chars',
             );
@@ -3173,32 +4452,74 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       final outputTranscription = serverContent['outputTranscription'] as Map<String, dynamic>?;
       final outputTranscriptionText = outputTranscription?['text'] as String?;
       if (outputTranscriptionText != null && outputTranscriptionText.isNotEmpty) {
-        _log_('GEMINI SAID: "$outputTranscriptionText"');
+        // P1 FIX — see [_logNoState]'s doc comment: fires on every
+        // output-transcription fragment (frequently, during any spoken
+        // response), same main-thread-contention reasoning as the
+        // inlineData site above.
+        _logNoState('GEMINI SAID: "$outputTranscriptionText"');
         _logCrossRef('GEMINI SAID', outputTranscriptionText);
+        // Turn-identity gate — must run before the audits below so they see
+        // whether this turn's audio is actually being played.
+        _classifyTurnAgainstScript(outputTranscriptionText);
         _currentTurnHadAudioOrText = true;
-        // BUG 2 backstop (step 3 of the echo-leak fix): rolling record of
-        // Gemini's own recently-spoken text, compared against every
-        // inputTranscription chunk in [_looksLikeGeminiEcho] before it's
-        // allowed anywhere near a trigger buffer. Bounded to the last 600
-        // chars so it can't grow unbounded over a long session.
-        _recentGeminiOutputText = ('$_recentGeminiOutputText $outputTranscriptionText').trim();
-        if (_recentGeminiOutputText.length > 600) {
-          _recentGeminiOutputText = _recentGeminiOutputText.substring(_recentGeminiOutputText.length - 600);
+        // P0 TRUST FIX — see [_auditGeminiCompletionClaim]. Placed here, on
+        // the transcript of what Gemini ACTUALLY SAID, rather than anywhere
+        // in the request path: the whole point is that the free-text path
+        // can produce words no function call ever justified, so the only
+        // reliable place to catch it is the output itself.
+        _auditGeminiCompletionClaim(outputTranscriptionText);
+        // P0 FIX — see [_auditGeminiForLeakedInstructionWrapper]'s doc
+        // comment. Placed right after the completion-claim audit, once
+        // [_currentTurnGeminiText] has already been updated with this
+        // fragment, and before the duplicate-response audit below — a
+        // leaked wrapper should be caught and suppressed as early in the
+        // turn as possible, before more of it plays.
+        _auditGeminiForLeakedInstructionWrapper();
+        // P0 AUDIO-ECHO FIX — see [_auditGeminiDuplicateResponse]'s doc
+        // comment. Same placement reasoning as the completion-claim audit
+        // immediately above: this has to watch what Gemini ACTUALLY SAYS,
+        // since the whole failure mode is the model generating a fresh
+        // turn that happens to restate a turn it already said seconds ago.
+        _auditGeminiDuplicateResponse(outputTranscriptionText);
+        // BUG 2 backstop (step 3 of the echo-leak fix), REDESIGNED — see
+        // [_currentTurnAudiblyPlayedText]'s doc comment for the P0
+        // regression this replaces (an unbounded-in-practice, whole-session
+        // accumulator that let a short real command sharing a couple of
+        // common words with ANYTHING Gemini had EVER said get discarded as
+        // echo). Accumulates ONLY the CURRENT turn's text now — a genuinely
+        // bounded, per-turn pool, never a growing multi-turn blob.
+        //
+        // P1 FIX (CONFIRMED via flutter_run_log_new.txt, build #65,
+        // unchanged by this redesign): text from a turn whose audio was
+        // entirely dropped (e.g. [_cameraNativeCallInProgress]'s hard-pause)
+        // was never actually audible, so it can never legitimately echo
+        // back through the mic — still excluded here via the same three
+        // gates [_onResponseAudioChunk] itself checks, in the same order.
+        final thisAudioWouldBeDropped = _responseAudioCurrentlyDropped;
+        if (!thisAudioWouldBeDropped) {
+          _currentTurnAudiblyPlayedText = ('$_currentTurnAudiblyPlayedText $outputTranscriptionText').trim();
         }
       }
 
       if (serverContent['turnComplete'] == true) {
         _log_('model turn complete');
         _turnComplete = true;
+        _flushPcmPrebuffer('turnComplete');
         _maybeResumeOutgoingAudio();
         _clearDeterministicAudioSuppression('turnComplete received');
+        _onTurnBoundaryWhileAwaitingScript(interrupted: false);
+        _scriptedResponsePending = false;
+        if (_fillerAudioStarted) _endFillerPassthrough('filler turn turnComplete');
         _logAndResetTurnShape('turnComplete');
       }
       if (serverContent['interrupted'] == true) {
         _log_('model turn interrupted');
         _turnComplete = true;
+        _discardPcmPrebuffer('turn interrupted');
         _maybeResumeOutgoingAudio();
         _clearDeterministicAudioSuppression('interrupted received');
+        _onTurnBoundaryWhileAwaitingScript(interrupted: true);
+        if (_fillerAudioStarted) _endFillerPassthrough('filler turn interrupted');
         _logAndResetTurnShape('interrupted');
       }
     } catch (e, stackTrace) {
@@ -3223,8 +4544,569 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
                 ? 'FREE-TEXT AUDIO ONLY — Gemini spoke without calling any function this turn'
                 : 'empty (neither a toolCall nor any audio/text this turn)';
     _log_('TURN SHAPE ($boundary): toolCall=$_currentTurnHadToolCall audioOrText=$_currentTurnHadAudioOrText — $shape');
+    // P0 AUDIO-ECHO FIX — see [_auditGeminiDuplicateResponse]'s doc
+    // comment: record this now-finished turn's full text into the recent-
+    // turn history BEFORE clearing [_currentTurnGeminiText] below, so it's
+    // available to compare the NEXT turn against.
+    //
+    // P1 FIX: only the AUDIBLE part of the turn. Every deterministic trigger
+    // produces two generations by design — Gemini's own free-text answer to
+    // the raw audio (muted by the preemptive mute / hold / hard-pause) and
+    // then our scripted "say exactly" line — and the two are often
+    // near-identical, because Gemini imitates our earlier scripted wording.
+    // Recording the MUTED first one made the real, scripted confirmation
+    // look like a repeat, so it was the one suppressed. A genuinely audible
+    // repeat is still caught, and a third repeat still compares against the
+    // first (audible) one within the lookback window.
+    _recordGeminiTurnForDuplicateDetection(_currentTurnAudiblyPlayedText);
+    // P0 ECHO FALSE-POSITIVE FIX — see [_currentTurnAudiblyPlayedText]'s
+    // doc comment. Snapshot this now-finished turn's AUDIBLY-PLAYED text
+    // (and when it finished) as the ECHO comparison pool's second, trailing
+    // entry, BEFORE clearing it for the next turn below — this is what lets
+    // a leaked chunk arriving shortly after Gemini stops talking still be
+    // recognized as echo, without keeping every earlier turn around too.
+    _lastCompletedTurnAudiblyPlayedText = _currentTurnAudiblyPlayedText;
+    _lastCompletedTurnFinishedAt = DateTime.now();
+    if (_currentTurnAudiblyPlayedText.trim().isNotEmpty) {
+      _recentAudibleTurns.add((text: _currentTurnAudiblyPlayedText, at: DateTime.now()));
+      final cutoff = DateTime.now().subtract(_recentAudibleTurnsWindow);
+      _recentAudibleTurns.removeWhere((t) => t.at.isBefore(cutoff));
+      while (_recentAudibleTurns.length > _recentAudibleTurnsMax) {
+        _recentAudibleTurns.removeAt(0);
+      }
+    }
+    // P0 FIX — see [_currentResponseTurnId]'s doc comment: every genuine
+    // turn boundary also bumps it, so a turn Gemini starts on its own
+    // (spontaneously, with no preceding app-side interrupt) still gets a
+    // fresh id for whatever comes NEXT — redundant with the interrupt-time
+    // bump in the common (app-interrupted) case, which is fine; an extra
+    // bump never causes two different turns to collide on one id, only
+    // (harmlessly) uses ids up slightly faster.
+    _currentResponseTurnId++;
+    // The suppression this turn's own audit may have armed is scoped to
+    // THIS turn only (see [_suppressResponseAudioForDuplicate]'s doc
+    // comment) — cleared here at the same turn boundary that already
+    // clears [_suppressResponseAudioForDeterministic] for the identical
+    // reason: the turn it applied to is now genuinely over.
+    _suppressResponseAudioForDuplicate = false;
+    // Same reasoning as the duplicate-suppression clear immediately
+    // above — see [_suppressResponseAudioForLeakedWrapper]'s doc comment.
+    _suppressResponseAudioForLeakedWrapper = false;
     _currentTurnHadToolCall = false;
     _currentTurnHadAudioOrText = false;
+    _currentTurnGeminiText = '';
+    _currentTurnAudiblyPlayedText = '';
+    _completionClaimAuditedThisTurn = false;
+    _duplicateResponseAuditedThisTurn = false;
+    _verbatimInstructionAuditedThisTurn = false;
+  }
+
+  // ===========================================================================
+  // P0 TRUST FIX — "Gemini said it happened when it didn't"
+  // See [photoCompletionClaimPhrases]'s doc comment for the confirmed bug.
+  // ===========================================================================
+
+  /// Wall-clock time each photo-flow function last genuinely SUCCEEDED —
+  /// written in exactly one place ([_updateScreenTaskForToolCall]'s success
+  /// branch), which both the deterministic trigger path
+  /// ([_executeDeterministic]) and a genuine server-sent `toolCall`
+  /// ([_handleToolCall]) already funnel through, so neither route can grow
+  /// a success this audit doesn't know about.
+  ///
+  /// Deliberately NOT [_TranscriptTrigger.lastActivityAt], which records
+  /// when a call was ATTEMPTED — an attempted-but-failed capture is exactly
+  /// the case where a "captured" claim is a lie.
+  final Map<String, DateTime> _photoActionLastSucceededAt = {};
+
+  /// Gemini's own spoken text for the CURRENT turn only, accumulated across
+  /// `outputTranscription` fragments and cleared at every turn boundary (see
+  /// [_logAndResetTurnShape]). Audited as a whole rather than fragment by
+  /// fragment so a claim split across a fragment boundary ("It's cap" +
+  /// "tured.") can't slip through — and so a long turn is audited once, not
+  /// once per fragment (that's [_completionClaimAuditedThisTurn]).
+  ///
+  /// Distinct from [_currentTurnAudiblyPlayedText] (used for echo
+  /// detection): this one includes text whose audio was dropped/never
+  /// played (a completion claim is a lie regardless of whether the
+  /// technician actually heard it said), while that one deliberately
+  /// excludes it (only AUDIBLE speech can ever leak back through the mic
+  /// as echo).
+  String _currentTurnGeminiText = '';
+
+  bool _completionClaimAuditedThisTurn = false;
+
+  // ===========================================================================
+  // P0 ECHO FALSE-POSITIVE FIX
+  // CONFIRMED (a real ~2.5 minute session): a technician's genuine "Take the
+  // photo." was discarded by [_looksLikeGeminiEcho] because it "matched" a
+  // 150+-word blob of EVERYTHING Gemini had said since the camera opened a
+  // minute earlier — comparing "take"/"the"/"photo" against that whole
+  // session's accumulated vocabulary found SOME nearby window where all
+  // three happened to co-occur, unrelated to any actual recent utterance.
+  // Result: capture_photo fired ZERO times in the whole session, and the
+  // app looped through 7 different "let me know when you're ready"
+  // rephrasings without ever hearing a real answer.
+  //
+  // The OLD [_recentGeminiOutputText] (a single string, nominally capped at
+  // 600 characters but still routinely spanning MANY distinct turns of
+  // conversation — 600 characters is ~100-120 words) is replaced entirely
+  // by these two, each compared SEPARATELY (never concatenated together,
+  // which would just recreate the same blob problem one level up):
+  //  - [_currentTurnAudiblyPlayedText] — the turn Gemini is speaking RIGHT
+  //    NOW, if any (the most likely real echo source: the mic picking up
+  //    what's playing at this exact moment).
+  //  - [_lastCompletedTurnAudiblyPlayedText] — the turn Gemini MOST
+  //    RECENTLY finished speaking, but ONLY while [_lastCompletedTurnFinishedAt]
+  //    is within [_echoComparisonTrailingWindowFor] — covering trailing
+  //    acoustic decay after playback stops, not "anything said this
+  //    session." Once that window passes, the turn drops out of the
+  //    comparison pool entirely, exactly as requested.
+  // ===========================================================================
+
+  /// Gemini's own spoken text for the CURRENT turn, but — unlike
+  /// [_currentTurnGeminiText] — ONLY text whose audio genuinely reached the
+  /// speaker (excludes anything [_onResponseAudioChunk] would drop: see the
+  /// `thisAudioWouldBeDropped` gate at this field's own accumulation site).
+  /// Text that was never audibly played can never leak back through the mic
+  /// as echo, so including it here would only ever widen the false-positive
+  /// surface for no corresponding real risk. Cleared at every turn boundary
+  /// in [_logAndResetTurnShape], which also snapshots it into
+  /// [_lastCompletedTurnAudiblyPlayedText] first.
+  String _currentTurnAudiblyPlayedText = '';
+
+  /// The PREVIOUS turn's [_currentTurnAudiblyPlayedText], snapshotted at
+  /// that turn's own boundary — see [_echoComparisonTrailingWindowFor] for how
+  /// long it stays eligible for comparison.
+  String _lastCompletedTurnAudiblyPlayedText = '';
+
+  /// When [_lastCompletedTurnAudiblyPlayedText] was captured — i.e. when
+  /// that turn genuinely finished. `null` only before the very first turn
+  /// of a session has completed.
+  DateTime? _lastCompletedTurnFinishedAt;
+
+  /// Rolling history of Gemini's AUDIBLE completed/interrupted turns, newest
+  /// last — at most [_recentAudibleTurnsMax] entries from the last
+  /// [_recentAudibleTurnsWindow]. Used by [_looksLikeGeminiEcho] for
+  /// whole-turn echoes of turns older than the one just finished; entries
+  /// are always compared separately, never concatenated.
+  final List<({String text, DateTime at})> _recentAudibleTurns = [];
+  static const int _recentAudibleTurnsMax = 5;
+  static const Duration _recentAudibleTurnsWindow = Duration(seconds: 90);
+
+  /// An older turn only counts as echoed if the chunk has at least
+  /// [_olderTurnEchoMinWords] words AND this fraction of that turn's word
+  /// count — see [_looksLikeGeminiEcho]. Sized so one sentence of a
+  /// two-sentence turn qualifies ("I'm here, loud and clear" = 6 of 13),
+  /// but a short command inside one of our longer prompts doesn't ("show me
+  /// the job history" = 5 of 17).
+  static const double _olderTurnEchoMinCoverage = 0.4;
+  static const int _olderTurnEchoMinWords = 5;
+
+  /// Base floor for how long after a turn finishes its text stays eligible
+  /// as an echo comparison target — see [_echoComparisonTrailingWindowFor],
+  /// which SCALES this up for longer turns and is what callers actually
+  /// use. Matches this fix's own original request ("the last 3-5 seconds
+  /// of TTS playback"), sized for a SHORT turn — generous enough to cover
+  /// the documented native-buffer/acoustic-decay lag this file's OTHER
+  /// echo fixes already measure in the low hundreds of ms to low seconds
+  /// (see [_resumeGraceDelay]/[_echoTailQuietRequirement]), without
+  /// reaching back far enough to accidentally re-admit "anything said a
+  /// while ago" — the exact failure this whole redesign exists to close.
+  static const Duration _echoComparisonTrailingWindowFloor = Duration(seconds: 5);
+
+  /// P1 FIX (recurring, CONFIRMED again in a later session): a flat 5s
+  /// window missed Gemini's own "Got it. I've taken the photo. Keep it or
+  /// retake it?" — an 11-word confirmation — leaking back, while other,
+  /// mostly SHORTER echoed turns in the SAME session correctly were still
+  /// caught. A longer spoken turn genuinely takes longer to physically
+  /// finish playing, and however much STT/network latency stacks on top
+  /// before its echo reaches this app as a transcript chunk scales with
+  /// that too — a short "Is that correct?" and an 11-word confirmation
+  /// don't share the same real-world echo-arrival deadline. Scales the
+  /// window with the completed turn's own word count past a small free
+  /// allowance, capped well short of turning back into "anything said a
+  /// while ago" (the original whole-session-blob failure this whole
+  /// redesign exists to close) — this can add at most a few extra
+  /// seconds for a genuinely long turn, never minutes.
+  static const int _echoComparisonFreeWordAllowance = 5;
+  static const Duration _echoComparisonPerExtraWord = Duration(milliseconds: 400);
+  static const Duration _echoComparisonTrailingWindowCap = Duration(seconds: 10);
+
+  static Duration _echoComparisonTrailingWindowFor(String turnText) {
+    final trimmed = turnText.trim();
+    if (trimmed.isEmpty) return _echoComparisonTrailingWindowFloor;
+    final wordCount = trimmed.split(RegExp(r'\s+')).length;
+    final extraWords = (wordCount - _echoComparisonFreeWordAllowance).clamp(0, 1 << 30);
+    final scaled = _echoComparisonTrailingWindowFloor + _echoComparisonPerExtraWord * extraWords;
+    return scaled > _echoComparisonTrailingWindowCap ? _echoComparisonTrailingWindowCap : scaled;
+  }
+
+  DateTime? _lastCompletionClaimCorrectionAt;
+
+  /// The most recent text handed to [_informGeminiToSpeakVerbatim] — used
+  /// only to exempt a genuinely scripted line from this audit. The
+  /// timestamp window below already covers the normal case (a real
+  /// confirm_photo_upload success is what produced the script in the first
+  /// place); this is defense in depth for a script spoken at the very edge
+  /// of that window.
+  String _lastVerbatimScriptText = '';
+
+  void _recordPhotoActionSuccess(String name) {
+    if (!photoCompletionClaimPhrases.containsKey(name)) return;
+    _photoActionLastSucceededAt[name] = DateTime.now();
+    _log_('COMPLETION CLAIM AUDIT: recorded a genuine "$name" success — completed-action phrasing for it is now licensed for ${_photoCompletionClaimWindow.inSeconds}s.');
+  }
+
+  bool _photoActionSucceededRecently(String name) {
+    final at = _photoActionLastSucceededAt[name];
+    if (at == null) return false;
+    return DateTime.now().difference(at) <= _photoCompletionClaimWindow;
+  }
+
+  /// Called for every `outputTranscription` fragment. Accumulates the turn's
+  /// spoken text and, the first time that text claims a photo action
+  /// completed, checks whether a real success actually licenses it.
+  ///
+  /// A violation is logged on a single, deliberately greppable line
+  /// (`COMPLETION CLAIM VIOLATION`) carrying both what Gemini said and when
+  /// — if ever — the claimed function last succeeded, so verifying "Gemini
+  /// never claimed a capture that didn't happen" in the next run is a grep,
+  /// not a manual read of three thousand lines. It is then corrected out
+  /// loud through the same constrained verbatim path every other canned
+  /// response uses, because the technician has already HEARD the false
+  /// claim by the time this runs — the audio for a transcription fragment
+  /// is streamed alongside it, so silently logging would leave the
+  /// technician believing a photo exists.
+  void _auditGeminiCompletionClaim(String fragment) {
+    _currentTurnGeminiText = '$_currentTurnGeminiText $fragment'.trim();
+    if (_completionClaimAuditedThisTurn) return;
+
+    final claimedFunction = completionClaimFunctionIn(_currentTurnGeminiText);
+    if (claimedFunction == null) return;
+    _completionClaimAuditedThisTurn = true;
+
+    // open_camera is licensed by the camera genuinely being open right now
+    // (not by the 60s window — a technician can sit in the live preview far
+    // longer than that), and never before its real open has completed.
+    if (claimedFunction == 'open_camera' && _cameraOpenConfirmed) {
+      _log_('COMPLETION CLAIM AUDIT: "$_currentTurnGeminiText" claims "open_camera" completed — LICENSED (camera is genuinely open).');
+      return;
+    }
+
+    if (_photoActionSucceededRecently(claimedFunction)) {
+      _log_('COMPLETION CLAIM AUDIT: "$_currentTurnGeminiText" claims "$claimedFunction" completed — LICENSED (it genuinely succeeded ${DateTime.now().difference(_photoActionLastSucceededAt[claimedFunction]!).inSeconds}s ago).');
+      return;
+    }
+
+    // A verbatim script we ourselves just told Gemini to read is, by
+    // construction, not a free-text guess — see [_lastVerbatimScriptText].
+    final normalizedSpoken = _normalizeForEchoCompare(_currentTurnGeminiText);
+    if (normalizedSpoken.isNotEmpty && _normalizeForEchoCompare(_lastVerbatimScriptText).contains(normalizedSpoken)) {
+      _log_('COMPLETION CLAIM AUDIT: "$_currentTurnGeminiText" matches the constrained script we just sent — not a free-text claim, allowing.');
+      return;
+    }
+
+    final lastSuccess = _photoActionLastSucceededAt[claimedFunction];
+    final when = lastSuccess == null
+        ? 'NEVER succeeded this session'
+        : 'last succeeded ${DateTime.now().difference(lastSuccess).inSeconds}s ago, outside the ${_photoCompletionClaimWindow.inSeconds}s window';
+    _log_(
+      'COMPLETION CLAIM VIOLATION: Gemini said "$_currentTurnGeminiText", which claims "$claimedFunction" '
+      'completed — but "$claimedFunction" $when. This is the free-text path narrating an outcome the '
+      'deterministic layer never produced; correcting out loud.',
+    );
+
+    // A claim whose audio was dropped (e.g. the open_camera hard-pause) was
+    // never heard — and a correction sent now would be dropped by the same
+    // gate, while still interrupting and replacing [_lastVerbatimScriptText].
+    if (_responseAudioCurrentlyDropped) {
+      _log_('COMPLETION CLAIM VIOLATION: the claim\'s audio was being dropped (never audible) — logged, no spoken correction.');
+      return;
+    }
+
+    final lastCorrection = _lastCompletionClaimCorrectionAt;
+    if (lastCorrection != null &&
+        DateTime.now().difference(lastCorrection) < _photoCompletionClaimCorrectionDebounce) {
+      _log_('COMPLETION CLAIM VIOLATION: correction suppressed — one was already spoken ${DateTime.now().difference(lastCorrection).inSeconds}s ago.');
+      return;
+    }
+    _lastCompletionClaimCorrectionAt = DateTime.now();
+    // open_camera still mid-flight: "that hasn't happened yet… I'll do it"
+    // would wrongly suggest nothing is underway.
+    final openInProgress = claimedFunction == 'open_camera' &&
+        (_screenTask == _ScreenTask.cameraOpening || _cameraOpenRealCallInFlight != null);
+    _informGeminiToSpeakVerbatim(
+      openInProgress ? "Sorry — the camera's still opening, give it a moment." : _photoCompletionClaimCorrectionText,
+      reason: 'completion_claim_violation',
+    );
+  }
+
+  // ===========================================================================
+  // P0 AUDIO-ECHO FIX — duplicate-response safety net
+  // CONFIRMED: "Camera's open — ready when you are." spoken identically
+  // three times, ~6-7s apart, each preceded by an ECHO BACKSTOP discard.
+  // The text-level echo backstop above only stops the APP from treating a
+  // leaked/echoed chunk as a technician command — by the time that runs,
+  // the raw audio it was transcribed from has ALREADY been sent to Gemini
+  // as realtimeInput (the mic-pause/adaptive-quiet-wait mechanism above is
+  // the fix for THAT). This is the last line of defense on the OUTPUT
+  // side: regardless of why the model ends up generating a fresh turn that
+  // just restates one it already said moments ago (leaked self-audio,
+  // ambiguous input, or anything else), the technician must never hear the
+  // same confirmation two or three times in a row.
+  // ===========================================================================
+
+  /// Recent, DISCRETE turns Gemini has actually spoken, newest last — each
+  /// compared as a WHOLE against the CURRENT turn's accumulating text in
+  /// [_auditGeminiDuplicateResponse]. Deliberately NOT a single
+  /// concatenated blob (the shape [_looksLikeGeminiEcho] used to use, and
+  /// was moved OFF of for the identical reason — see that function's own
+  /// doc comment): a blob is right for "does this SHORT chunk appear
+  /// anywhere recently" but wrong for "is this whole NEW turn essentially
+  /// the same SENTENCE as a specific earlier one" — checking that against
+  /// a blob would either miss a duplicate split across a turn boundary
+  /// inside it, or false-positive on two unrelated turns that happen to
+  /// share common phrasing somewhere within a long combined history.
+  final List<({String text, DateTime at})> _recentGeminiTurnHistory = [];
+
+  /// How far back a prior turn can be and still count as a "recent" enough
+  /// duplicate to suppress. Matches the confirmed evidence (three repeats,
+  /// ~6-7s apart) with real margin either side — wide enough to catch a
+  /// slightly slower repeat cycle, narrow enough that a technician asking
+  /// for a genuine repeat ("what did you say?") minutes later is never
+  /// affected (an explicitly-requested repeat is legitimate; nothing about
+  /// this mechanism can distinguish that case from an unprompted one within
+  /// the window, which is the accepted, documented trade-off here — same
+  /// "safe to occasionally over-suppress a rare legitimate case in
+  /// exchange for reliably killing a confirmed, worse failure mode"
+  /// posture already used throughout this file's other backstops).
+  static const Duration _duplicateResponseLookbackWindow = Duration(seconds: 12);
+
+  /// Slightly stricter than [_echoFuzzyOverlapThreshold] (0.8) — this
+  /// suppresses OUTPUT the technician would otherwise hear, a higher-cost
+  /// mistake than discarding one suspect INPUT chunk, so it asks for a
+  /// larger fraction of the words to genuinely overlap before acting.
+  static const double _duplicateResponseOverlapThreshold = 0.85;
+
+  bool _duplicateResponseAuditedThisTurn = false;
+
+  /// Whether the CURRENT turn's remaining response audio should be dropped
+  /// on arrival because it was just found to duplicate a recent prior turn
+  /// — a narrower, single-turn-scoped cousin of
+  /// [_suppressResponseAudioForDeterministic] (see [_onResponseAudioChunk]'s
+  /// own dedicated drop-branch for this flag). Deliberately a SEPARATE flag
+  /// rather than reusing that one: that flag's machinery
+  /// ([_interruptGeminiForDeterministicTrigger]'s full native-player
+  /// teardown/reinit, and diagnostics like "PROTECTED CONFIRMATION AUDIO
+  /// DROPPED" that assume re-arming it mid-window means something went
+  /// WRONG) is built for "something BETTER is about to replace this stale
+  /// turn" — not this case, where nothing new is coming and the fix is
+  /// simply "stop feeding the rest of what's already playing." Cleared at
+  /// the next turn boundary in [_logAndResetTurnShape], the same place
+  /// [_suppressResponseAudioForDeterministic] already gets cleared for the
+  /// identical reason (the turn it applied to is over).
+  bool _suppressResponseAudioForDuplicate = false;
+
+  // ===========================================================================
+  // P0 FIX — Gemini reading its own "say exactly this" wrapper out loud
+  // CONFIRMED: 5 of 15 constrained-verbatim sends this session leaked —
+  // Gemini spoke the literal instruction text ("Say exactly and only the
+  // following, with no additions, no preamble, and no extra commentary:
+  // '...'") instead of just the quoted content, then got interrupted and
+  // fell back to "I didn't catch that." The Live API's client protocol has
+  // no system/tool-role message this could be sent as instead (confirmed
+  // elsewhere in this file: `setup`/`clientContent`/`realtimeInput`/
+  // `toolResponse` are the entire client vocabulary, and
+  // `systemInstruction` is a ONE-TIME field in the initial `setup`
+  // message, not re-sendable per turn) — so this is the report's own
+  // suggested stopgap: detect a leaked wrapper via the SAME
+  // `outputTranscription` visibility [_auditGeminiCompletionClaim]/
+  // [_auditGeminiDuplicateResponse] already use, silently suppress its
+  // audio, and retry the same instruction, bounded so a model that keeps
+  // leaking can never loop forever.
+  // ===========================================================================
+
+  /// See [_suppressResponseAudioForDuplicate]'s doc comment for the SAME
+  /// "separate flag, not shared machinery" reasoning — this one stops
+  /// [_onResponseAudioChunk] from playing the rest of a turn the instant
+  /// [_auditGeminiForLeakedInstructionWrapper] recognizes it as a leaked
+  /// wrapper, so the technician never hears "Say exactly and only the
+  /// following..." play out in full. Cleared at the next turn boundary in
+  /// [_logAndResetTurnShape], same as every other per-turn suppression
+  /// flag in this file.
+  bool _suppressResponseAudioForLeakedWrapper = false;
+
+  bool _verbatimInstructionAuditedThisTurn = false;
+
+  /// How many times the CURRENT pending scripted line has already been
+  /// retried after a leaked wrapper — reset to 0 the moment
+  /// [_informGeminiToSpeakVerbatim] is asked to speak a genuinely
+  /// DIFFERENT line (see that method's own reset logic), so this budget is
+  /// per-LINE, not a single session-wide allowance that could starve a
+  /// later, unrelated scripted response.
+  int _verbatimInstructionRetryCount = 0;
+
+  /// Bounded so a model that keeps leaking the wrapper can never retry
+  /// forever — after this many retries, the line is left unsaid (silence)
+  /// rather than risking an infinite loop of the same leak repeating.
+  /// Silence is the safer failure here: the technician not hearing a
+  /// confirmation at all is a lesser problem than hearing broken
+  /// instruction text play out and get interrupted every single time.
+  static const int _maxVerbatimInstructionRetries = 2;
+
+  /// Normalized (via [_normalizeForEchoCompare]) prefix of
+  /// [_informGeminiToSpeakVerbatim]'s own wrapper text — checked as a
+  /// substring near the start of what Gemini actually said, not an exact
+  /// `startsWith`, so a model that prepends a small acknowledgment before
+  /// leaking ("Okay, say exactly...") is still caught.
+  static const String _verbatimInstructionLeakPrefix = 'say exactly';
+
+  /// Called for every `outputTranscription` fragment, same accumulate-
+  /// once-per-turn shape as [_auditGeminiCompletionClaim]/
+  /// [_auditGeminiDuplicateResponse]. The moment [_currentTurnGeminiText]
+  /// (already updated by [_auditGeminiCompletionClaim], called
+  /// immediately before this at the same call site) contains
+  /// [_verbatimInstructionLeakPrefix], this turn is a leaked wrapper, not
+  /// a genuine response — suppress its audio and retry the pending line.
+  void _auditGeminiForLeakedInstructionWrapper() {
+    if (_verbatimInstructionAuditedThisTurn) return;
+    final normalized = _normalizeForEchoCompare(_currentTurnGeminiText);
+    if (normalized.length < _verbatimInstructionLeakPrefix.length) return;
+    if (!normalized.contains(_verbatimInstructionLeakPrefix)) return;
+    _verbatimInstructionAuditedThisTurn = true;
+
+    _log_(
+      'VERBATIM INSTRUCTION LEAK: Gemini spoke the wrapper instruction itself ("$_currentTurnGeminiText") '
+      'instead of just the intended content — suppressing this turn\'s audio.',
+    );
+    _suppressResponseAudioForLeakedWrapper = true;
+
+    // A leaked FILLER is just dropped: [_lastVerbatimScriptText] is the last
+    // real scripted line, not the filler (see [_speakPendingCallFiller]), so
+    // retrying here would re-speak an old, unrelated line mid-capture.
+    if (_fillerPassthroughActive) {
+      _log_('VERBATIM INSTRUCTION LEAK: leaked turn was a pending-call filler — dropped, not retried.');
+      return;
+    }
+
+    final pendingText = _lastVerbatimScriptText;
+    if (pendingText.isEmpty) {
+      _log_('VERBATIM INSTRUCTION LEAK: no pending script text on record — leaving it suppressed, nothing to retry.');
+      return;
+    }
+    if (_verbatimInstructionRetryCount >= _maxVerbatimInstructionRetries) {
+      _log_(
+        'VERBATIM INSTRUCTION LEAK: already retried $_verbatimInstructionRetryCount time(s) for this line — '
+        'giving up to avoid a retry loop; the technician gets silence here rather than broken wrapper text.',
+      );
+      return;
+    }
+    _verbatimInstructionRetryCount++;
+    _log_('VERBATIM INSTRUCTION LEAK: retrying the same line (attempt $_verbatimInstructionRetryCount of $_maxVerbatimInstructionRetries).');
+    _informGeminiToSpeakVerbatim(pendingText, reason: 'verbatim_instruction_leak_retry');
+  }
+
+  /// Pushes [text] (this now-finished turn's full spoken text) into
+  /// [_recentGeminiTurnHistory] for future turns to compare against, and
+  /// trims anything outside [_duplicateResponseLookbackWindow] plus a hard
+  /// count cap, so this can never grow unbounded over a long session. A
+  /// no-op for text too short to be a meaningful comparison target (the
+  /// same [_echoBackstopMinWords]/[_echoBackstopMinChars] gate
+  /// [_looksLikeGeminiEcho] already uses) — a short generic reply like
+  /// "Got it." repeating is normal conversational cadence, not evidence of
+  /// anything wrong.
+  void _recordGeminiTurnForDuplicateDetection(String text) {
+    final normalized = _normalizeForEchoCompare(text);
+    if (normalized.length >= _echoBackstopMinChars &&
+        normalized.split(' ').where((w) => w.isNotEmpty).length >= _echoBackstopMinWords) {
+      _recentGeminiTurnHistory.add((text: text, at: DateTime.now()));
+    }
+    final cutoff = DateTime.now().subtract(_duplicateResponseLookbackWindow);
+    _recentGeminiTurnHistory.removeWhere((entry) => entry.at.isBefore(cutoff));
+    const maxEntries = 6;
+    if (_recentGeminiTurnHistory.length > maxEntries) {
+      _recentGeminiTurnHistory.removeRange(0, _recentGeminiTurnHistory.length - maxEntries);
+    }
+  }
+
+  /// Called for every `outputTranscription` fragment, same accumulate-
+  /// once-per-turn shape as [_auditGeminiCompletionClaim]. The first time
+  /// THIS turn's accumulating text crosses the same min-length gate
+  /// [_recordGeminiTurnForDuplicateDetection] uses, compares it against
+  /// every still-in-window entry in [_recentGeminiTurnHistory] using
+  /// [_bestWordOverlapRatio] — the exact same word-overlap algorithm
+  /// already proven for echo detection, applied here turn-to-turn instead
+  /// of chunk-to-blob. A high enough overlap means this turn is, for all
+  /// practical purposes, repeating something already said seconds ago:
+  /// arms [_suppressResponseAudioForDuplicate] so no further audio for
+  /// THIS turn plays, and logs a single greppable violation line.
+  ///
+  /// Deliberately fires on the FIRST qualifying fragment, not the whole
+  /// turn: TTS audio and its transcription arrive interleaved and roughly
+  /// in step, so catching this as early as possible in the turn is what
+  /// actually limits how much of a repeat plays before suppression kicks
+  /// in — some of it may already have been heard by the time enough text
+  /// has accumulated to compare, which is an accepted trade-off (still far
+  /// better than the full sentence playing three times over).
+  void _auditGeminiDuplicateResponse(String fragment) {
+    if (_duplicateResponseAuditedThisTurn) return;
+    // Pending-call fillers legitimately repeat word-for-word (five captures
+    // in a row each get "Just a second, still capturing.") — never a
+    // duplicate to suppress. See [_speakPendingCallFiller].
+    if (_fillerPassthroughActive) return;
+    // [_currentTurnGeminiText] is guaranteed already updated with this same
+    // [fragment] by the time this runs — [_auditGeminiCompletionClaim],
+    // called immediately before this at the same call site, updates it as
+    // its own first line.
+    final soFar = _currentTurnGeminiText;
+    final normalized = _normalizeForEchoCompare(soFar);
+    if (normalized.length < _echoBackstopMinChars) return;
+    final words = normalized.split(' ').where((w) => w.isNotEmpty).toList();
+    if (words.length < _echoBackstopMinWords) return;
+    _duplicateResponseAuditedThisTurn = true;
+
+    final cutoff = DateTime.now().subtract(_duplicateResponseLookbackWindow);
+    for (final entry in _recentGeminiTurnHistory.reversed) {
+      if (entry.at.isBefore(cutoff)) continue;
+      final priorWords = _normalizeForEchoCompare(entry.text).split(' ').where((w) => w.isNotEmpty).toList();
+      final overlap = _bestWordOverlapRatio(words, priorWords);
+      if (overlap < _duplicateResponseOverlapThreshold) continue;
+      final agoMs = DateTime.now().difference(entry.at).inMilliseconds;
+      _log_(
+        'DUPLICATE RESPONSE SUPPRESSED: current turn ("$soFar") overlaps ${(overlap * 100).toStringAsFixed(0)}% '
+        'of a turn spoken ${agoMs}ms ago ("${entry.text}") — >= ${(_duplicateResponseOverlapThreshold * 100).toStringAsFixed(0)}% threshold. Dropping the '
+        'remainder of this turn\'s audio so the technician does not hear the same confirmation again '
+        '(P0 audio-echo safety net).',
+      );
+      _suppressResponseAudioForDuplicate = true;
+      // P0 FIX (CONFIRMED regression: this used to be the ONLY effect of a
+      // duplicate finding, and it silently ate the wrong audio — see
+      // [_pendingPcmChunksAwaitingReinit]'s doc comment for the full "Can
+      // you hear me?" evidence). [_suppressResponseAudioForDuplicate]
+      // alone only stops FUTURE chunks arriving live over the websocket
+      // for this turn — it says nothing about chunks that arrived EARLIER
+      // and are already sitting in the reinit-pending queue, waiting to be
+      // flushed later via [_flushQueuedPcmChunksForGeneration], which
+      // re-feeds the WHOLE queue through [_onResponseAudioChunk]
+      // regardless of which turn each entry belongs to. Purging THIS
+      // turn's own already-queued entries right now — by [turnId], not by
+      // clearing the queue wholesale — is what actually keeps this
+      // targeted: an EARLIER turn's still-queued, still-wanted audio
+      // (e.g. a genuinely first-heard reply that just hasn't been flushed
+      // yet) is never touched, only ever this specific, just-confirmed
+      // duplicate turn's own entries.
+      final purged = _pendingPcmChunksAwaitingReinit.length;
+      _pendingPcmChunksAwaitingReinit.removeWhere((c) => c.turnId == _currentResponseTurnId);
+      final actuallyPurged = purged - _pendingPcmChunksAwaitingReinit.length;
+      if (actuallyPurged > 0) {
+        _log_(
+          'DUPLICATE RESPONSE SUPPRESSED: also purged $actuallyPurged already-queued chunk(s) tagged turn '
+          '$_currentResponseTurnId from the reinit-pending queue (${_pendingPcmChunksAwaitingReinit.length} '
+          'chunk(s) from OTHER turns left untouched).',
+        );
+      }
+      return;
+    }
   }
 
   /// Executes every `functionCalls` entry in a `toolCall` message via
@@ -3344,6 +5226,70 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         _log_('toolCall: "$name" (id=$id) — GEMINI-INITIATED (Gemini called this itself, not the deterministic trigger)');
       }
 
+      // ISSUE 1 fix (CONFIRMED via f5a8bd8b-flutter_run_log.txt:
+      // "PHOTO TIMING [open_camera]: handler_entry" logged TWICE, ~3ms
+      // apart, for the SAME open_camera request). Root cause: Gemini's own
+      // genuine toolCall for `name` arrived here while this app's OWN
+      // deterministic trigger had ALREADY fired `name` for this exact
+      // utterance a moment earlier — the debounce claims just above stop
+      // the deterministic trigger from firing AGAIN once a genuine toolCall
+      // claims `lastActivityAt` first, but nothing stopped the REVERSE
+      // ordering: a genuine toolCall arriving after this app's own trigger
+      // already fired never checked that at all, and just dispatched a
+      // SECOND real call. Two concurrent `CameraController.initialize()`
+      // calls contending for the same camera hardware is a plausible real
+      // cause of that log's 3.79s Dart-side gap before the native call
+      // actually dispatched. Fixed symmetrically: if this app's own trigger
+      // already resolved (fired) `name` for the CURRENT utterance, this
+      // toolCall is redundant — never dispatch a second, concurrent real
+      // call. Still acknowledged back to Gemini (the Live API expects a
+      // functionResponse for every toolCall it sends), just without a
+      // second real dispatch and without a second spoken confirmation (the
+      // app's own trigger already handles speaking one).
+      // P0 FIX — same one-trigger-per-utterance rule as the evaluation loop
+      // in [_onInputTranscription], extended to Gemini's own toolCalls for
+      // screen-changing functions: if the app already committed a
+      // DIFFERENT trigger for this utterance (e.g. go_back), a Gemini
+      // view_invoice for it must not push a second screen on top.
+      final conflictsWithCommittedTrigger = (_isNavigatingScreenFunction(name) || name == 'go_back') &&
+          _anyTriggerCommittedThisUtterance &&
+          !_alreadyResolvedByAppTriggerThisUtterance(name);
+      if (conflictsWithCommittedTrigger) {
+        _log_(
+          'toolCall: "$name" (id=$id) SUPPRESSED — this utterance was already committed to a different app '
+          'trigger; one screen change per utterance.',
+        );
+        functionResponses.add({
+          'id': id,
+          'name': name,
+          'response': {'status': 'already_handled', 'job_id': args['job_id']},
+        });
+        continue;
+      }
+      if (_alreadyResolvedByAppTriggerThisUtterance(name)) {
+        _log_(
+          'toolCall: "$name" (id=$id) SUPPRESSED — this app\'s own deterministic trigger already fired "$name" '
+          'for this exact utterance a moment earlier; not dispatching a second, concurrent real call. '
+          'Acknowledging Gemini\'s toolCall without a second spoken confirmation.',
+        );
+        debugPrint(
+          'GEMINI TOOLCALL SUPPRESSED (duplicate): "$name" already fired by this app\'s own deterministic '
+          'trigger for this utterance — skipping the second real dispatch.',
+        );
+        functionResponses.add({
+          'id': id,
+          'name': name,
+          'response': {'status': 'already_handled', 'job_id': args['job_id']},
+        });
+        continue;
+      }
+
+      // ISSUE 2 — see [_dispatchGenerationCounter]'s doc comment: captured
+      // BEFORE dispatch, same as the deterministic path in
+      // [_executeDeterministic], so a genuine Gemini-initiated toolCall is
+      // ordered against deterministic dispatches by when it actually began,
+      // not by when it happens to finish.
+      final myDispatchGeneration = _beginNewDispatchGeneration();
       Map<String, dynamic> responsePayload;
       // FIX 2: an UNPROMPTED go_back right after a view_* succeeded — no
       // actual "take me back" heard from the technician in between — is
@@ -3368,7 +5314,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           _log_('toolCall: dispatching "$name" (id=$id) args=$args ...');
           _beginFunctionCallInFlight('toolCall "$name" (id=$id)');
           try {
-            responsePayload = await _dispatchWithOpenCameraSafeguards(name: name, args: args);
+            responsePayload = await _pipelineDispatch(
+              name: name,
+              source: 'gemini_toolCall',
+              call: () => _dispatchWithOpenCameraSafeguards(name: name, args: args),
+            );
           } finally {
             _endFunctionCallInFlight('toolCall "$name" (id=$id)');
           }
@@ -3379,6 +5329,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           // after it.
           if (!responsePayload.containsKey('error')) {
             _clearAllTriggerBuffersAfterSuccess('toolCall "$name" (id=$id)');
+            // ISSUE 2 — see [_recordDispatchSucceeded]'s doc comment.
+            _recordDispatchSucceeded(myDispatchGeneration, name);
           }
           // BUG FIX: a successful function call is itself a genuine "turn" —
           // reset here too, not just when the toolCall message first arrived
@@ -3414,7 +5366,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // `_intentionalGoBackHeardSinceLastView` to false so an intentional
       // phrase heard for a PREVIOUS view_ screen doesn't carry over and
       // incorrectly waive the cooldown for this new one.
-      if (_isNavigatingScreenFunction(name) && !responsePayload.containsKey('error')) {
+      if (_isNavigatingScreenFunction(name) && _viewResultNavigated(responsePayload)) {
         _lastViewFunctionSucceededAt = DateTime.now();
         _intentionalGoBackHeardSinceLastView = false;
         _currentViewScreenName = name;
@@ -3430,8 +5382,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // builder either way, whether Gemini called the function itself or
       // the app's deterministic backstop did (see
       // [_buildSpokenTextForResult]).
-      final spokenText = _buildSpokenTextForResult(name: name, result: responsePayload);
-      if (spokenText != null) {
+      final spokenText = responsePayload['silent'] == true ? null : _buildSpokenTextForResult(name: name, result: responsePayload);
+      // ISSUE 2 — see [_discardIfStaleDispatch]'s doc comment: same
+      // staleness guard [_executeDeterministic] applies, so a genuine but
+      // slow-to-resolve Gemini toolCall can't interrupt a newer request's
+      // already-spoken confirmation either.
+      if (spokenText != null && !_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: name)) {
         _informGeminiToSpeakVerbatim(spokenText, reason: 'toolCall "$name" (id=$id)');
       }
 
@@ -3452,7 +5408,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
 
     if (shouldEndSession) {
-      unawaited(_stopTest());
+      unawaited(_stopTest(reason: 'end_session requested'));
     }
   }
 
@@ -3487,20 +5443,77 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   ///     get_kb_answer/site_condition/get_last_photo/get_job_timeline_answer
   ///     without hand-rolling eight more near-identical detectors.
   void _onInputTranscription(String textChunk) {
+    _pipelineLog('transcript_received', '"$textChunk" ($_utteranceStateSummary)');
     // BUG 2 backstop (step 3): checked BEFORE the "inputTranscription
     // chunk:" log line and BEFORE any trigger sees this text at all — see
     // [_looksLikeGeminiEcho]'s doc comment for the thresholds and why they
-    // exist.
-    if (_looksLikeGeminiEcho(textChunk)) {
+    // exist. A flagged chunk that carries a command the technician started
+    // saying only after our audio had provably finished playing is let
+    // through instead — see [_decideEchoOverride].
+    final echoDecision = _looksLikeGeminiEcho(textChunk) ? _decideEchoOverride(textChunk) : EchoDecision.notEcho;
+    if (echoDecision == EchoDecision.suppress) {
+      _pipelineLog('transcript_dropped', 'reason=echo (reads like Gemini\'s own recent speech) — no matcher sees it');
+      // ECHO LOOP FIX (CONFIRMED in a real trace): the "speech" this
+      // transcript belongs to was our own voice, so its transcript HAS
+      // arrived — there is nothing left to wait for and nothing to answer.
+      // Leaving the wait running made its 8s timeout say "I didn't catch
+      // that", which echoed in turn ("Sorry, still not catching that",
+      // four times in a row).
+      _stopAwaitingLateTranscript('the transcript was an echo of our own speech — nothing to answer');
       _log_(
         'ECHO BACKSTOP: discarding inputTranscription chunk "$textChunk" — matches Gemini\'s own recent spoken '
-        'output ("$_recentGeminiOutputText"), treating as acoustic mic bleed, not technician speech — NOT '
+        'output (current turn: "$_currentTurnAudiblyPlayedText"; last completed turn: '
+        '"$_lastCompletedTurnAudiblyPlayedText"), treating as acoustic mic bleed, not technician speech — NOT '
         'passed to any trigger',
       );
       debugPrint('PHOTO TIMING [echo]: discarded likely-echo inputTranscription chunk: "$textChunk"');
+      // P0 AUDIO-ECHO FIX — the real measurement this whole fix's sizing
+      // depends on. This chunk is TEXT-LEVEL discarded (never reaches a
+      // trigger), but the underlying raw audio it was transcribed FROM was
+      // only ever a problem if it was sent to Gemini AT ALL — i.e. if it
+      // arrived while outgoing mic audio was already resumed. Logging how
+      // long after the most recent resume this happened turns "is the
+      // grace/quiet window wide enough" into something a real run's log
+      // answers directly, not something inferred from code reading. A
+      // small gap here (a few hundred ms) is expected/harmless — some
+      // in-flight network jitter between resume and a chunk that was
+      // already borderline is normal; a LARGE gap (multiple seconds, like
+      // the confirmed 6-7s repeats) is the actual signal this fix targets.
+      final resumedAt = _lastOutgoingMicResumedAt;
+      if (resumedAt != null) {
+        final sinceResume = DateTime.now().difference(resumedAt);
+        _log_(
+          'ECHO TIMING: this echo-flagged chunk was transcribed ${sinceResume.inMilliseconds}ms after outgoing '
+          'mic audio last resumed — ${sinceResume.inSeconds >= 1 ? "LARGE gap: real acoustic echo tail still audible well after resuming, the adaptive quiet-wait above should be catching this now" : "small gap: normal transcription-latency jitter"}',
+        );
+      }
       return;
     }
+    // P0 FIX (CONFIRMED via a real session: "Show me the estimate. Try me
+    // again. For example, show the job history or take a photo." — one
+    // inputTranscription chunk containing the technician's REAL request
+    // followed by this app's OWN spoken fallback prompt, both merged into
+    // one STT segment). [_looksLikeGeminiEcho] above only ever discards a
+    // chunk WHOLESALE, and correctly refuses to here — the chunk also
+    // carries genuine technician speech that must not be lost. This
+    // instead finds and strips just the CONTAMINATED TAIL — see
+    // [_stripTrailingEchoContamination]'s own doc comment — so every
+    // trigger below only ever sees the technician's own words. (Also
+    // backstopped independently by the hard "stop after the first trigger
+    // fires" rule in [_maybeTriggerDeterministic] and every hand-rolled
+    // trigger function, so even an UN-stripped contamination case can
+    // never fire more than one action — but stripping is what gives the
+    // TECHNICIAN'S actual request the best chance of being the one that
+    // wins, rather than whichever trigger happens to be checked first.)
+    textChunk = _stripTrailingEchoContamination(textChunk);
     _log_('inputTranscription chunk: "$textChunk"');
+    // Real technician words arrived — any "Thinking..." wait ends, and if
+    // they arrived after this utterance was already finalized, its
+    // end-of-utterance routing re-runs on them (see
+    // [_scheduleLateTranscriptFinalize]).
+    _stopAwaitingLateTranscript('transcript arrived');
+    _latencyTranscriptAt ??= DateTime.now(); // LATENCY metric only
+    final arrivedAfterUtteranceEnd = _finalizedCurrentUtterance && !_isSpeaking;
 
     // PART I item 1 (CONFIRMED root cause of every remaining "half answer"/
     // late-reply complaint): mute UNCONDITIONALLY, before ANY trigger-
@@ -3516,12 +5529,53 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // still resolves exactly as fast internally afterward; it just never
     // gets a head start over this mute anymore. See
     // [_muteImmediatelyOnFirstChunkOfUtterance]'s own doc comment.
+    _endAwaitingFirstTranscript('first transcript chunk arrived');
     _muteImmediatelyOnFirstChunkOfUtterance();
 
-    // PART D items 1-2: checked FIRST — a plain greeting/presence-check
-    // ("can you hear me", "hello") resolves instantly via its own canned
-    // response, same as it always has.
-    _maybeTriggerAcknowledgePresence(textChunk);
+    // ISSUE 2 — see [_looksLikeNonLatinScriptTranscription]'s doc comment:
+    // checked BEFORE any trigger sees this chunk. Genuinely non-Latin-script
+    // text (Hindi/Korean/Japanese/Cyrillic/Arabic/Thai) strips to nothing
+    // under every trigger's own `[^a-z ]` normalization — there is no
+    // matching left to even attempt — so this alone still short-circuits
+    // straight to the same "didn't catch that" fallback genuinely-
+    // unmatchable STT output gets (see ISSUE 1(c)).
+    if (_looksLikeNonLatinScriptTranscription(textChunk)) {
+      // An English greeting rendered in another script ("हेलो हेलो") gets the
+      // exact same reply "hello" gets, through the same trigger — and only
+      // greetings do (see `transliterated_greeting.dart`); anything else in
+      // a non-Latin script is still discarded below, unchanged.
+      if (!_utteranceAlreadyResolvedByTrigger && looksLikeTransliteratedGreeting(textChunk)) {
+        _pipelineLog('transcript_greeting', 'non-Latin-script greeting "$textChunk" — answering it like "hello"');
+        _log_('NON-LATIN SCRIPT GREETING: "$textChunk" is a greeting — routing to acknowledge_presence');
+        _maybeTriggerAcknowledgePresence('hello');
+        return;
+      }
+      _pipelineLog('transcript_dropped', 'reason=non_latin_script — no matcher sees it');
+      _log_('NON-LATIN SCRIPT TRANSCRIPTION DETECTED: skipping English trigger matching for "$textChunk"');
+      if (!_utteranceAlreadyResolvedByTrigger) {
+        _clearAllTriggerBuffersAfterSuccess('non-latin script transcription detected', endsUnclearInputStreak: false);
+        _respondToUnclearInput(reason: 'non_latin_script_transcription');
+      }
+      return;
+    }
+    // CONFIRMED bug (flutter_run_log_new.txt, build #50): "Y es, ¿dispor? Me
+    // looks good." — a single stray "¿" from garbled STT — used to hit the
+    // SAME short-circuit as true non-Latin script above via
+    // [_transcriptionDriftReason], and so never even reached
+    // [_maybeDetectPhotoDecision] below, even though "looks good" is an
+    // exact, unambiguous confirm phrase that survives normalization just
+    // fine (only the "¿"/accented characters themselves strip to spaces,
+    // not the English words around them — unlike true non-Latin script,
+    // where normalization strips EVERYTHING). This heuristic
+    // ([_looksLikeNonEnglishLatinTranscription]) is a suspicion, not proof
+    // the buffer is unmatchable, so it no longer short-circuits anything —
+    // left as a diagnostic log only. Every trigger below still gets its
+    // normal chance; [_maybeArmPreemptiveMuteSafetyTimeout] at the end of
+    // this method remains the real "nothing matched" fallback, reached only
+    // if every one of them genuinely misses.
+    if (_looksLikeNonEnglishLatinTranscription(textChunk)) {
+      _log_('NON-ENGLISH TRANSCRIPTION SUSPECTED (not skipped — still trying every trigger below): "$textChunk"');
+    }
 
     // BUG FIX: reset on every transcribed chunk of real technician speech,
     // not just the raw-amplitude silence->speech edge in [_trackSpeechLevel]
@@ -3529,129 +5583,43 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // active right now.
     _resetInactivityTimer(reason: 'technician transcription chunk received');
 
-    _maybeTriggerViewEstimate(textChunk);
-    _maybeTriggerGetJobDetails(textChunk);
-    _maybeDetectIntentionalGoBack(textChunk);
-    _maybeDetectPhotoDecision(textChunk);
-
-    // CONFIRMED via a full real session: Gemini called zero functions
-    // natively — every one of these gets the same deterministic backstop
-    // proven above for get_job_details, via the shared [_TranscriptTrigger]
-    // machinery (see its own doc comment).
-    _maybeTriggerDeterministic(
-      _deterministicTriggers['view_change_orders']!,
-      textChunk,
-      requireJobId: true,
-      buildArgs: (_, jobId) => {'job_id': jobId},
-      buildSpokenText: (result) => _defaultDeterministicSpokenText(
-        name: 'view_change_orders',
-        humanAction: 'see the change orders',
-        appAction: 'navigated there and looked them up for you',
-        result: result,
-      ),
+    // P0 FIX (CONFIRMED twice in real sessions: view_estimate +
+    // view_job_history + open_camera off one utterance, then go_back +
+    // view_invoice off another). ONE trigger per utterance, enforced HERE in
+    // the shared evaluation loop rather than per trigger pair: the moment
+    // any evaluator below commits (see [_anyTriggerCommittedThisUtterance]),
+    // the rest are not evaluated against this utterance at all. The old
+    // check inside [_maybeTriggerDeterministic] read only
+    // [_utteranceAlreadyResolvedByTrigger], which isn't set until a fired
+    // trigger's async dispatch SUCCEEDS — so for the whole navigation window
+    // (and for every trigger evaluated later in the same chunk) a second
+    // trigger could still fire.
+    _pipelineLog('transcript_to_matchers', '"$textChunk"');
+    final evaluators = _buildTriggerEvaluators(textChunk);
+    final committedBefore = _anyTriggerCommittedThisUtterance;
+    for (final evaluate in evaluators.values) {
+      if (_anyTriggerCommittedThisUtterance) {
+        debugPrint('DETERMINISTIC SKIP: utterance already committed to a trigger — not evaluating the rest');
+        break;
+      }
+      evaluate();
+    }
+    _pipelineLog(
+      'matcher_result',
+      committedBefore
+          ? 'utterance was ALREADY committed before this chunk — no trigger evaluated ($_utteranceStateSummary)'
+          : (_anyTriggerCommittedThisUtterance
+                ? 'committed ($_utteranceStateSummary)'
+                : 'no trigger matched this chunk yet${_pendingGuardFailedReply != null ? ' (a guard-failed clarification is queued)' : ''}'),
     );
-    _maybeTriggerDeterministic(
-      _deterministicTriggers['view_invoice']!,
-      textChunk,
-      requireJobId: true,
-      buildArgs: (_, jobId) => {'job_id': jobId},
-      buildSpokenText: (result) => _defaultDeterministicSpokenText(
-        name: 'view_invoice',
-        humanAction: 'see the invoice',
-        appAction: 'navigated there and looked it up for you',
-        result: result,
-      ),
-    );
-    _maybeTriggerDeterministic(
-      _deterministicTriggers['view_job_history']!,
-      textChunk,
-      requireJobId: true,
-      buildArgs: (_, jobId) => {'job_id': jobId},
-      buildSpokenText: (result) => _defaultDeterministicSpokenText(
-        name: 'view_job_history',
-        humanAction: 'see the job history',
-        appAction: 'navigated there and looked it up for you',
-        result: result,
-      ),
-    );
-    _maybeTriggerDeterministic(
-      _deterministicTriggers['get_job_timeline_answer']!,
-      textChunk,
-      requireJobId: true,
-      buildArgs: (transcript, jobId) => {'job_id': jobId, 'query_hint': transcript},
-      buildSpokenText: (result) => _defaultDeterministicSpokenText(
-        name: 'get_job_timeline_answer',
-        humanAction: "ask about this job's timeline",
-        appAction: 'looked up the real logged events for you',
-        result: result,
-      ),
-    );
-    // Guarded to skip while a camera/photo flow is already active (open
-    // again mid-flow would be a confusing no-op/duplicate-open at best).
-    _maybeTriggerDeterministic(
-      _deterministicTriggers['open_camera']!,
-      textChunk,
-      requireJobId: true,
-      guard: () => _screenTask == _ScreenTask.none,
-      buildArgs: (_, jobId) => {'job_id': jobId},
-      buildSpokenText: (result) => _defaultDeterministicSpokenText(
-        name: 'open_camera',
-        humanAction: 'take a photo',
-        appAction: 'opened the camera for you',
-        result: result,
-      ),
-      // PART N item 1 — see [_maybeTriggerDeterministic]'s `onGuardFailed`
-      // doc comment: restating "take a photo"/"let's take a photo" while
-      // the camera is already open must get this explicit clarification,
-      // not silence a different trigger could wrongly fill in behind.
-      onGuardFailed: () => _informGeminiToSpeakVerbatim(
-        "The camera's already open — say 'ready' or 'capture it' when you want the photo.",
-        reason: 'open_camera_guard_failed_already_open',
-      ),
-    );
-    // FIX 2: capture_photo's own backstop, mirroring open_camera's exactly —
-    // guarded to ONLY arm while the live camera preview is genuinely showing
-    // ([_ScreenTask.cameraLive], set by a successful open_camera/retake_photo
-    // — see [_updateScreenTaskForToolCall]), so "ready"/"go ahead" can never
-    // misfire at any other point in the conversation.
-    _maybeTriggerDeterministic(
-      _deterministicTriggers['capture_photo']!,
-      textChunk,
-      requireJobId: true,
-      guard: () => _screenTask == _ScreenTask.cameraLive,
-      buildArgs: (_, jobId) => {'job_id': jobId},
-      buildSpokenText: (result) => _defaultDeterministicSpokenText(
-        name: 'capture_photo',
-        humanAction: 'capture the photo',
-        appAction: 'took the photo for you',
-        result: result,
-      ),
-    );
-    _maybeTriggerDeterministic(
-      _deterministicTriggers['get_last_photo']!,
-      textChunk,
-      requireJobId: true,
-      buildArgs: (_, jobId) => {'job_id': jobId},
-      buildSpokenText: (result) => _defaultDeterministicSpokenText(
-        name: 'get_last_photo',
-        humanAction: 'see the last photo',
-        appAction: (result['found'] as bool? ?? false)
-            ? 'opened it for you'
-            : 'checked, but no photos have been taken on this job yet',
-        result: result,
-      ),
-    );
-    // get_current_screen bypasses dispatchGeminiFunctionCall entirely (see
-    // [_describeCurrentScreen]), so it gets its own small hand-rolled
-    // detector rather than going through [_maybeTriggerDeterministic] —
-    // same reasoning as get_job_details predating the shared engine.
-    _maybeTriggerGetCurrentScreen(textChunk);
-    // PART A item 3: meta/capability questions ("what can you do") answer
-    // from a FIXED, hardcoded description, never dispatchGeminiFunctionCall
-    // — same hand-rolled reasoning as get_current_screen just above, not the
-    // shared [_TranscriptTrigger] engine (which sends the DISPATCHER's real
-    // result to Gemini to speak, not a canned string).
-    _maybeTriggerMetaCapability(textChunk);
+    // See the guard-failed branch in [_maybeTriggerDeterministic]: a queued
+    // clarification only speaks if nothing actually fired for this chunk.
+    final guardFailedReply = _pendingGuardFailedReply;
+    _pendingGuardFailedReply = null;
+    if (guardFailedReply != null && !_anyTriggerCommittedThisUtterance) {
+      _guardFailedReplySpokenThisUtterance = true;
+      guardFailedReply();
+    }
     // get_kb_answer works standalone too (job_id is optional for it), so
     // get_kb_answer/site_condition are NOT fired here, unlike every trigger
     // above — their matched phrases ("how do i"/"note that") are only a
@@ -3664,6 +5632,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // own doc comment.
     _accumulateDeterministicBuffer(_deterministicTriggers['get_kb_answer']!, textChunk);
     _accumulateDeterministicBuffer(_deterministicTriggers['site_condition']!, textChunk);
+    if (arrivedAfterUtteranceEnd) {
+      _pipelineLog('late_transcript', 'arrived after utterance end — end-of-utterance routing will re-run on it');
+      _scheduleLateTranscriptFinalize();
+    }
 
     // PART F items 4-5 / PART I item 1: checked LAST, after every known-
     // command trigger above has already had its synchronous chance to
@@ -3671,6 +5643,200 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // at the top of this method (see [_muteImmediatelyOnFirstChunkOfUtterance]);
     // this only arms the last-resort safety timeout if nothing resolved.
     _maybeArmPreemptiveMuteSafetyTimeout();
+  }
+
+  /// Every per-chunk trigger evaluator, keyed by the trigger/function name it
+  /// fires, in the fixed priority order [_onInputTranscription] runs them in
+  /// (the first to commit wins the utterance). Keyed so
+  /// [_maybeResolveByIntent] can run exactly one named trigger — with all of
+  /// its own guards, args and replies — once the fuzzy intent layer has
+  /// picked it.
+  Map<String, void Function()> _buildTriggerEvaluators(String textChunk) {
+    return <String, void Function()>{
+      // PART D items 1-2: checked FIRST — a plain greeting/presence-check
+      // ("can you hear me", "hello") resolves instantly via its own canned
+      // response, same as it always has.
+      'acknowledge_presence': () => _maybeTriggerAcknowledgePresence(textChunk),
+      'view_estimate': () => _maybeTriggerViewEstimate(textChunk),
+      'get_job_details': () => _maybeTriggerGetJobDetails(textChunk),
+      'go_back': () => _maybeDetectIntentionalGoBack(textChunk),
+      'photo_decision': () => _maybeDetectPhotoDecision(textChunk),
+
+      // CONFIRMED via a full real session: Gemini called zero functions
+      // natively — every one of these gets the same deterministic backstop
+      // proven above for get_job_details, via the shared [_TranscriptTrigger]
+      // machinery (see its own doc comment).
+      'view_change_orders': () => _maybeTriggerDeterministic(
+        _deterministicTriggers['view_change_orders']!,
+        textChunk,
+        requireJobId: true,
+        buildArgs: (_, jobId) => {'job_id': jobId},
+        buildSpokenText: (result) => _defaultDeterministicSpokenText(
+          name: 'view_change_orders',
+          humanAction: 'see the change orders',
+          appAction: 'navigated there and looked them up for you',
+          result: result,
+        ),
+      ),
+      'view_invoice': () => _maybeTriggerDeterministic(
+        _deterministicTriggers['view_invoice']!,
+        textChunk,
+        requireJobId: true,
+        buildArgs: (_, jobId) => {'job_id': jobId},
+        buildSpokenText: (result) => _defaultDeterministicSpokenText(
+          name: 'view_invoice',
+          humanAction: 'see the invoice',
+          appAction: 'navigated there and looked it up for you',
+          result: result,
+        ),
+      ),
+      'view_job_history': () => _maybeTriggerDeterministic(
+        _deterministicTriggers['view_job_history']!,
+        textChunk,
+        requireJobId: true,
+        buildArgs: (_, jobId) => {'job_id': jobId},
+        buildSpokenText: (result) => _defaultDeterministicSpokenText(
+          name: 'view_job_history',
+          humanAction: 'see the job history',
+          appAction: 'navigated there and looked it up for you',
+          result: result,
+        ),
+      ),
+      'get_job_timeline_answer': () => _maybeTriggerDeterministic(
+        _deterministicTriggers['get_job_timeline_answer']!,
+        textChunk,
+        requireJobId: true,
+        buildArgs: (transcript, jobId) => {'job_id': jobId, 'query_hint': transcript},
+        buildSpokenText: (result) => _defaultDeterministicSpokenText(
+          name: 'get_job_timeline_answer',
+          humanAction: "ask about this job's timeline",
+          appAction: 'looked up the real logged events for you',
+          result: result,
+        ),
+      ),
+      // Guarded to skip while a camera/photo flow is already active (open
+      // again mid-flow would be a confusing no-op/duplicate-open at best).
+      'open_camera': () => _maybeTriggerDeterministic(
+        _deterministicTriggers['open_camera']!,
+        textChunk,
+        requireJobId: true,
+        guard: () => _screenTask == _ScreenTask.none,
+        buildArgs: (_, jobId) => {'job_id': jobId},
+        buildSpokenText: (result) => _defaultDeterministicSpokenText(
+          name: 'open_camera',
+          humanAction: 'take a photo',
+          appAction: 'opened the camera for you',
+          result: result,
+        ),
+        // PART N item 1 — see [_maybeTriggerDeterministic]'s `onGuardFailed`
+        // doc comment: restating "take a photo"/"let's take a photo" while
+        // the camera is already open must get this explicit clarification,
+        // not silence a different trigger could wrongly fill in behind.
+        onGuardFailed: () {
+          // While a captured photo awaits keep/retake, an open-camera-style
+          // phrase ("Daughters or take a photo?" in the log) is a decision
+          // attempt, not a request to shoot: if the photo-decision trigger
+          // already resolved it this chunk, stay silent; otherwise re-ask the
+          // pending question instead of the live-preview "say ready" line.
+          if (_screenTask == _ScreenTask.cameraCaptured) {
+            if (_photoDecisionResolvedForCurrentUtterance) {
+              _log_('OPEN_CAMERA GUARD: photo decision already handled this utterance — no reply');
+              return;
+            }
+            _log_('OPEN_CAMERA REPEAT WHILE PHOTO PENDING: re-asking keep/retake, no action taken');
+            _informGeminiToSpeakVerbatim(
+              "You've got a photo waiting — do you want to keep it, or retake it?",
+              reason: 'open_camera_guard_failed_photo_pending',
+            );
+            return;
+          }
+          // P0 FIX — never claim "already open" before the real open has
+        // completed (see the open_camera entry in
+        // `photoCompletionClaimPhrases`).
+        if (_screenTask == _ScreenTask.cameraClosing) {
+          _log_('OPEN_CAMERA WHILE CLOSING: acknowledging, no action taken — the camera is still being released.');
+          _informGeminiToSpeakVerbatim(
+            "The camera's just closing — give it a second, then ask again.",
+            reason: 'open_camera_guard_failed_closing',
+          );
+          return;
+        }
+        if (_screenTask == _ScreenTask.cameraOpening || !_cameraOpenConfirmed) {
+          _log_('OPEN_CAMERA REPEAT WHILE OPENING: acknowledging, no action taken — open still in progress.');
+          _informGeminiToSpeakVerbatim(
+            "The camera's still opening — give it a moment.",
+            reason: 'open_camera_guard_failed_still_opening',
+          );
+          return;
+        }
+        // ISSUE 1 item 3: a distinct, greppable log line for exactly this
+          // path — separate from the generic "DETERMINISTIC SKIP"/
+          // "DETERMINISTIC INTERRUPT" lines [_maybeTriggerDeterministic]/
+          // [_informGeminiToSpeakVerbatim] already print — so the next real
+          // log makes it unambiguous that a repeated open-camera-style phrase
+          // while already open was acknowledged and NOT allowed to fall
+          // through to any other trigger (in particular capture_photo).
+          _log_(
+            'OPEN_CAMERA REPEAT WHILE OPEN: acknowledging, no action taken — camera is already open, telling the '
+            'technician to say \'ready\' or \'capture it\' instead of silently falling through to another trigger.',
+          );
+          _informGeminiToSpeakVerbatim(
+            "The camera's already open — say 'ready' or 'capture it' when you want the photo.",
+            reason: 'open_camera_guard_failed_already_open',
+          );
+        },
+      ),
+      // FIX 2: capture_photo's own backstop, mirroring open_camera's exactly —
+      // guarded to ONLY arm while the live camera preview is genuinely showing
+      // ([_ScreenTask.cameraLive], set by a successful open_camera/retake_photo
+      // — see [_updateScreenTaskForToolCall]), so "ready"/"go ahead" can never
+      // misfire at any other point in the conversation.
+      //
+      // P2: [_screenTask] can now reach `cameraLive` EARLY, off the preview
+      // texture rather than off `open_camera` returning success (see
+      // [_ScreenTask.cameraOpening]) — which is the whole point, but would
+      // have quietly widened this guard from "the camera is open" to "a
+      // preview is showing". [_cameraOpenConfirmed] keeps the ACTION gated on
+      // full initialization while the VIEW runs ahead of it.
+      'capture_photo': () => _maybeTriggerDeterministic(
+        _deterministicTriggers['capture_photo']!,
+        textChunk,
+        requireJobId: true,
+        guard: () => _screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed,
+        buildArgs: (_, jobId) => {'job_id': jobId},
+        buildSpokenText: (result) => _defaultDeterministicSpokenText(
+          name: 'capture_photo',
+          humanAction: 'capture the photo',
+          appAction: 'took the photo for you',
+          result: result,
+        ),
+      ),
+      'get_last_photo': () => _maybeTriggerDeterministic(
+        _deterministicTriggers['get_last_photo']!,
+        textChunk,
+        requireJobId: true,
+        buildArgs: (_, jobId) => {'job_id': jobId},
+        buildSpokenText: (result) => _defaultDeterministicSpokenText(
+          name: 'get_last_photo',
+          humanAction: 'see the last photo',
+          appAction: (result['found'] as bool? ?? false)
+              ? 'opened it for you'
+              : 'checked, but no photos have been taken on this job yet',
+          result: result,
+        ),
+      ),
+      // get_current_screen bypasses dispatchGeminiFunctionCall entirely (see
+      // [_describeCurrentScreen]), so it gets its own small hand-rolled
+      // detector rather than going through [_maybeTriggerDeterministic] —
+      // same reasoning as get_job_details predating the shared engine.
+      'get_current_screen': () => _maybeTriggerGetCurrentScreen(textChunk),
+      // PART A item 3: meta/capability questions ("what can you do") answer
+      // from a FIXED, hardcoded description, never dispatchGeminiFunctionCall
+      // — same hand-rolled reasoning as get_current_screen just above, not the
+      // shared [_TranscriptTrigger] engine (which sends the DISPATCHER's real
+      // result to Gemini to speak, not a canned string).
+      'meta_capability': () => _maybeTriggerMetaCapability(textChunk),
+    };
   }
 
   /// Appends [textChunk] to [trigger]'s buffer without matching/firing —
@@ -3691,6 +5857,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// [_accumulateDeterministicBuffer] on every chunk, so this only needs to
   /// run the match/debounce/dispatch step, not append anything further.
   void _finalizeUtteranceEndDeterministicTriggers() {
+    // ISSUE 1(a) — see [_utteranceEndDetectedAt]'s doc comment.
+    _utteranceEndDetectedAt = DateTime.now();
+    _pipelineLog(
+      'utterance_end',
+      'final text="${_deterministicTriggers['get_kb_answer']!.buffer.trim()}" ($_utteranceStateSummary)',
+    );
     _maybeTriggerDeterministic(
       _deterministicTriggers['get_kb_answer']!,
       '',
@@ -3702,7 +5874,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // more specific trigger already owns this utterance instead of
       // double-answering (or wrongly declining a job-specific question the
       // KB was never going to have).
-      guard: () => !_otherSpecificTriggerAlreadyResolvedThisUtterance,
+      guard: () => !_otherSpecificTriggerAlreadyResolvedThisUtterance && !_guardFailedReplySpokenThisUtterance,
       buildArgs: (transcript, jobId) => {
         'question': transcript,
         'job_id': ?jobId,
@@ -3727,11 +5899,254 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         result: result,
       ),
     );
+    // Task A: the keyword/similarity layer gets the utterance only if
+    // nothing above claimed it. When it answers (fires, asks which, or gives
+    // the options reply) it sets the same flags every other resolution does,
+    // so the catch-all below sees them and stands down on its own.
+    _maybeResolveByIntent();
     // PART F item 4: by this point every per-chunk AND end-of-utterance
     // trigger above has already had its synchronous chance to match, so
     // this sees the final, settled state of every trigger's
     // resolvedForCurrentUtterance flag.
     _maybeFallBackToKbAnswerCatchAll();
+
+    // Nothing heard yet for speech Gemini did receive: its transcript is
+    // most likely still on the way — show that instead of nothing.
+    _finalizedCurrentUtterance = true;
+    final heard = _deterministicTriggers['get_kb_answer']!.buffer.trim();
+    if (heard.isEmpty &&
+        _speechBurstReachedGemini &&
+        !_anyTriggerCommittedThisUtterance &&
+        !_guardFailedReplySpokenThisUtterance) {
+      _startAwaitingLateTranscript();
+    }
+  }
+
+  /// Set only while [_maybeResolveByIntent] runs its one chosen evaluator —
+  /// lets that trigger past its phrase check (see [_maybeTriggerDeterministic]).
+  String? _forcedIntentTrigger;
+
+  /// Task B — numbers each utterance (bumped on the same "genuinely new
+  /// utterance" edge that resets every trigger buffer, in
+  /// [_trackSpeechLevel]) so every VOICE PIPELINE line for one spoken
+  /// command can be pulled out of logcat with a single grep.
+  int _utteranceSeq = 0;
+
+  /// When the current open_camera was dispatched (voice match or Gemini
+  /// toolCall) — the start of the end-to-end camera_preview_live timing.
+  DateTime? _openCameraDispatchedAt;
+
+  /// Whether the current speech burst's audio was actually being sent to
+  /// Gemini when it started (outgoing mic not paused for playback) — only
+  /// then can a transcript for it ever arrive, so only then is it worth
+  /// waiting for one. CONFIRMED in a real trace: several "utterances" were
+  /// bursts that began while outgoing audio was paused (the speaker's own
+  /// echo), and never got a transcript.
+  bool _speechBurstReachedGemini = false;
+
+  /// True once [_finalizeUtteranceEndDeterministicTriggers] has run for the
+  /// current utterance — reset on each genuinely new utterance. A transcript
+  /// arriving while this is true (and the technician is silent) arrived
+  /// LATE, after the end-of-utterance routing already ran on an empty
+  /// buffer; see [_scheduleLateTranscriptFinalize].
+  bool _finalizedCurrentUtterance = false;
+
+  /// Speech ended, it reached Gemini, and no transcript has arrived yet.
+  /// Gemini's input transcription routinely lands ~1-2s after the app's own
+  /// silence detection, and CONFIRMED once 17.5s after (with live mic audio
+  /// flowing the whole time — server-side, not app-side, latency). While
+  /// true the UI shows "Thinking..." (see [_applyVoicePhase]).
+  bool _awaitingLateTranscript = false;
+  Timer? _lateTranscriptTimeout;
+  Timer? _lateTranscriptFinalizeTimer;
+
+  /// Longest the app shows "Thinking..." for a transcript that hasn't come,
+  /// before asking the technician to try again. A transcript that still
+  /// arrives after this is handled normally, not ignored.
+  static const Duration _lateTranscriptMaxWait = Duration(seconds: 8);
+
+  /// How long a late transcript must be quiet (no further chunks) before
+  /// end-of-utterance routing re-runs on it.
+  static const Duration _lateTranscriptSettle = Duration(milliseconds: 700);
+
+  void _startAwaitingLateTranscript() {
+    if (_awaitingLateTranscript) return; // keep the first deadline for this utterance
+    _awaitingLateTranscript = true;
+    _pipelineLog(
+      'awaiting_transcript',
+      'speech ended and reached Gemini, but no transcript yet — showing "Thinking..." for up to '
+          '${_lateTranscriptMaxWait.inSeconds}s',
+    );
+    _syncVoicePhase();
+    _lateTranscriptTimeout?.cancel();
+    _lateTranscriptTimeout = Timer(_lateTranscriptMaxWait, () {
+      if (!_awaitingLateTranscript) return;
+      _stopAwaitingLateTranscript('no transcript within ${_lateTranscriptMaxWait.inSeconds}s');
+      if (_anyTriggerCommittedThisUtterance || _guardFailedReplySpokenThisUtterance || _inFlightFunctionCalls > 0) {
+        return;
+      }
+      _pipelineLog(
+        'transcript_timeout',
+        'asking the technician to try again — if the transcript still arrives later it is handled normally',
+      );
+      _respondToUnclearInput(reason: 'transcript_never_arrived');
+    });
+  }
+
+  void _stopAwaitingLateTranscript(String reason) {
+    _lateTranscriptTimeout?.cancel();
+    _lateTranscriptTimeout = null;
+    if (!_awaitingLateTranscript) return;
+    _awaitingLateTranscript = false;
+    _pipelineLog('awaiting_transcript_done', reason);
+    _syncVoicePhase();
+  }
+
+  /// A transcript that arrived after this utterance's end-of-utterance
+  /// routing already ran (on an empty buffer): per-chunk commands have
+  /// already had their chance on it, but the knowledge-base question,
+  /// site-condition note and fuzzy-intent steps only run at utterance end,
+  /// so without this a late question would never be routed at all. Re-runs
+  /// that routing once the late transcript stops growing. Harmless if a
+  /// per-chunk trigger already handled it — every step there checks the
+  /// same "already resolved" flags and stands down.
+  void _scheduleLateTranscriptFinalize() {
+    _lateTranscriptFinalizeTimer?.cancel();
+    _lateTranscriptFinalizeTimer = Timer(_lateTranscriptSettle, () {
+      _lateTranscriptFinalizeTimer = null;
+      if (!mounted || _isSpeaking) return; // still talking — the natural silence edge will finalize it
+      _pipelineLog('late_transcript_finalize', 're-running end-of-utterance routing on the late transcript');
+      _finalizeUtteranceEndDeterministicTriggers();
+    });
+  }
+
+  /// Task B — one line per step of transcript -> matcher -> dispatch ->
+  /// result -> UI/reply, in a fixed `VOICE PIPELINE [u=N] stage: detail`
+  /// shape, so a "correct transcript, no action" reproduction shows exactly
+  /// which step was the last to fire. debugPrint only (no setState), since
+  /// several of these run per transcript chunk.
+  void _pipelineLog(String stage, String detail) => _logNoState('VOICE PIPELINE [u=$_utteranceSeq] $stage: $detail');
+
+  /// Which triggers have claimed the current utterance (fired, debounced,
+  /// or skipped after matching) — the state that decides whether anything
+  /// else may still act on it.
+  List<String> get _resolvedTriggerNamesThisUtterance => [
+    if (_acknowledgePresenceResolvedForCurrentUtterance) 'acknowledge_presence',
+    if (_viewEstimateDetectionResolvedForCurrentUtterance) 'view_estimate',
+    if (_getJobDetailsDetectionResolvedForCurrentUtterance) 'get_job_details',
+    if (_goBackTriggerResolvedForCurrentUtterance) 'go_back',
+    if (_photoDecisionResolvedForCurrentUtterance) 'photo_decision',
+    if (_getCurrentScreenDetectionResolvedForCurrentUtterance) 'get_current_screen',
+    if (_metaCapabilityDetectionResolvedForCurrentUtterance) 'meta_capability',
+    for (final trigger in _deterministicTriggers.values)
+      if (trigger.resolvedForCurrentUtterance) trigger.name,
+  ];
+
+  String get _utteranceStateSummary =>
+      'resolved=[${_resolvedTriggerNamesThisUtterance.join(', ')}] '
+      'alreadyResolvedBySuccess=$_utteranceAlreadyResolvedByTrigger screenTask=${_screenTask.name} '
+      'cameraOpenConfirmed=$_cameraOpenConfirmed inFlightCalls=$_inFlightFunctionCalls';
+
+  /// The voice command registry at dispatch time. Gemini-session dispatch
+  /// never reads it, but its "RAPID SWAP" warning is the suspected link, so
+  /// its contents and the age of its last change are captured anyway, to
+  /// confirm or rule that out from a real log.
+  String _registrySnapshot() {
+    final registry = ref.read(voiceCommandRegistryProvider);
+    final lastChangeAt = ref.read(voiceCommandRegistryProvider.notifier).lastChangeAt;
+    final sinceChange = lastChangeAt == null ? null : DateTime.now().difference(lastChangeAt).inMilliseconds;
+    final swapNote = sinceChange != null && sinceChange < 2000 ? ' *** registry changed <2s ago ***' : '';
+    return 'registry=[${registry.keys.join(', ')}] '
+        'lastRegistryChange=${sinceChange == null ? 'never' : '${sinceChange}ms ago'}$swapNote';
+  }
+
+  /// Wraps each of the six dispatch call sites (unchanged calls, just
+  /// bracketed) with dispatch_start / dispatch_result / dispatch_error and
+  /// a ui_settled line on the next frame, so a command that was matched
+  /// but never visibly acted on shows whether the handler ran, what it
+  /// returned, and whether it threw.
+  Future<Map<String, dynamic>> _pipelineDispatch({
+    required String name,
+    required String source,
+    required Future<Map<String, dynamic>> Function() call,
+  }) async {
+    final startedAt = DateTime.now();
+    if (name == 'open_camera') _openCameraDispatchedAt = startedAt;
+    _pipelineLog('dispatch_start','function=$name source=$source mounted=$mounted $_utteranceStateSummary; ${_registrySnapshot()}');
+    try {
+      final result = await call();
+      final ms = DateTime.now().difference(startedAt).inMilliseconds;
+      _pipelineLog(
+        'dispatch_result',
+        'function=$name after ${ms}ms status=${result['status'] ?? '-'}'
+            '${result.containsKey('error') ? ' ERROR=${result['error']}' : ''} keys=[${result.keys.join(', ')}]',
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _pipelineLog('ui_settled', 'function=$name mounted=$mounted screenTask=${_screenTask.name}');
+      });
+      return result;
+    } catch (e) {
+      final ms = DateTime.now().difference(startedAt).inMilliseconds;
+      _pipelineLog('dispatch_error', 'function=$name after ${ms}ms threw ${_scrubCredentials(e)}');
+      rethrow;
+    }
+  }
+
+  /// Task A — runs `command_intent_matcher.dart` over a FINISHED utterance
+  /// that no existing trigger matched (a paraphrase like "grab a shot of
+  /// that", or a truncated transcript like "foto"), before it would fall
+  /// through to the knowledge-base catch-all:
+  ///  - confident: fires that one trigger through its own evaluator, so its
+  ///    guard/debounce/dispatch/reply are exactly what a phrase match gets;
+  ///  - ambiguous: asks "did you mean A, or B?" instead of guessing;
+  ///  - weak: the existing "not sure what you need" options reply;
+  ///  - none: does nothing — the catch-all handles it exactly as before.
+  void _maybeResolveByIntent() {
+    if (_anyTriggerCommittedThisUtterance || _guardFailedReplySpokenThisUtterance) return;
+    final kbTrigger = _deterministicTriggers['get_kb_answer']!;
+    if (kbTrigger.resolvedForCurrentUtterance || _deterministicTriggers['site_condition']!.resolvedForCurrentUtterance) {
+      return;
+    }
+    final transcript = kbTrigger.buffer.trim();
+    if (transcript.isEmpty) return;
+
+    final decision = classifyCommandIntent(transcript);
+    _log_(decision.describe(transcript));
+    _pipelineLog('intent_layer', '${decision.kind.name}${decision.best == null ? '' : ' best=${decision.best!.trigger}'}');
+    switch (decision.kind) {
+      case IntentDecisionKind.none:
+        return;
+      case IntentDecisionKind.confident:
+        final name = decision.best!.trigger;
+        final evaluate = _buildTriggerEvaluators('')[name];
+        if (evaluate == null) {
+          _log_('FUZZY MATCH: no evaluator registered for "$name" — leaving it to the existing fallback');
+          return;
+        }
+        _forcedIntentTrigger = name;
+        try {
+          evaluate();
+        } finally {
+          _forcedIntentTrigger = null;
+        }
+        // Same post-loop handling [_onInputTranscription] gives a guard
+        // failure (e.g. "the camera's already open").
+        final guardFailedReply = _pendingGuardFailedReply;
+        _pendingGuardFailedReply = null;
+        if (!_anyTriggerCommittedThisUtterance && guardFailedReply != null) {
+          _guardFailedReplySpokenThisUtterance = true;
+          guardFailedReply();
+        }
+      case IntentDecisionKind.ambiguous:
+        _guardFailedReplySpokenThisUtterance = true;
+        _informGeminiToSpeakVerbatim(
+          'Did you mean ${decision.best!.intent.label}, or ${decision.runnerUp!.intent.label}?',
+          reason: 'intent_ambiguous',
+        );
+      case IntentDecisionKind.weak:
+        _guardFailedReplySpokenThisUtterance = true;
+        _respondToUnclearInput(reason: 'intent_weak_match');
+    }
   }
 
   /// PART F item 4 (client-confirmed regression, twice over: "Is today
@@ -3752,6 +6167,20 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// "okay"/"thanks" gets a silent, unmuted resume instead of an
   /// unnecessary KB round-trip and boundary decline.
   void _maybeFallBackToKbAnswerCatchAll() {
+    // ISSUE 1(a) — see [_utteranceEndDetectedAt]'s doc comment: logs how
+    // long THIS decision itself took from the moment the utterance was
+    // detected as over, at every return point below, so the next real log
+    // can directly confirm this branch is near-instant rather than
+    // inferring it from the absence of a bug report.
+    void logDecision(String outcome) {
+      final startedAt = _utteranceEndDetectedAt;
+      final elapsedMs = startedAt == null ? null : DateTime.now().difference(startedAt).inMicroseconds / 1000.0;
+      _log_(
+        'KB CATCH-ALL: routing decision made in ${elapsedMs == null ? '?' : elapsedMs.toStringAsFixed(2)}ms — '
+        '$outcome',
+      );
+    }
+
     // PART G item 1 — see [_utteranceAlreadyResolvedByTrigger]'s doc
     // comment: some OTHER trigger already resolved this utterance for real
     // (possibly several chunks ago, after which
@@ -3760,14 +6189,17 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // follow-up request could still be detected) — never treat that as
     // "nothing matched" and speak a second, wrong response over it.
     if (_utteranceAlreadyResolvedByTrigger) {
+      logDecision('already resolved by another trigger — nothing to route');
       _clearPreemptiveDefaultMuteSilently('utterance already resolved by another trigger');
       return;
     }
     final kbTrigger = _deterministicTriggers['get_kb_answer']!;
     final siteConditionTrigger = _deterministicTriggers['site_condition']!;
     if (_otherSpecificTriggerAlreadyResolvedThisUtterance ||
+        _guardFailedReplySpokenThisUtterance ||
         kbTrigger.resolvedForCurrentUtterance ||
         siteConditionTrigger.resolvedForCurrentUtterance) {
+      logDecision('a specific trigger already owns this utterance — nothing to route');
       return;
     }
     final transcript = kbTrigger.buffer.trim();
@@ -3778,7 +6210,40 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           'asking the KB.',
         );
       }
+      logDecision('filler or empty transcript — not asking the KB');
       _clearPreemptiveDefaultMuteSilently('KB catch-all found nothing worth asking about');
+      return;
+    }
+    // Clearly conversational — not a question the KB could ever answer
+    // (CONFIRMED: "No, this provision looks good" took a 13.2s KB round trip
+    // to come back "not available", then a boundary decline 15.4s after the
+    // technician stopped talking). Positive evidence only: anything with a
+    // question, request or problem word stays on the KB path below exactly
+    // as before — see `conversational_utterance.dart`.
+    switch (classifySmallTalk(transcript)) {
+      case SmallTalkKind.greeting:
+        logDecision('"$transcript" is a greeting — same reply as "hello", not the KB');
+        _pipelineLog('conversational_reply', 'greeting "$transcript" -> acknowledge_presence');
+        _maybeTriggerAcknowledgePresence('hello');
+        return;
+      case SmallTalkKind.reaction:
+        logDecision('"$transcript" is a conversational reaction — replying directly, not the KB');
+        _pipelineLog('conversational_reply', 'reaction "$transcript" -> in-character acknowledgment');
+        _guardFailedReplySpokenThisUtterance = true;
+        _informGeminiToSpeakVerbatim(_conversationalReplyForCurrentState(), reason: 'conversational_reaction');
+        return;
+      case SmallTalkKind.none:
+        break;
+    }
+    // The recognizer drifted into another language (Spanish in a real
+    // trace) and it isn't recognizable small talk: the English-only KB
+    // can't answer it either — ask for a repeat now, the same way
+    // non-Latin-script text already is, rather than after a KB round trip.
+    if (_looksLikeNonEnglishLatinTranscription(transcript)) {
+      logDecision('"$transcript" looks like a non-English transcription — asking for a repeat, not the KB');
+      _pipelineLog('conversational_reply', 'non-English transcription "$transcript" -> ask to repeat');
+      _guardFailedReplySpokenThisUtterance = true;
+      _respondToUnclearInput(reason: 'non_english_transcription');
       return;
     }
     kbTrigger.resolvedForCurrentUtterance = true;
@@ -3796,7 +6261,22 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // actually arrives.
     _preemptiveDefaultMuteSafetyTimer?.cancel();
     _preemptiveDefaultMuteSafetyTimer = null;
+    logDecision('routing "$transcript" to get_kb_answer as a last resort');
     _log_('KB CATCH-ALL: nothing else matched this utterance — routing "$transcript" to get_kb_answer as a last resort.');
+    // ISSUE 1(b) — see [_kbAnswerWaitSafetyTimer]'s doc comment: a separate,
+    // longer, purely-diagnostic ceiling on top of
+    // [_armPreemptiveDefaultMuteSafetyTimer]'s own indefinite defer-while-
+    // in-flight behavior, so a genuinely stuck backend call is at least
+    // visible in the log instead of silently waiting forever with no trace.
+    _kbAnswerWaitSafetyTimer?.cancel();
+    _kbAnswerWaitSafetyTimer = Timer(_kbAnswerWaitSafetyDelay, () {
+      if (!_preemptiveDefaultMuteActive) return; // already resolved for real
+      _log_(
+        'KB CATCH-ALL: still waiting on the real get_kb_answer response after '
+        '${_kbAnswerWaitSafetyDelay.inSeconds}s — NOT speaking a fallback message (that would risk the exact '
+        'wrong-message bug Issue 1 fixed); continuing to wait for the real answer.',
+      );
+    });
     unawaited(
       _executeDeterministic(
         kbTrigger,
@@ -3847,6 +6327,39 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // utterance is done.
     if (_utteranceAlreadyResolvedByTrigger) return;
     if (_preemptiveDefaultMuteActive) return; // already muted this utterance
+    // P0 FIX — see [_protectedConfirmationActive]'s doc comment: an
+    // incidental utterance that hasn't resolved into anything yet must not
+    // get the usual unconditional head-start mute while a protected
+    // confirmation's audio is expected imminently — a GENUINE resolved
+    // command still interrupts normally through its own trigger-specific
+    // call once it actually matches later in [_onInputTranscription]; only
+    // this blind preemptive step is skipped.
+    if (_protectedConfirmationActive) {
+      _log_(
+        'PROTECTED CONFIRMATION: suppressing the usual preemptive mute for an incidental, not-yet-resolved '
+        'utterance during the post-confirmation grace window — a genuine command will still interrupt normally '
+        'once it actually matches.',
+      );
+      return;
+    }
+    // BUG 4 FIX — see [_trackSpeechLevel]'s own doc comment on the block
+    // this moved out of. This is the moment REAL transcript text proves a
+    // genuinely new utterance has started (this method only ever reaches
+    // here once per utterance — see the two guards just above), unlike the
+    // raw-amplitude edge in [_trackSpeechLevel], which fires on background
+    // noise alone with no transcript at all. Any PCM chunk still queued
+    // from the previous utterance's reinit is stale by now (that reinit
+    // normally completes and flushes well within the debounce a genuinely
+    // new utterance requires) UNLESS it's a still-wanted response the app
+    // itself is waiting to play — which is exactly what discarding it here,
+    // instead of on a bare noise blip, protects.
+    if (_pendingPcmChunksAwaitingReinit.isNotEmpty) {
+      _log_(
+        'PCM QUEUE: discarding ${_pendingPcmChunksAwaitingReinit.length} queued response chunk(s) — a new '
+        'utterance with real transcript text just started.',
+      );
+      _pendingPcmChunksAwaitingReinit.clear();
+    }
     _log_(
       'PREEMPTIVE MUTE: first chunk of a new utterance — muting Gemini\'s audio immediately and '
       'unconditionally, before any trigger-specific logic (including acknowledge_presence/meta_capability) runs.',
@@ -3855,6 +6368,227 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _interruptGeminiForDeterministicTrigger('preemptive_default_mute');
     _preemptiveDefaultMuteActive = true;
   }
+
+  /// P0 FIX (CONFIRMED in a real session: "I'm not able to take photos,
+  /// but" played for ~500ms before open_camera's own "Camera's open" line).
+  /// [_muteImmediatelyOnFirstChunkOfUtterance] only runs on the first
+  /// INPUT TRANSCRIPTION chunk, but Gemini answers the raw mic audio and its
+  /// first response audio can arrive before that transcription does. So
+  /// from the speech-onset edge in [_trackSpeechLevel] until the first
+  /// transcript chunk (or [_awaitingFirstTranscriptTimeout], for a noise
+  /// blip that never transcribes), [_onResponseAudioChunk] drops any
+  /// response audio we didn't ask for — the same audio the preemptive mute
+  /// would cut off a moment later anyway, just without the audible head
+  /// start. Lines we scripted ([_scriptedResponsePending]), a protected
+  /// confirmation, and a pending-call filler are never held.
+  bool _awaitingFirstTranscriptOfUtterance = false;
+  Timer? _awaitingFirstTranscriptTimer;
+  static const Duration _awaitingFirstTranscriptTimeout = Duration(milliseconds: 2500);
+
+  /// Set when [_informGeminiToSpeakVerbatim] asks for a line, cleared on
+  /// the next `turnComplete` — see [_awaitingFirstTranscriptOfUtterance].
+  bool _scriptedResponsePending = false;
+
+  /// TURN-IDENTITY GATE (P0, CONFIRMED twice on "I want to take photo", and
+  /// on screen recording ~0:27: "I understand you want" / "Go ahead! What
+  /// are" played and got cut off mid-word right before "Camera's open").
+  ///
+  /// WHY IDENTITY AND NOT TIMING: when [_informGeminiToSpeakVerbatim] sends
+  /// "say exactly X", Gemini may ALREADY be generating its own free-text
+  /// turn from the raw utterance. That stale turn's first chunk can reach
+  /// us 150–200ms AFTER our send, so "arrived after the interrupt" does not
+  /// mean "generated after the interrupt" — and every timing-based unmute
+  /// (the 150ms idle safety timeout, the one-shot per-utterance interrupt)
+  /// is a guess that loses exactly that race. The client can't see when the
+  /// server generated a chunk, but it CAN see what the turn says: the
+  /// scripted turn's output transcription matches X, and a stale turn's
+  /// doesn't. So from the send until a turn is identified, response chunks
+  /// are HELD, not played. A matching transcript flushes them, and a
+  /// mismatching one — or the server's `interrupted` for that turn, which
+  /// only a turn cut off by our clientContent gets — discards them.
+  ///
+  /// Normalized words of the scripted line we're waiting for, or `null`
+  /// when no scripted line is pending identification.
+  List<String>? _awaitingScriptedTurnWords;
+
+  /// The turn currently arriving was identified as NOT the scripted one —
+  /// drop its chunks until its turn boundary.
+  bool _currentTurnKnownStale = false;
+  String _scriptIdentityCandidateText = '';
+  final List<({Uint8List bytes, String? mimeType})> _heldUnidentifiedTurnChunks = [];
+  Timer? _scriptIdentityTimer;
+
+  /// Held-but-unidentified chunks are released after this long without an
+  /// identifying transcript — better a rare stale fragment than silently
+  /// losing the real confirmation if transcription never arrives.
+  static const Duration _scriptIdentityHoldTimeout = Duration(milliseconds: 2500);
+
+  /// Gives up waiting if Gemini never starts ANY turn for the scripted line
+  /// (nothing is held, so nothing is at risk — this only stops the pill
+  /// showing "Thinking..." forever).
+  static const Duration _scriptIdentityAbandonTimeout = Duration(seconds: 15);
+
+  static const double _scriptIdentityMatchRatio = 0.6;
+
+  void _beginAwaitingScriptedTurn(String text) {
+    _awaitingScriptedTurnWords = _normalizeForEchoCompare(text).split(' ').where((w) => w.isNotEmpty).toList();
+    _currentTurnKnownStale = false;
+    _scriptIdentityCandidateText = '';
+    _heldUnidentifiedTurnChunks.clear();
+    _armScriptIdentityTimer(_scriptIdentityAbandonTimeout);
+    _syncVoicePhase();
+  }
+
+  void _armScriptIdentityTimer(Duration delay) {
+    _scriptIdentityTimer?.cancel();
+    _scriptIdentityTimer = Timer(delay, () {
+      if (_awaitingScriptedTurnWords == null) return;
+      _resolveScriptedTurn(play: true, reason: 'no identifying transcript within ${delay.inMilliseconds}ms');
+    });
+  }
+
+  /// Ends the wait. [play] flushes held chunks back through
+  /// [_onResponseAudioChunk] (every OTHER gate still applies to them);
+  /// otherwise they're discarded.
+  void _resolveScriptedTurn({required bool play, required String reason}) {
+    _scriptIdentityTimer?.cancel();
+    _scriptIdentityTimer = null;
+    final held = List.of(_heldUnidentifiedTurnChunks);
+    _heldUnidentifiedTurnChunks.clear();
+    _awaitingScriptedTurnWords = null;
+    _currentTurnKnownStale = false;
+    _scriptIdentityCandidateText = '';
+    _log_('TURN IDENTITY: resolved ($reason) — ${play ? 'playing' : 'discarding'} ${held.length} held chunk(s)');
+    if (play) {
+      // This turn is the one we asked for, so whatever stale turn the
+      // deterministic suppression was guarding against is already behind it.
+      _clearDeterministicAudioSuppression('scripted turn identified ($reason)');
+      for (final chunk in held) {
+        _onResponseAudioChunk(chunk.bytes, mimeType: chunk.mimeType);
+      }
+    }
+    _syncVoicePhase();
+  }
+
+  /// Called for every output-transcription fragment BEFORE the audits, so
+  /// they see this turn's audibility correctly.
+  void _classifyTurnAgainstScript(String fragment) {
+    final script = _awaitingScriptedTurnWords;
+    if (script == null || _currentTurnKnownStale) return;
+    _scriptIdentityCandidateText = '$_scriptIdentityCandidateText $fragment'.trim();
+    final words = _normalizeForEchoCompare(_scriptIdentityCandidateText).split(' ').where((w) => w.isNotEmpty).toList();
+    if (words.length < 2) return; // too little to judge yet
+    final scriptWords = script.toSet();
+    final ratio = words.where(scriptWords.contains).length / words.length;
+    if (ratio >= _scriptIdentityMatchRatio) {
+      _resolveScriptedTurn(play: true, reason: 'transcript "$_scriptIdentityCandidateText" matches the script');
+      return;
+    }
+    _currentTurnKnownStale = true;
+    _log_(
+      'TURN IDENTITY: STALE TURN — "$_scriptIdentityCandidateText" is not the scripted line; discarding '
+      '${_heldUnidentifiedTurnChunks.length} held chunk(s) and dropping the rest of this turn.',
+    );
+    _heldUnidentifiedTurnChunks.clear();
+  }
+
+  /// A server turn boundary while waiting for the scripted turn.
+  void _onTurnBoundaryWhileAwaitingScript({required bool interrupted}) {
+    if (_awaitingScriptedTurnWords == null) return;
+    if (_currentTurnKnownStale || interrupted) {
+      // Stale turn over (an `interrupted` turn is one our clientContent cut
+      // off). Keep waiting — the scripted turn comes next.
+      if (_heldUnidentifiedTurnChunks.isNotEmpty) {
+        _log_('TURN IDENTITY: discarding ${_heldUnidentifiedTurnChunks.length} held chunk(s) from a turn the server interrupted.');
+      }
+      _heldUnidentifiedTurnChunks.clear();
+      _currentTurnKnownStale = false;
+      _scriptIdentityCandidateText = '';
+      _armScriptIdentityTimer(_scriptIdentityAbandonTimeout);
+      return;
+    }
+    if (_heldUnidentifiedTurnChunks.isNotEmpty) {
+      // Completed naturally with no identifying transcript yet — play it
+      // rather than risk losing the real confirmation.
+      _resolveScriptedTurn(play: true, reason: 'turn completed before its transcript arrived');
+    }
+  }
+
+  /// Single source of truth for the voice pill's phase. Busy
+  /// ("Thinking...") is tied to the real in-flight work — a dispatch
+  /// ([_inFlightFunctionCalls]) or a scripted turn we're still waiting on —
+  /// instead of dropping back to listening the moment the mic resumes while
+  /// that work is still running.
+  ///
+  /// `listening` (the pill's green level bars) must mean exactly "mic audio
+  /// is being sent to Gemini right now" — the same gates [_onMicChunk]
+  /// applies before its `MIC SEND` lines: [_outgoingAudioPaused] (paused
+  /// while Gemini's own audio plays, so the mic can't hear the speaker) and
+  /// [_cameraNativeCallInProgress] (the camera hard-pause). Keying the pill
+  /// off generic audio activity instead would light "listening" while the
+  /// assistant itself was talking.
+  ///
+  /// Coalesced to one update per microtask — still before the next frame,
+  /// so no visible lag — so a transient in-between state inside one
+  /// synchronous step (e.g. a dispatch ending immediately before its
+  /// scripted reply is requested) can't flash on the pill.
+  void _syncVoicePhase() {
+    if (_voicePhaseSyncScheduled) return;
+    _voicePhaseSyncScheduled = true;
+    scheduleMicrotask(() {
+      _voicePhaseSyncScheduled = false;
+      _applyVoicePhase();
+    });
+  }
+
+  bool _voicePhaseSyncScheduled = false;
+
+  void _applyVoicePhase() {
+    final VoicePhase phase;
+    if (_outgoingAudioPaused) {
+      phase = VoicePhase.speaking;
+    } else if (_cameraNativeCallInProgress ||
+        _inFlightFunctionCalls > 0 ||
+        _awaitingScriptedTurnWords != null ||
+        _awaitingLateTranscript) {
+      phase = VoicePhase.processing;
+    } else {
+      phase = VoicePhase.listening;
+    }
+    _pausedVoiceService?.setExternalSessionPhase(phase);
+  }
+
+  void _beginAwaitingFirstTranscript() {
+    _awaitingFirstTranscriptOfUtterance = true;
+    _awaitingFirstTranscriptTimer?.cancel();
+    _awaitingFirstTranscriptTimer = Timer(_awaitingFirstTranscriptTimeout, () {
+      _endAwaitingFirstTranscript('no transcript within ${_awaitingFirstTranscriptTimeout.inMilliseconds}ms');
+    });
+  }
+
+  void _endAwaitingFirstTranscript(String reason) {
+    _awaitingFirstTranscriptTimer?.cancel();
+    _awaitingFirstTranscriptTimer = null;
+    if (!_awaitingFirstTranscriptOfUtterance) return;
+    _awaitingFirstTranscriptOfUtterance = false;
+    debugPrint('UNCLASSIFIED UTTERANCE HOLD: released ($reason) at ${DateTime.now()}');
+  }
+
+  /// The same gates [_onResponseAudioChunk] checks first, in the same
+  /// order — true while any response audio arriving now would be dropped
+  /// rather than played.
+  bool get _responseAudioCurrentlyDropped =>
+      (_cameraNativeCallInProgress && !_fillerPassthroughActive) ||
+      _awaitingScriptedTurnWords != null ||
+      _holdingForUnclassifiedUtterance ||
+      _suppressResponseAudioForDeterministic ||
+      _preemptiveDefaultMuteActive;
+
+  bool get _holdingForUnclassifiedUtterance =>
+      _awaitingFirstTranscriptOfUtterance &&
+      !_scriptedResponsePending &&
+      !_protectedConfirmationActive &&
+      !_fillerPassthroughActive;
 
   /// PART I item 1 — see [_muteImmediatelyOnFirstChunkOfUtterance]'s doc
   /// comment: that method now does the actual muting, unconditionally, on
@@ -3867,21 +6601,99 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   void _maybeArmPreemptiveMuteSafetyTimeout() {
     if (_utteranceAlreadyResolvedByTrigger) return;
     if (_otherSpecificTriggerAlreadyResolvedThisUtterance) return; // already matched something known
+    if (_guardFailedReplySpokenThisUtterance) return; // a guard-failed clarification already answered it
     if (_deterministicTriggers['site_condition']!.resolvedForCurrentUtterance) return;
     if (_preemptiveDefaultMuteSafetyTimer != null) return; // already armed for this utterance
     _log_(
       'PREEMPTIVE DEFAULT MUTE: nothing matches a known command pattern yet — arming the '
       '${_preemptiveDefaultMuteSafetyDelay.inSeconds}s safety-net timeout.',
     );
+    _armPreemptiveDefaultMuteSafetyTimer();
+  }
+
+  /// ISSUE 3(b) (CONFIRMED via f5a8bd8b-flutter_run_log.txt): same fix as
+  /// [_armSuppressResponseAudioSafetyTimer], applied to this timer's own
+  /// "nothing matched, speak the retry decline" path — a real dispatch
+  /// genuinely being slow (get_kb_answer's catch-all round trip, observed
+  /// taking 17.7s end to end) is not the same thing as "nothing was ever
+  /// going to resolve this," and must not get the same canned retry line
+  /// spoken over it once it finally does resolve. Checks
+  /// [_inFlightFunctionCalls] before actually declining: while something is
+  /// genuinely in flight, defers by re-arming itself instead, so only a
+  /// real "nothing was even dispatched" STT/no-match failure ever reaches
+  /// the decline.
+  void _armPreemptiveDefaultMuteSafetyTimer() {
     _preemptiveDefaultMuteSafetyTimer = Timer(_preemptiveDefaultMuteSafetyDelay, () {
       if (!_preemptiveDefaultMuteActive) return;
+      // ISSUE 1(a) fix (CONFIRMED via fbd877f0-flutter_run_log.txt: "Can you
+      // tell me the president name of India?" — an 8-word question — was
+      // still being SPOKEN when this fixed 2s timer, armed from the
+      // utterance's first chunk, expired; the KB catch-all can only make
+      // its routing decision once silence is actually detected (see
+      // [_finalizeUtteranceEndDeterministicTriggers]/[_utteranceEndDetectedAt]),
+      // so firing while the technician is still genuinely mid-sentence
+      // speaks the wrong "didn't catch that" line over a request that
+      // hasn't even finished being asked yet). Defers instead of declining
+      // while [_isSpeaking] is true — the same raw-amplitude signal
+      // [_trackSpeechLevel] itself uses to decide the utterance isn't over.
+      if (_isSpeaking) {
+        _log_(
+          'PREEMPTIVE DEFAULT MUTE: safety timeout (${_preemptiveDefaultMuteSafetyDelay.inSeconds}s) reached but '
+          'the technician is still actively speaking — deferring the retry decline until the utterance actually '
+          'ends; checking again in another ${_preemptiveDefaultMuteSafetyDelay.inSeconds}s.',
+        );
+        _armPreemptiveDefaultMuteSafetyTimer();
+        return;
+      }
+      if (_inFlightFunctionCalls > 0) {
+        _log_(
+          'PREEMPTIVE DEFAULT MUTE: safety timeout (${_preemptiveDefaultMuteSafetyDelay.inSeconds}s) reached but '
+          '$_inFlightFunctionCalls function call(s) still genuinely in flight (e.g. a KB lookup) — deferring the '
+          'retry decline instead of speaking it over a real dispatch; checking again in another '
+          '${_preemptiveDefaultMuteSafetyDelay.inSeconds}s.',
+        );
+        _armPreemptiveDefaultMuteSafetyTimer();
+        return;
+      }
       _log_(
         'PREEMPTIVE DEFAULT MUTE: safety timeout (${_preemptiveDefaultMuteSafetyDelay.inSeconds}s) — nothing '
-        'ever resolved this, not even a KB catch-all dispatch — inviting a retry as a last resort so the '
-        'session doesn\'t stay silently muted.',
+        'ever resolved this, not even a KB catch-all dispatch, and nothing genuinely in flight either — inviting '
+        'a retry as a last resort so the session doesn\'t stay silently muted.',
       );
-      _informGeminiToSpeakVerbatim(_unrecognizedUtteranceRetryText, reason: 'preemptive_default_mute_timeout');
+      _respondToUnclearInput(reason: 'preemptive_default_mute_timeout');
     });
+  }
+
+  /// Consecutive unclear-input fallbacks within [_unclearInputStreakWindow]
+  /// — reset by any real trigger resolution (see
+  /// [_clearAllTriggerBuffersAfterSuccess]) or by the window lapsing.
+  int _unclearInputStreak = 0;
+  DateTime? _lastUnclearInputAt;
+  static const Duration _unclearInputStreakWindow = Duration(seconds: 40);
+  static const String _unclearInputShortReply = 'Sorry, still not catching that.';
+
+  /// P1 FIX (CONFIRMED: a run of unclear inputs — bad pickup, echo, noise —
+  /// got a near-identical full "I didn't catch that, try again" line every
+  /// single time, which reads as the app being stuck in a loop). Escalates
+  /// instead: the 1st gets the full state-aware reply, the 2nd a distinctly
+  /// shorter line, and from the 3rd on nothing is said (the on-screen UI
+  /// still shows state) — Gemini's own stale free-text answer is still cut
+  /// off, so going quiet never means Gemini fills the silence itself.
+  void _respondToUnclearInput({required String reason}) {
+    final now = DateTime.now();
+    final last = _lastUnclearInputAt;
+    if (last == null || now.difference(last) > _unclearInputStreakWindow) _unclearInputStreak = 0;
+    _lastUnclearInputAt = now;
+    _unclearInputStreak++;
+    if (_unclearInputStreak == 1) {
+      _informGeminiToSpeakVerbatim(_unrecognizedReplyForCurrentState(), reason: reason);
+    } else if (_unclearInputStreak == 2) {
+      _log_('UNCLEAR INPUT: 2nd in a row — short reply instead of repeating the full line ($reason)');
+      _informGeminiToSpeakVerbatim(_unclearInputShortReply, reason: reason);
+    } else {
+      _log_('UNCLEAR INPUT: $_unclearInputStreak in a row — staying quiet ($reason)');
+      _interruptGeminiForDeterministicTrigger('unclear_input_quiet');
+    }
   }
 
   /// See [_preemptiveDefaultMuteActive]'s doc comment — clears it WITHOUT
@@ -3923,10 +6735,18 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// multi-word phrase), so a false positive here only costs an extra
   /// NON_BLOCKING navigation call, never a write.
   bool _looksLikeViewEstimateRequest(String text) {
-    final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ');
-    final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
-    final padded = ' ${words.join(' ')} ';
-    if (_viewEstimateIndicatorPhrases.any((phrase) => padded.contains(' $phrase '))) return true;
+    // P0 FIX — the same literal-substring brittleness [_TranscriptTrigger.matches]
+    // documents. Routed through the same shared matcher so word-form drift, one
+    // inserted filler word, and the negation veto behave identically for the
+    // hand-rolled triggers and the [_deterministicTriggers] map alike.
+    final padded = stemmedPaddedTriggerText(text);
+    final phraseMatch = matchAnyTriggerPhrase(text, _viewEstimateIndicatorPhrases);
+    if (phraseMatch != null) {
+      if (!phraseMatch.exact) {
+        debugPrint('FUZZY TRIGGER MATCH [view_estimate]: ${phraseMatch.describe()} matched in "$text"');
+      }
+      return true;
+    }
     // PART G item 2 / PART L item 1 — see [_looksLikeNounPlusActionIntent]'s
     // doc comment.
     return _looksLikeNounPlusActionIntent(
@@ -3950,7 +6770,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// next is a genuinely NEW request. Called from every point in this file
   /// a function call succeeds, in addition to (not instead of) the
   /// silence-based reset in [_trackSpeechLevel].
-  void _clearAllTriggerBuffersAfterSuccess(String reason) {
+  void _clearAllTriggerBuffersAfterSuccess(String reason, {bool endsUnclearInputStreak = true}) {
     _goBackIntentDetectionBuffer = '';
     _goBackTriggerResolvedForCurrentUtterance = false;
     _viewEstimateDetectionBuffer = '';
@@ -3982,12 +6802,19 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // method runs) closes the race unconditionally, at the exact moment a
     // real resolution is known to exist.
     _utteranceAlreadyResolvedByTrigger = true;
+    // A real resolution ends any unclear-input streak — see [_respondToUnclearInput].
+    if (endsUnclearInputStreak) _unclearInputStreak = 0;
     if (_preemptiveDefaultMuteActive) {
       _log_('PREEMPTIVE DEFAULT MUTE: cleared — "$reason" resolved this utterance for real.');
     }
     _preemptiveDefaultMuteActive = false;
     _preemptiveDefaultMuteSafetyTimer?.cancel();
     _preemptiveDefaultMuteSafetyTimer = null;
+    // ISSUE 1(b) — a real resolution just happened (this method's whole
+    // purpose), so any pending KB-wait diagnostic ceiling for THIS
+    // utterance is no longer relevant.
+    _kbAnswerWaitSafetyTimer?.cancel();
+    _kbAnswerWaitSafetyTimer = null;
     _log_('trigger buffers cleared (function call succeeded: $reason)');
   }
 
@@ -4000,16 +6827,29 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// [_viewEstimateDebounce]. Resolves at most once per utterance — see
   /// [_viewEstimateDetectionResolvedForCurrentUtterance].
   void _maybeTriggerViewEstimate(String textChunk) {
+    // P0 FIX — see [_maybeTriggerDeterministic]'s matching guard/doc
+    // comment: the same hard "one trigger per utterance" rule, applied
+    // here since this predates and isn't routed through that shared
+    // engine.
+    if (_utteranceAlreadyResolvedByTrigger) return;
     if (_viewEstimateDetectionResolvedForCurrentUtterance) return;
     _viewEstimateDetectionBuffer = '$_viewEstimateDetectionBuffer $textChunk'.trim();
 
-    if (!_looksLikeViewEstimateRequest(_viewEstimateDetectionBuffer)) return;
+    // See the same check in [_maybeTriggerDeterministic].
+    if (_forcedIntentTrigger != 'view_estimate' && !_looksLikeViewEstimateRequest(_viewEstimateDetectionBuffer)) {
+      return;
+    }
 
     final transcript = _viewEstimateDetectionBuffer;
     final now = DateTime.now();
     final lastActivity = _lastViewEstimateActivityAt;
     if (lastActivity != null && now.difference(lastActivity) < _viewEstimateDebounce) {
       _viewEstimateDetectionResolvedForCurrentUtterance = true;
+      _pipelineLog(
+        'matched_not_fired',
+        'trigger=view_estimate reason=debounce (ran ${now.difference(lastActivity).inMilliseconds}ms ago — assumes it '
+            'is already being handled)',
+      );
       _log_(
         'DETERMINISTIC VIEW ESTIMATE TRIGGER: pattern matched ("$transcript") but view_estimate ran '
         '${now.difference(lastActivity).inMilliseconds}ms ago (within the ${_viewEstimateDebounce.inSeconds}s '
@@ -4063,15 +6903,21 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// the same "don't let an unprompted go_back immediately pop it back off"
   /// protection applies regardless of which path opened it.
   Future<void> _executeDeterministicViewEstimate({required String jobId}) async {
+    // ISSUE 2 — see [_dispatchGenerationCounter]'s doc comment.
+    final myDispatchGeneration = _beginNewDispatchGeneration();
     Map<String, dynamic> result;
     _beginFunctionCallInFlight('deterministic view_estimate');
     try {
-      result = await dispatchGeminiFunctionCall(
-        ref: ref,
-        cameraSession: _cameraSession,
-        navigationSession: _navigationSession,
+      result = await _pipelineDispatch(
         name: 'view_estimate',
-        args: {'job_id': jobId},
+        source: 'deterministic',
+        call: () => dispatchGeminiFunctionCall(
+          ref: ref,
+          cameraSession: _cameraSession,
+          navigationSession: _navigationSession,
+          name: 'view_estimate',
+          args: {'job_id': jobId},
+        ),
       );
     } catch (e, stackTrace) {
       debugPrint('GEMINI DETERMINISTIC TRIGGER ERROR (view_estimate): $e\n$stackTrace');
@@ -4084,12 +6930,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _log_('DETERMINISTIC VIEW ESTIMATE TRIGGER: view_estimate succeeded: $result');
     debugPrint('GEMINI DETERMINISTIC TRIGGER: view_estimate succeeded');
     _clearAllTriggerBuffersAfterSuccess('deterministic view_estimate');
+    _recordDispatchSucceeded(myDispatchGeneration, 'view_estimate');
     _updateScreenTaskForToolCall('view_estimate', result);
 
-    _lastViewFunctionSucceededAt = DateTime.now();
-    _intentionalGoBackHeardSinceLastView = false;
-    _currentViewScreenName = 'view_estimate';
+    if (_viewResultNavigated(result)) {
+      _lastViewFunctionSucceededAt = DateTime.now();
+      _intentionalGoBackHeardSinceLastView = false;
+      _currentViewScreenName = 'view_estimate';
+    }
 
+    if (_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: 'view_estimate')) return;
     _informGeminiOfDeterministicViewEstimate(result: result);
   }
 
@@ -4099,8 +6949,47 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// since the navigation (and the data lookup) already happened whether or
   /// not Gemini itself decided to call view_estimate.
   void _informGeminiOfDeterministicViewEstimate({required Map<String, dynamic> result}) {
-    _informGeminiToSpeakVerbatim(_buildViewEstimateSpokenText(result), reason: 'deterministic view_estimate');
+    final text = result['status'] == 'already_on_screen'
+        ? _alreadyOnScreenSpokenText('view_estimate')
+        : _buildViewEstimateSpokenText(result);
+    _informGeminiToSpeakVerbatim(text, reason: 'deterministic view_estimate');
   }
+
+  /// The dispatcher's view_* no-op guard (`_pushUnlessAlreadyOnTop` in
+  /// `gemini_function_dispatcher.dart`) returns `already_on_screen` instead
+  /// of stacking a duplicate — say so plainly rather than "the invoice is
+  /// up", which would read as though it just navigated again.
+  String _alreadyOnScreenSpokenText(String name) {
+    final label = switch (name) {
+      'view_estimate' => 'the estimate',
+      'view_change_orders' => 'the change orders',
+      'view_invoice' => 'the invoice',
+      'view_job_history' => 'the job history',
+      _ => 'that screen',
+    };
+    return "We're already on $label.";
+  }
+
+  /// See the repeat check at the top of [_informGeminiToSpeakVerbatim].
+  ({String text, DateTime at})? _lastNoChangeStatusLine;
+  static const Duration _noChangeRepeatWindow = Duration(seconds: 10);
+  static const String _noChangeRepeatAck = 'Yep, still there.';
+
+  /// Lines that report "nothing changed" rather than an action taken:
+  /// [_alreadyOnScreenSpokenText], go_back's already-home reply, and
+  /// get_current_screen's answers ([_describeCurrentScreen]).
+  bool _isNoChangeStatusLine(String text) =>
+      text.startsWith("We're already on ") ||
+      text == "You're already on the job details screen." ||
+      text.startsWith("You're currently on ") ||
+      text == "You're on the main job details screen.";
+
+  /// Whether a view_* result actually put a new screen on top — `false` for
+  /// an error or the dispatcher's `already_on_screen` no-op, neither of
+  /// which should re-arm the go_back cooldown (re-arming it on a redundant
+  /// fire is part of what made "go back" look like it did nothing).
+  bool _viewResultNavigated(Map<String, dynamic> result) =>
+      !result.containsKey('error') && result['status'] != 'already_on_screen';
 
   /// CONFIRMED ghost-call bug: broad, NOT exact-phrase, whole-word/phrase
   /// pattern match for "the technician wants to know about this job" — same
@@ -4108,16 +6997,23 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// false positive here only costs an extra read-only lookup + an
   /// informational clientContent message, never a write.
   bool _looksLikeGetJobDetailsRequest(String text) {
-    final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ');
-    final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
-    final padded = ' ${words.join(' ')} ';
-    return _getJobDetailsIndicatorPhrases.any((phrase) => padded.contains(' $phrase '));
+    // P0 FIX — see [_TranscriptTrigger.matches]'s doc comment: shared
+    // stem/filler/negation-aware matching instead of a literal substring check.
+    final phraseMatch = matchAnyTriggerPhrase(text, _getJobDetailsIndicatorPhrases);
+    if (phraseMatch == null) return false;
+    if (!phraseMatch.exact) {
+      debugPrint('FUZZY TRIGGER MATCH [get_job_details]: ${phraseMatch.describe()} matched in "$text"');
+    }
+    return true;
   }
 
   /// Called from [_onInputTranscription] on EVERY transcript chunk — same
   /// accumulate/resolve/debounce shape as [_maybeTriggerViewEstimate], just
   /// applied to [_getJobDetailsIndicatorPhrases]/[_getJobDetailsDebounce].
   void _maybeTriggerGetJobDetails(String textChunk) {
+    // P0 FIX — see [_maybeTriggerDeterministic]'s matching guard/doc
+    // comment.
+    if (_utteranceAlreadyResolvedByTrigger) return;
     if (_getJobDetailsDetectionResolvedForCurrentUtterance) return;
     _getJobDetailsDetectionBuffer = '$_getJobDetailsDetectionBuffer $textChunk'.trim();
 
@@ -4168,15 +7064,21 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// pure data lookup with no screen to navigate to, so there's no
   /// `_updateScreenTaskForToolCall`/go-back-cooldown bookkeeping here.
   Future<void> _executeDeterministicGetJobDetails({required String jobId}) async {
+    // ISSUE 2 — see [_dispatchGenerationCounter]'s doc comment.
+    final myDispatchGeneration = _beginNewDispatchGeneration();
     Map<String, dynamic> result;
     _beginFunctionCallInFlight('deterministic get_job_details');
     try {
-      result = await dispatchGeminiFunctionCall(
-        ref: ref,
-        cameraSession: _cameraSession,
-        navigationSession: _navigationSession,
+      result = await _pipelineDispatch(
         name: 'get_job_details',
-        args: {'job_id': jobId},
+        source: 'deterministic',
+        call: () => dispatchGeminiFunctionCall(
+          ref: ref,
+          cameraSession: _cameraSession,
+          navigationSession: _navigationSession,
+          name: 'get_job_details',
+          args: {'job_id': jobId},
+        ),
       );
     } catch (e, stackTrace) {
       debugPrint('GEMINI DETERMINISTIC TRIGGER ERROR (get_job_details): $e\n$stackTrace');
@@ -4189,7 +7091,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _log_('DETERMINISTIC GET JOB DETAILS TRIGGER: get_job_details succeeded: $result');
     debugPrint('GEMINI DETERMINISTIC TRIGGER: get_job_details succeeded');
     _clearAllTriggerBuffersAfterSuccess('deterministic get_job_details');
+    _recordDispatchSucceeded(myDispatchGeneration, 'get_job_details');
 
+    if (_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: 'get_job_details')) return;
     _informGeminiOfDeterministicGetJobDetails(result: result);
   }
 
@@ -4208,10 +7112,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// technician wants to know what screen they're on" — same
   /// normalization/padding approach as [_looksLikeViewEstimateRequest].
   bool _looksLikeGetCurrentScreenRequest(String text) {
-    final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ');
-    final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
-    final padded = ' ${words.join(' ')} ';
-    return _getCurrentScreenIndicatorPhrases.any((phrase) => padded.contains(' $phrase '));
+    // P0 FIX — see [_TranscriptTrigger.matches]'s doc comment.
+    final phraseMatch = matchAnyTriggerPhrase(text, _getCurrentScreenIndicatorPhrases);
+    if (phraseMatch == null) return false;
+    if (!phraseMatch.exact) {
+      debugPrint('FUZZY TRIGGER MATCH [get_current_screen]: ${phraseMatch.describe()} matched in "$text"');
+    }
+    return true;
   }
 
   /// Hand-rolled deterministic trigger for get_current_screen — NOT routed
@@ -4222,6 +7129,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// accumulate/resolve/debounce shape as [_maybeTriggerGetJobDetails]
   /// otherwise.
   void _maybeTriggerGetCurrentScreen(String textChunk) {
+    // P0 FIX — see [_maybeTriggerDeterministic]'s matching guard/doc
+    // comment.
+    if (_utteranceAlreadyResolvedByTrigger) return;
     if (_getCurrentScreenDetectionResolvedForCurrentUtterance) return;
     _getCurrentScreenDetectionBuffer = '$_getCurrentScreenDetectionBuffer $textChunk'.trim();
 
@@ -4272,7 +7182,17 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ');
     final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
     final padded = ' ${words.join(' ')} ';
-    if (_metaCapabilityIndicatorPhrases.any((phrase) => padded.contains(' $phrase '))) return true;
+    // P0 FIX — see [_TranscriptTrigger.matches]'s doc comment. The two
+    // wildcard regexes below deliberately keep running against the RAW
+    // padded text: they match on sentence SHAPE, not on a stemmable
+    // vocabulary, so stemming could only break them for no gain.
+    final phraseMatch = matchAnyTriggerPhrase(text, _metaCapabilityIndicatorPhrases);
+    if (phraseMatch != null) {
+      if (!phraseMatch.exact) {
+        debugPrint('FUZZY TRIGGER MATCH [meta_capability]: ${phraseMatch.describe()} matched in "$text"');
+      }
+      return true;
+    }
     // PART G item 2 — see [_metaCapabilityWildcardShape1]'s doc comment.
     return _metaCapabilityWildcardShape1.hasMatch(padded) || _metaCapabilityWildcardShape2.hasMatch(padded);
   }
@@ -4289,6 +7209,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// Gemini's own judgment (or the `toolConfig`/`mode: ANY` setup field) is
   /// actually steering it away from that.
   void _maybeTriggerMetaCapability(String textChunk) {
+    // P0 FIX — see [_maybeTriggerDeterministic]'s matching guard/doc
+    // comment.
+    if (_utteranceAlreadyResolvedByTrigger) return;
     if (_metaCapabilityDetectionResolvedForCurrentUtterance) return;
     _metaCapabilityDetectionBuffer = '$_metaCapabilityDetectionBuffer $textChunk'.trim();
 
@@ -4349,10 +7272,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// match for a plain greeting/presence-check, same normalization/padding
   /// approach as [_looksLikeMetaCapabilityRequest].
   bool _looksLikeAcknowledgePresenceRequest(String text) {
-    final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ');
-    final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
-    final padded = ' ${words.join(' ')} ';
-    return _acknowledgePresenceIndicatorPhrases.any((phrase) => padded.contains(' $phrase '));
+    // P0 FIX — see [_TranscriptTrigger.matches]'s doc comment.
+    final phraseMatch = matchAnyTriggerPhrase(text, _acknowledgePresenceIndicatorPhrases);
+    if (phraseMatch == null) return false;
+    if (!phraseMatch.exact) {
+      debugPrint('FUZZY TRIGGER MATCH [acknowledge_presence]: ${phraseMatch.describe()} matched in "$text"');
+    }
+    return true;
   }
 
   /// PART D items 1-2 — hand-rolled deterministic trigger for plain
@@ -4370,6 +7296,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// regression this fixes in [_acknowledgePresenceIndicatorPhrases]'s doc
   /// comment.
   bool _maybeTriggerAcknowledgePresence(String textChunk) {
+    // P0 FIX — see [_maybeTriggerDeterministic]'s matching guard/doc
+    // comment. `false`, not `true`: this utterance was resolved by
+    // something ELSE, not by acknowledge_presence itself, so callers must
+    // not read this as "acknowledge_presence handled it."
+    if (_utteranceAlreadyResolvedByTrigger) return false;
     if (_acknowledgePresenceResolvedForCurrentUtterance) return true;
     _acknowledgePresenceDetectionBuffer = '$_acknowledgePresenceDetectionBuffer $textChunk'.trim();
     if (!_looksLikeAcknowledgePresenceRequest(_acknowledgePresenceDetectionBuffer)) return false;
@@ -4402,7 +7333,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// [_acknowledgePresenceCannedResponse] verbatim — same VERBATIM pattern
   /// as [_informGeminiOfMetaCapability].
   void _informGeminiOfAcknowledgePresence() {
-    _informGeminiToSpeakVerbatim(_acknowledgePresenceCannedResponse, reason: 'acknowledge_presence');
+    _informGeminiToSpeakVerbatim(_nextAcknowledgePresenceResponse(), reason: 'acknowledge_presence');
   }
 
   /// Shared dispatch step for every [_TranscriptTrigger] — see that class's
@@ -4428,6 +7359,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // proves the break is in `_maybeTriggerDeterministic` (matches/guard/
     // debounce) or upstream in `_onInputTranscription`, NOT in this method.
     debugPrint('PHOTO TIMING [_executeDeterministic]: ENTERED for trigger="${trigger.name}" args=$args');
+    // ISSUE 2 — see [_dispatchGenerationCounter]'s doc comment: captured
+    // BEFORE the dispatch below, so this represents exactly when the
+    // technician's request for `trigger.name` began, not when its (possibly
+    // much slower) backend call happens to finish.
+    final myDispatchGeneration = _beginNewDispatchGeneration();
     Map<String, dynamic> result;
     _beginFunctionCallInFlight('deterministic ${trigger.name}');
     try {
@@ -4446,7 +7382,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // OTHER trigger name, so this is a pure superset for every non-camera
       // trigger using this same shared method.
       debugPrint('PHOTO TIMING [_executeDeterministic]: about to call _dispatchWithOpenCameraSafeguards for "${trigger.name}"');
-      result = await _dispatchWithOpenCameraSafeguards(name: trigger.name, args: args);
+      result = await _pipelineDispatch(
+        name: trigger.name,
+        source: _forcedIntentTrigger == trigger.name ? 'deterministic(fuzzy intent)' : 'deterministic',
+        call: () => _dispatchWithOpenCameraSafeguards(name: trigger.name, args: args),
+      );
       debugPrint('PHOTO TIMING [_executeDeterministic]: _dispatchWithOpenCameraSafeguards RETURNED for "${trigger.name}": $result');
     } catch (e, stackTrace) {
       debugPrint('PHOTO TIMING [_executeDeterministic]: EXCEPTION for "${trigger.name}": $e');
@@ -4461,10 +7401,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     debugPrint('GEMINI DETERMINISTIC TRIGGER: ${trigger.name} succeeded');
     if (!result.containsKey('error')) {
       _clearAllTriggerBuffersAfterSuccess('deterministic ${trigger.name}');
+      // ISSUE 2 — record success BEFORE the staleness check below, so a
+      // newer dispatch's own success is visible to it immediately (and, in
+      // the reverse case, so THIS dispatch correctly becomes the new
+      // "latest" for any older, still-pending dispatch to recognize itself
+      // as stale against once it finally resolves).
+      _recordDispatchSucceeded(myDispatchGeneration, trigger.name);
     }
 
     _updateScreenTaskForToolCall(trigger.name, result);
-    if (_isNavigatingScreenFunction(trigger.name) && !result.containsKey('error')) {
+    if (_isNavigatingScreenFunction(trigger.name) && _viewResultNavigated(result)) {
       _lastViewFunctionSucceededAt = DateTime.now();
       _intentionalGoBackHeardSinceLastView = false;
       _currentViewScreenName = trigger.name;
@@ -4474,6 +7420,23 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       );
     }
 
+    // ISSUE 2 (HIGH PRIORITY, CONFIRMED via f5a8bd8b-flutter_run_log.txt) —
+    // see [_discardIfStaleDispatch]'s doc comment: a newer request (e.g.
+    // open_camera) may have already succeeded and started speaking its own
+    // confirmation while THIS dispatch (e.g. an abandoned get_kb_answer
+    // question) was still in flight. Speaking now would interrupt/overwrite
+    // that current confirmation mid-word with a stale, unrelated answer.
+    if (_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: trigger.name)) {
+      _pipelineLog('reply_skipped', 'function=${trigger.name} reason=stale (a newer request superseded it)');
+      return;
+    }
+    // Set by [_updateScreenTaskForToolCall] for an open_camera cancelled on
+    // behalf of something that speaks (or shows) its own outcome.
+    if (result['silent'] == true) {
+      _pipelineLog('reply_skipped', 'function=${trigger.name} reason=result marked silent');
+      _log_('DETERMINISTIC ${trigger.name.toUpperCase()} TRIGGER: result marked silent — not speaking');
+      return;
+    }
     _informGeminiToSpeakVerbatim(buildSpokenText(result), reason: 'deterministic ${trigger.name}');
   }
 
@@ -4512,6 +7475,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (result.containsKey('error')) {
       return "Sorry, something went wrong doing that — please try again.";
     }
+    if (result['status'] == 'already_on_screen') return _alreadyOnScreenSpokenText(name);
     switch (name) {
       case 'get_job_details':
         return (result['summary'] as String?) ?? 'No details were found for this job.';
@@ -4652,13 +7616,34 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // also tries to answer it.
     void Function()? onGuardFailed,
   }) {
+    // P0 FIX (CONFIRMED via a real session: "Show me the estimate. Try me
+    // again. For example, show the job history or take a photo." — one
+    // contaminated transcript chunk containing three DIFFERENT triggers'
+    // phrases — fired view_estimate, view_job_history, AND open_camera in
+    // sequence within 44ms, each navigating over the last). HARD RULE,
+    // independent of whatever caused that specific contamination: the
+    // instant ANY trigger — this one or any other, hand-rolled or via this
+    // shared engine — resolves an utterance for real
+    // ([_clearAllTriggerBuffersAfterSuccess] is the ONE place that sets
+    // [_utteranceAlreadyResolvedByTrigger]), every OTHER trigger stops
+    // being evaluated against that SAME utterance, full stop. Checked
+    // first, before even buffering this chunk — once resolved, there is
+    // nothing left for any other trigger to usefully accumulate toward.
+    if (_utteranceAlreadyResolvedByTrigger) {
+      debugPrint('DETERMINISTIC SKIP: trigger=${trigger.name} — this utterance was already resolved by a different trigger');
+      return;
+    }
     if (trigger.resolvedForCurrentUtterance) {
       debugPrint('DETERMINISTIC SKIP: trigger=${trigger.name} already resolved for this utterance');
       return;
     }
     trigger.buffer = '${trigger.buffer} $textChunk'.trim();
 
-    if (!trigger.matches(trigger.buffer)) {
+    // [_maybeResolveByIntent] already matched this utterance to this
+    // trigger by keyword/similarity; everything after the phrase check —
+    // guard, debounce, job_id, dispatch, reply — still applies unchanged.
+    final forcedByIntent = _forcedIntentTrigger == trigger.name;
+    if (!forcedByIntent && !trigger.matches(trigger.buffer)) {
       debugPrint(
         'DETERMINISTIC NO MATCH: trigger=${trigger.name} pattern=${trigger.phrases} against '
         "text='${trigger.buffer}'",
@@ -4666,11 +7651,18 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
     if (guard != null && !guard()) {
+      _pipelineLog('matched_not_fired', 'trigger=${trigger.name} reason=guard (screenTask=${_screenTask.name})');
       debugPrint('DETERMINISTIC SKIP: trigger=${trigger.name} matched but guard() returned false');
-      if (onGuardFailed != null) {
-        trigger.resolvedForCurrentUtterance = true;
-        trigger.lastActivityAt = DateTime.now();
-        onGuardFailed();
+      // P0 FIX (CONFIRMED in a real session: every "Take the photo." while
+      // the camera was open hit open_camera's guard, which marked the
+      // utterance resolved, so the one-trigger-per-utterance loop never
+      // reached capture_photo — capture was impossible once open). A
+      // guard-failed match is a NON-event: it neither marks this trigger
+      // resolved nor commits the utterance. Its clarification reply is only
+      // queued, and [_onInputTranscription] speaks it after the loop only if
+      // no other trigger actually committed this chunk.
+      if (onGuardFailed != null && !_guardFailedReplySpokenThisUtterance) {
+        _pendingGuardFailedReply ??= onGuardFailed;
       }
       return;
     }
@@ -4680,6 +7672,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final lastActivity = trigger.lastActivityAt;
     if (lastActivity != null && now.difference(lastActivity) < _deterministicTriggerDebounce) {
       trigger.resolvedForCurrentUtterance = true;
+      _pipelineLog(
+        'matched_not_fired',
+        'trigger=${trigger.name} reason=debounce (${trigger.name} ran ${now.difference(lastActivity).inMilliseconds}ms '
+            'ago — assumes it is already being handled)',
+      );
       _log_(
         'DETERMINISTIC ${trigger.name.toUpperCase()} TRIGGER: pattern matched ("$transcript") but '
         '${trigger.name} ran ${now.difference(lastActivity).inMilliseconds}ms ago (within the '
@@ -4692,6 +7689,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final jobId = widget.jobId;
     if (requireJobId && jobId == null) {
       trigger.resolvedForCurrentUtterance = true;
+      _pipelineLog('matched_not_fired', 'trigger=${trigger.name} reason=no job_id (standalone session)');
       _log_(
         'DETERMINISTIC ${trigger.name.toUpperCase()} TRIGGER: pattern matched ("$transcript") but no job_id '
         'known (standalone mode) — skipping.',
@@ -4701,6 +7699,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
     trigger.resolvedForCurrentUtterance = true;
     trigger.lastActivityAt = now;
+    _pipelineLog('matched_firing', 'trigger=${trigger.name}${forcedByIntent ? ' (via fuzzy intent layer)' : ''} text="$transcript"');
     // PART G item 3 (CONFIRMED regression: a small residual audio leak
     // measured on action triggers too, not just acknowledge_presence/
     // meta_capability). Root cause found here specifically: unlike those
@@ -4735,10 +7734,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// checks), so "backpack" never matches "back" and "gone" never matches
   /// "go".
   bool _looksLikeIntentionalGoBack(String text) {
-    final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ');
-    final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
-    final padded = ' ${words.join(' ')} ';
-    return _intentionalGoBackPhrases.any((phrase) => padded.contains(' $phrase '));
+    // P0 FIX — see [_TranscriptTrigger.matches]'s doc comment. The
+    // "'gone' never matches 'go'" property above still holds: the shared
+    // stemmer deliberately leaves irregular past tenses alone (see
+    // `_irregularStems` in `trigger_phrase_matcher.dart`).
+    final phraseMatch = matchAnyTriggerPhrase(text, _intentionalGoBackPhrases);
+    if (phraseMatch == null) return false;
+    if (!phraseMatch.exact) {
+      debugPrint('FUZZY TRIGGER MATCH [go_back]: ${phraseMatch.describe()} matched in "$text"');
+    }
+    return true;
   }
 
   /// Called from [_onInputTranscription] on every chunk. Serves TWO
@@ -4766,6 +7771,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   ///     the opposite, a genuinely just-heard "go back" request, which that
   ///     same doc comment says must never be delayed.
   void _maybeDetectIntentionalGoBack(String textChunk) {
+    // P0 FIX — see [_maybeTriggerDeterministic]'s matching guard/doc
+    // comment. Applied uniformly here too, including the cooldown-lifting
+    // side effect below: a technician's own words genuinely belong to
+    // whichever trigger already resolved this utterance, not to a second
+    // one layering more state changes on top of the same breath.
+    if (_utteranceAlreadyResolvedByTrigger) return;
     final viewCooldownActive = _lastViewFunctionSucceededAt != null && !_intentionalGoBackHeardSinceLastView;
 
     _goBackIntentDetectionBuffer = '$_goBackIntentDetectionBuffer $textChunk'.trim();
@@ -4834,10 +7845,22 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return "You're looking at the photo you just took, waiting for you to say keep it or retake it.";
     }
     if (_screenTask == _ScreenTask.cameraLive) {
-      return "You're in the camera, ready to take a photo.";
+      // P2: the preview can be showing before open_camera has reported
+      // success, so this distinguishes "you can see it" from "it's armed" —
+      // get_current_screen must never tell a technician the camera is ready
+      // to shoot when capture_photo's own guard would still refuse.
+      return _cameraOpenConfirmed
+          ? "You're in the camera, ready to take a photo."
+          : "You're in the camera — the preview is up and it'll be ready to shoot in a moment.";
+    }
+    if (_screenTask == _ScreenTask.cameraOpening) {
+      return "The camera is opening right now — it'll be up in a moment.";
+    }
+    if (_screenTask == _ScreenTask.cameraClosing) {
+      return "The camera is closing — you'll be back on the job screen in a moment.";
     }
     if (_viewScreenActive) {
-      final label = switch (_currentViewScreenName) {
+      final label = switch (_navigationSession.topScreenName ?? _currentViewScreenName) {
         'view_estimate' => 'the Estimate screen',
         'view_change_orders' => 'the Change Orders screen',
         'view_invoice' => 'the Invoice screen',
@@ -4864,15 +7887,21 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
 
+    // ISSUE 2 — see [_dispatchGenerationCounter]'s doc comment.
+    final myDispatchGeneration = _beginNewDispatchGeneration();
     Map<String, dynamic> result;
     _beginFunctionCallInFlight('deterministic go_back');
     try {
-      result = await dispatchGeminiFunctionCall(
-        ref: ref,
-        cameraSession: _cameraSession,
-        navigationSession: _navigationSession,
+      result = await _pipelineDispatch(
         name: 'go_back',
-        args: {'job_id': jobId},
+        source: 'deterministic',
+        call: () => dispatchGeminiFunctionCall(
+          ref: ref,
+          cameraSession: _cameraSession,
+          navigationSession: _navigationSession,
+          name: 'go_back',
+          args: {'job_id': jobId},
+        ),
       );
     } catch (e, stackTrace) {
       debugPrint('GEMINI DETERMINISTIC TRIGGER ERROR (go_back): $e\n$stackTrace');
@@ -4887,6 +7916,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _log_('DETERMINISTIC GO BACK TRIGGER: go_back succeeded: $result');
     debugPrint('GEMINI DETERMINISTIC TRIGGER: go_back succeeded');
     _clearAllTriggerBuffersAfterSuccess('deterministic go_back');
+    _recordDispatchSucceeded(myDispatchGeneration, 'go_back');
+    if (_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: 'go_back')) return;
     _informGeminiOfDeterministicGoBack(result: result);
   }
 
@@ -4931,7 +7962,21 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (_screenTask == _ScreenTask.none && !cameraActuallyOpen) return responsePayload;
 
     final closedTask = _screenTask;
-    await _cameraSession.dispose();
+    _cameraOpenConfirmed = false;
+    // Still opening: stop waiting on the native open (see
+    // [GeminiCameraSession.cancelPendingOpen]) instead of queueing this close
+    // behind it for however long it takes — the abandoned open releases its
+    // own controller when it finally returns, and nothing was ever shown.
+    if (_cameraSession.cancelPendingOpen()) {
+      // Read when the cancelled dispatch returns (asynchronously, after this).
+      _cameraOpenCancelIntent = _CameraOpenCancelIntent.goBack;
+      _log_('go_back: camera was still opening ($closedTask) — cancelled the pending open, nothing to release yet');
+    } else {
+      // See [_ScreenTask.cameraClosing]: shown BEFORE the release is awaited.
+      _log_('go_back: closing camera flow ($closedTask -> ${_ScreenTask.cameraClosing}) — releasing the native camera');
+      if (mounted) setState(() => _screenTask = _ScreenTask.cameraClosing);
+      await _cameraSession.dispose();
+    }
     _log_('go_back: closed active camera flow ($closedTask -> none, cameraActuallyOpen=$cameraActuallyOpen), camera released');
     if (mounted) setState(() => _screenTask = _ScreenTask.none);
     _pausedVoiceService?.setScreenTaskActive(false);
@@ -4949,24 +7994,76 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (text != null) _informGeminiToSpeakVerbatim(text, reason: 'deterministic go_back');
   }
 
-  /// Reliability audit finding (CHECK 4): broad, NOT exact-phrase,
-  /// whole-word/phrase pattern match for "the technician wants to keep
-  /// this photo" — see [_photoConfirmIndicatorPhrases]'s doc comment. Same
-  /// normalization/padding approach as [_looksLikeViewEstimateRequest].
-  bool _looksLikePhotoConfirmRequest(String text) {
-    final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ');
-    final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
-    final padded = ' ${words.join(' ')} ';
-    return _photoConfirmIndicatorPhrases.any((phrase) => padded.contains(' $phrase '));
+  /// State-aware reply for an utterance nothing could route: while a captured
+  /// photo awaits a decision (or the live preview awaits a shutter word), the
+  /// useful thing to say is the pending question, not a generic examples line.
+  /// A short, in-character acknowledgment for a conversational reaction
+  /// (see [_maybeFallBackToKbAnswerCatchAll]) — acknowledges and points back
+  /// at what can happen next on this job; never answers anything itself.
+  String _conversationalReplyForCurrentState() {
+    if (_screenTask == _ScreenTask.cameraCaptured) {
+      return _photoDecisionDispatchInFlight
+          ? 'Still working on that photo — one moment.'
+          : 'Got it. Do you want to keep this photo, or retake it?';
+    }
+    if (_screenTask == _ScreenTask.cameraLive) return "Got it. Say 'capture it' whenever you're ready.";
+    return _conversationalReplies[_conversationalReplyCursor++ % _conversationalReplies.length];
   }
 
-  /// See [_looksLikePhotoConfirmRequest]'s doc comment — same approach,
-  /// against [_photoRetakeIndicatorPhrases].
-  bool _looksLikePhotoRetakeRequest(String text) {
-    final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ');
-    final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
-    final padded = ' ${words.join(' ')} ';
-    return _photoRetakeIndicatorPhrases.any((phrase) => padded.contains(' $phrase '));
+  int _conversationalReplyCursor = 0;
+  static const List<String> _conversationalReplies = [
+    'Sounds good. Just let me know what you need next on this job.',
+    "Got it. I'm here if you need anything else on this job.",
+    'Okay. Say the word if you want the estimate, the change orders, or a photo.',
+  ];
+
+  String _unrecognizedReplyForCurrentState() {
+    if (_screenTask == _ScreenTask.cameraCaptured) {
+      // BUG 5 FIX (CONFIRMED via flutter_run_log_new.txt, build #56): a
+      // confirm_photo_upload/retake_photo decision that's ALREADY been
+      // dispatched and is genuinely in flight (compressing/uploading, which
+      // has taken as long as ~23s in a real run) used to still hit this
+      // exact "keep it, or retake it?" reprompt for every stray unresolved
+      // utterance during that whole wait — [_screenTask] only leaves
+      // [cameraCaptured] once the dispatch SUCCEEDS, not when it STARTS, so
+      // from the technician's perspective the app looked like it never
+      // heard the decision at all, even 3 repeats in. See
+      // [_photoDecisionDispatchInFlight]'s own doc comment.
+      if (_photoDecisionDispatchInFlight) {
+        if (!_photoDecisionDispatchAcknowledgedUnresolved) {
+          _photoDecisionDispatchAcknowledgedUnresolved = true;
+          return "Still working on that photo — one moment.";
+        }
+        return "Still processing — almost done.";
+      }
+      // P0 FIX — see [_photoDecisionAmbiguousStreak]'s doc comment: a
+      // "nothing matched at all" miss (not an ambiguous one — this is a
+      // genuinely separate code path) still needs the same stricter
+      // wording once escalated, so the technician gets ONE consistent
+      // instruction regardless of which of the two paths produced it.
+      if (_photoDecisionAmbiguousStreak >= _photoDecisionAmbiguousEscalationThreshold) {
+        return _photoDecisionAmbiguousPrompt();
+      }
+      const replies = [
+        "Sorry, I missed that — do you want to keep this photo, or retake it?",
+        "I didn't catch that. Say 'keep it' to save the photo, or 'retake' to shoot it again.",
+      ];
+      return replies[_retryReplyCursor++ % replies.length];
+    }
+    // cameraLive can be reached early off the preview texture (see
+    // [_ScreenTask.cameraOpening]) — don't say "the camera's open" until
+    // the real open has completed.
+    if (_screenTask == _ScreenTask.cameraLive && !_cameraOpenConfirmed) {
+      return "The camera's still opening — give it a moment.";
+    }
+    if (_screenTask == _ScreenTask.cameraLive) {
+      const replies = [
+        "Sorry, I missed that — say 'ready' or 'capture it' when you want the photo.",
+        "I didn't catch that. The camera's open — say 'capture it' when you're set.",
+      ];
+      return replies[_retryReplyCursor++ % replies.length];
+    }
+    return _nextUnrecognizedUtteranceReply();
   }
 
   /// Reliability audit finding (CHECK 4): `capture_photo`'s required
@@ -4975,20 +8072,74 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// already proven for view_estimate/go_back. Armed ONLY while
   /// [_screenTask] is [_ScreenTask.cameraCaptured] (a captured-but-
   /// undecided photo actually exists to act on); resolves at most once per
-  /// utterance. If the accumulated buffer matches BOTH confirm and retake
-  /// phrasing (a genuinely ambiguous utterance), this deliberately does
-  /// NOT fire either — safer to let Gemini's own conversational judgment
-  /// (or a later, clearer utterance) resolve the ambiguity than to guess.
+  /// utterance. See [classifyPhotoDecision]'s doc comment for the actual
+  /// decision logic (P0 FIX, build #59) — a genuinely ambiguous utterance
+  /// (both retake and confirm evidence, neither negated into the other)
+  /// asks the technician to repeat clearly rather than guessing which way
+  /// to gamble a real upload/discard decision.
   void _maybeDetectPhotoDecision(String textChunk) {
+    // P0 FIX — see [_maybeTriggerDeterministic]'s matching guard/doc
+    // comment.
+    if (_utteranceAlreadyResolvedByTrigger) return;
     if (_screenTask != _ScreenTask.cameraCaptured || _photoDecisionResolvedForCurrentUtterance) return;
     _photoDecisionDetectionBuffer = '$_photoDecisionDetectionBuffer $textChunk'.trim();
 
-    final wantsConfirm = _looksLikePhotoConfirmRequest(_photoDecisionDetectionBuffer);
-    final wantsRetake = _looksLikePhotoRetakeRequest(_photoDecisionDetectionBuffer);
-    if (wantsConfirm == wantsRetake) return; // neither matched yet, or both did (ambiguous) — keep waiting.
+    // P0 FIX — see [_photoDecisionAmbiguousStreakDecay]'s doc comment: an
+    // escalation this stale is from a cascade that's clearly over, not
+    // ongoing genuine confusion — let normal evidence-scoring matching
+    // resume rather than leaving the technician locked into bare-word-only
+    // mode for the rest of this photo's decision.
+    final lastAmbiguous = _lastPhotoDecisionAmbiguousAt;
+    if (_photoDecisionAmbiguousStreak > 0 &&
+        lastAmbiguous != null &&
+        DateTime.now().difference(lastAmbiguous) > _photoDecisionAmbiguousStreakDecay) {
+      _log_(
+        'PHOTO DECISION: ambiguous streak decayed (${DateTime.now().difference(lastAmbiguous).inSeconds}s since '
+        'the last ambiguous hit, > ${_photoDecisionAmbiguousStreakDecay.inSeconds}s) — resuming normal '
+        'evidence-scoring matching instead of staying in strict bare-word-only mode.',
+      );
+      _photoDecisionAmbiguousStreak = 0;
+    }
 
-    final action = wantsConfirm ? 'confirm_photo_upload' : 'retake_photo';
+    // P0 FIX — see [_photoDecisionAmbiguousStreak]'s doc comment: once
+    // escalated, a bare-word-only check REPLACES the normal evidence
+    // scoring entirely — an echoed full sentence (the strict prompt or the
+    // original question) always has extra words around "keep"/"retake", so
+    // it can never satisfy this, breaking the echo-reinforced loop even
+    // without a perfect echo fix.
+    final escalated = _photoDecisionAmbiguousStreak >= _photoDecisionAmbiguousEscalationThreshold;
+    final decision = escalated
+        ? classifyStrictBareWordPhotoDecision(_photoDecisionDetectionBuffer)
+        : classifyPhotoDecision(_photoDecisionDetectionBuffer);
+    if (decision == PhotoDecision.none) {
+      // retake_photo/confirm_photo_upload aren't in `_deterministicTriggers`
+      // (so they never got a "DETERMINISTIC NO MATCH" line) — log the
+      // decision-state miss explicitly so it's visible.
+      debugPrint('PHOTO DECISION: no confirm/retake match for "$_photoDecisionDetectionBuffer"');
+      return;
+    }
+    if (decision == PhotoDecision.ambiguous) {
+      // P0 FIX — see [classifyPhotoDecision]'s doc comment: a genuine,
+      // unresolved conflict (e.g. "yes retake") must never be guessed on a
+      // fork this high-stakes. Resolves the utterance (so this exact text
+      // doesn't keep re-triggering ambiguous on every subsequent chunk) but
+      // fires neither action — asks for a clear repeat instead.
+      _photoDecisionResolvedForCurrentUtterance = true;
+      _photoDecisionAmbiguousStreak++;
+      _lastPhotoDecisionAmbiguousAt = DateTime.now();
+      _log_(
+        'DETERMINISTIC PHOTO DECISION TRIGGER: "$_photoDecisionDetectionBuffer" matched BOTH keep and retake '
+        'evidence with nothing to resolve the conflict (streak=$_photoDecisionAmbiguousStreak) — asking for a '
+        'clear repeat instead of guessing.',
+      );
+      _interruptGeminiForDeterministicTrigger('photo_decision_ambiguous');
+      _informGeminiToSpeakVerbatim(_photoDecisionAmbiguousPrompt(), reason: 'photo_decision_ambiguous');
+      return;
+    }
+
+    final action = decision == PhotoDecision.confirm ? 'confirm_photo_upload' : 'retake_photo';
     _photoDecisionResolvedForCurrentUtterance = true;
+    _photoDecisionAmbiguousStreak = 0;
     final now = DateTime.now();
     final lastActivity = _lastPhotoDecisionActivityAt;
     if (lastActivity != null && now.difference(lastActivity) < _photoDecisionDebounce) {
@@ -5024,15 +8175,34 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
 
+    // ISSUE 2 — see [_dispatchGenerationCounter]'s doc comment.
+    final myDispatchGeneration = _beginNewDispatchGeneration();
     Map<String, dynamic> result;
     _beginFunctionCallInFlight('deterministic $action');
+    // BUG 5 FIX — see [_photoDecisionDispatchInFlight]'s doc comment.
+    _photoDecisionDispatchInFlight = true;
+    _photoDecisionDispatchAcknowledgedUnresolved = false;
+    if (action == 'confirm_photo_upload' && mounted) setState(() => _photoUploadInFlight = true);
     try {
-      result = await dispatchGeminiFunctionCall(
-        ref: ref,
-        cameraSession: _cameraSession,
-        navigationSession: _navigationSession,
+      // P2 FIX (CONFIRMED via flutter_run_log_new.txt, build #59): this
+      // used to call [dispatchGeminiFunctionCall] DIRECTLY — bypassing
+      // [_dispatchWithOpenCameraSafeguards] entirely, unlike EVERY other
+      // camera-flow deterministic trigger (open_camera/capture_photo, both
+      // routed through it via [_maybeTriggerDeterministic]). That's exactly
+      // why the BUG 2 audio-hard-pause fix (widening
+      // `needsAudioHardPause` to `confirm_photo_upload`, applied inside
+      // [_dispatchWithOpenCameraSafeguards]) never actually took effect for
+      // a confirm_photo_upload fired from THIS path — the log showed
+      // compress still taking 4.4s with no `audio_hard_pause_engaged` line
+      // at all for it, even though the code change was genuinely present
+      // and DID engage correctly for open_camera/capture_photo in the same
+      // log. Routed through the same safeguards wrapper now so
+      // confirm_photo_upload/retake_photo get identical protection
+      // regardless of which of the two call sites fires them.
+      result = await _pipelineDispatch(
         name: action,
-        args: {'job_id': jobId},
+        source: 'deterministic(photo decision)',
+        call: () => _dispatchWithOpenCameraSafeguards(name: action, args: {'job_id': jobId}),
       );
     } catch (e, stackTrace) {
       debugPrint('GEMINI DETERMINISTIC TRIGGER ERROR ($action): $e\n$stackTrace');
@@ -5040,12 +8210,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     } finally {
       _endFunctionCallInFlight('deterministic $action');
+      _photoDecisionDispatchInFlight = false;
+      if (_photoUploadInFlight && mounted) setState(() => _photoUploadInFlight = false);
     }
 
     _log_('DETERMINISTIC PHOTO DECISION TRIGGER: $action succeeded: $result');
     debugPrint('GEMINI DETERMINISTIC TRIGGER: $action succeeded');
     _clearAllTriggerBuffersAfterSuccess('deterministic $action');
+    _recordDispatchSucceeded(myDispatchGeneration, action);
     _updateScreenTaskForToolCall(action, result);
+    if (_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: action)) return;
     _informGeminiOfDeterministicPhotoDecision(action: action, result: result);
   }
 
@@ -5055,7 +8229,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// use.
   void _informGeminiOfDeterministicPhotoDecision({required String action, required Map<String, dynamic> result}) {
     final text = _buildSpokenTextForResult(name: action, result: result);
-    if (text != null) _informGeminiToSpeakVerbatim(text, reason: 'deterministic $action');
+    if (text == null) return;
+    // P0 FIX — see [_beginProtectedConfirmation]'s doc comment: the
+    // post-confirm_photo_upload "I've uploaded the photo" line is a direct,
+    // app-triggered consequence of an action the app itself just took (a
+    // real upload that took real seconds) — it must not be able to get
+    // silently swept by an incidental utterance's own preemptive mute the
+    // instant it starts streaming back.
+    if (action == 'confirm_photo_upload') _beginProtectedConfirmation();
+    _informGeminiToSpeakVerbatim(text, reason: 'deterministic $action');
   }
 
   /// The camera flow is the only tool group with real, function-call-
@@ -5099,8 +8281,35 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // "nothing was ever opened" case as an `open_camera` failure below,
     // handled explicitly here rather than falling through to the generic
     // success switch (which would have wrongly jumped to `cameraLive`).
+    if (responsePayload['status'] == 'cancelled') {
+      // See [GeminiCameraSession.cancelPendingOpen] — the native open is
+      // abandoned, not failed; nothing was ever shown open.
+      final intent = _cameraOpenCancelIntent ?? _CameraOpenCancelIntent.user;
+      _cameraOpenCancelIntent = null;
+      _cameraOpenConfirmed = false;
+      if (intent == _CameraOpenCancelIntent.retry) {
+        // Stay on the opening surface; the retry's own open queues behind
+        // the abandoned one and starts the moment the camera is free. Spoken
+        // audio would be dropped by the retry's own hard-pause anyway, so
+        // the surface says "Retrying" instead.
+        responsePayload['silent'] = true;
+        _log_('screen task: open_camera cancelled for RETRY — staying on ${_ScreenTask.cameraOpening}');
+        _cameraOpeningStartedAt = DateTime.now();
+        _cameraOpenIsRetry = true;
+        unawaited(Future(_startCameraOpenRetry));
+        return;
+      }
+      // go_back already speaks its own reply for this.
+      if (intent == _CameraOpenCancelIntent.goBack) responsePayload['silent'] = true;
+      _log_('screen task: open_camera CANCELLED ($intent) -> ${_ScreenTask.none}');
+      if (_screenTask == _ScreenTask.cameraOpening && mounted) setState(() => _screenTask = _ScreenTask.none);
+      _pausedVoiceService?.setScreenTaskActive(_screenTask != _ScreenTask.none);
+      return;
+    }
+
     if (responsePayload['status'] == 'timeout') {
       _log_('screen task: "$name" TIMED OUT -> ${_ScreenTask.none} (nothing was confirmed open)');
+      _cameraOpenConfirmed = false;
       if (_screenTask != _ScreenTask.none && mounted) setState(() => _screenTask = _ScreenTask.none);
       _pausedVoiceService?.setScreenTaskActive(false);
       return;
@@ -5124,6 +8333,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // that orphaned resource again. Leaving `_screenTask` exactly as it
       // already was is what's actually still true for those three.
       final nextTask = name == 'open_camera' ? _ScreenTask.none : _screenTask;
+      // P2 — an open_camera failure also retracts the early "there is
+      // something to look at" state the preview callback may have set, and
+      // must leave capture disarmed either way.
+      if (name == 'open_camera') _cameraOpenConfirmed = false;
       _log_(
         'screen task: "$name" FAILED -> $nextTask '
         '(${name == "open_camera" ? "nothing was ever opened" : "resource state left unchanged"})',
@@ -5139,17 +8352,81 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _ => _ScreenTask.none, // confirm_photo_upload — task done, back to pure conversation.
     };
 
+    // P0 FIX — see [_photoDecisionAmbiguousStreak]'s doc comment: a fresh
+    // capture starts a brand new keep/retake decision cycle, so any
+    // escalation earned by a PREVIOUS photo's ambiguous loop must not carry
+    // over and immediately put this new one into strict bare-word mode.
+    if (name == 'capture_photo') _photoDecisionAmbiguousStreak = 0;
+
+    // P0 TRUST FIX — the ONE place a genuine photo-action success is
+    // recorded for [_auditGeminiCompletionClaim]. Reached from both the
+    // deterministic trigger path ([_executeDeterministic]) and a genuine
+    // server-sent toolCall ([_handleToolCall]), and only past every
+    // rejected_overlap/timeout/error early-return above it — so "we got
+    // here" is exactly "this function really did what it says".
+    _recordPhotoActionSuccess(name);
+
+    // P2 — the ACTION gate (see [_cameraOpenConfirmed]). Only a genuine
+    // open_camera/retake_photo SUCCESS arms capture; confirm_photo_upload
+    // ends the flow and disarms it. capture_photo itself leaves it alone —
+    // the camera is still open behind the captured still, which is what
+    // makes retake work.
+    if (name == 'open_camera' || name == 'retake_photo') {
+      _cameraOpenConfirmed = true;
+    } else if (name == 'confirm_photo_upload') {
+      _cameraOpenConfirmed = false;
+    }
+
     _log_('screen task: "$name" succeeded -> $nextTask');
     if (mounted) setState(() => _screenTask = nextTask);
     _pausedVoiceService?.setScreenTaskActive(nextTask != _ScreenTask.none);
+    if (name == 'confirm_photo_upload') {
+      // Photo saved: the flow is done and the technician is back on the job
+      // (screen task -> none). Release the camera hardware too — confirm used
+      // to leave it open behind the conversation view, holding the camera
+      // (the next open_camera reopens it cleanly; retake, by contrast, keeps
+      // it open on purpose).
+      _log_(
+        'PHOTO CONFIRM: navigated to job details (photo view dismissed -> $_screenTask; the ambient overlay '
+        'returns to the conversation over the job screen) — releasing camera',
+      );
+      _scheduleCameraReleaseWhenIdle();
+    }
   }
 
-  /// BUG 2 backstop (step 3): rolling record of Gemini's own recently-spoken
-  /// text, built from `serverContent.outputTranscription` chunks (see
-  /// [_onServerMessage]) — bounded to the last 600 characters. Compared
-  /// against every `inputTranscription` chunk in [_looksLikeGeminiEcho]
-  /// BEFORE it reaches any trigger buffer.
-  String _recentGeminiOutputText = '';
+  /// CONFIRMED via the build #41 log: releasing the camera the instant
+  /// confirm succeeded took 40s ("CAMERA CLOSE: complete (40114ms)"), during
+  /// which the main thread stalled (Choreographer "Skipped 545 frames") and
+  /// the PCM release/setup reinit for the spoken confirmation sat behind it
+  /// (27 chunks queued). The camera plugin's native close runs on the main
+  /// thread and is not something Dart can speed up (the native
+  /// `CameraDevice#close` itself only took 240ms — the time went into the
+  /// platform thread being saturated/blocked around it). So take it OFF the
+  /// critical path instead: release only once the session is genuinely quiet
+  /// (confirmation spoken, PCM ready, mic not paused, nothing in flight, nobody
+  /// talking), and never while a new camera task is active. A new open_camera
+  /// simply reopens (its own open path disposes first).
+  Timer? _cameraReleaseTimer;
+
+  void _scheduleCameraReleaseWhenIdle() {
+    _cameraReleaseTimer?.cancel();
+    final scheduledAt = DateTime.now();
+    _cameraReleaseTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      if (!mounted || _screenTask != _ScreenTask.none) {
+        timer.cancel();
+        _cameraReleaseTimer = null;
+        _log_('CAMERA RELEASE: cancelled — a new camera task started (or screen closed) before idle release');
+        return;
+      }
+      final waited = DateTime.now().difference(scheduledAt);
+      final quiet = _pcmReady && !_outgoingAudioPaused && !_isSpeaking && _inFlightFunctionCalls == 0;
+      if (waited < const Duration(seconds: 5) || !quiet) return;
+      timer.cancel();
+      _cameraReleaseTimer = null;
+      _log_('CAMERA RELEASE: session idle after ${waited.inMilliseconds}ms — releasing camera now (off the audio critical path)');
+      unawaited(_cameraSession.dispose());
+    });
+  }
 
   /// BUG 2 backstop: is [chunk] very likely Gemini's own voice leaking back
   /// through the mic rather than genuine technician speech? Deliberately
@@ -5165,34 +8442,308 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   ///    e.g. Gemini asking "would you like to keep it or retake it?" must
   ///    never cause a genuine technician reply of "keep it" to be discarded)
   ///  - AND the whole normalized chunk appears verbatim as a substring of
-  ///    [_recentGeminiOutputText].
+  ///    the comparison pool (see [_looksLikeGeminiEcho]'s own doc comment
+  ///    for what that pool is).
   /// CONFIRMED real leaked examples this is sized to catch: "Is that
   /// correct?" (3 words), "What would you like to do next?" (7 words) — both
-  /// comfortably clear these thresholds.
-  ///
-  /// HONEST LIMITATION: a substring check requires a near-verbatim match.
-  /// Gemini's own synthesized speech, once played through a real speaker
-  /// and re-captured by the mic under real acoustic conditions, may be
-  /// re-transcribed slightly differently than the original — a genuine
-  /// echo with enough ASR drift between the two transcriptions could slip
-  /// past this backstop. That's why this is a backstop, not the primary
-  /// fix; the primary fix is closing the actual mic-timing gap (see
-  /// [_lastAudioChunkFedAt]/[_resumeGraceDelay] and the MIC SEND logging
-  /// in [_onMicChunk]).
+  /// comfortably clear these thresholds. Also shared with (and originally
+  /// sized for) [_auditGeminiDuplicateResponse]'s unrelated turn-to-turn
+  /// duplicate check — a real, deliberate reuse, not a leftover coupling:
+  /// both are "is this text substantially the same as that text" checks
+  /// that should agree on how short is too short to judge.
   static const int _echoBackstopMinWords = 3;
   static const int _echoBackstopMinChars = 12;
 
+  /// Used by [_auditGeminiDuplicateResponse]'s turn-to-turn duplicate check
+  /// ONLY — [_looksLikeGeminiEcho] used to share this too, but was moved
+  /// onto [wordEditDistance]/[looksLikeCloseSequenceMatch] instead (see
+  /// that pair's own doc comment for why: this UNORDERED "appears
+  /// somewhere nearby" scoring is exactly what let unrelated common words
+  /// scattered across a long comparison text falsely "match" a short real
+  /// command). Left exactly as-is here and still correct for duplicate
+  /// detection, which compares a whole turn against ANOTHER WHOLE, DISCRETE
+  /// prior turn (never a growing multi-turn blob) — the failure mode that
+  /// motivated moving echo detection off this algorithm doesn't apply to
+  /// that comparison shape.
+  ///
+  /// Finds the best-aligned window in [recentWords] of about the same
+  /// length as [chunkWords] (checking one word shorter and one word longer
+  /// too, so a genuinely dropped/inserted word at the boundary doesn't
+  /// misalign the rest) and returns the highest fraction of [chunkWords]
+  /// found anywhere within that window. Deliberately word-level
+  /// containment, not a full edit-distance implementation —
+  /// `photo_decision_classifier.dart` already covers per-word typo drift
+  /// for the keep/retake fork specifically; this only needs to survive a
+  /// handful of genuinely swapped/garbled words between two turns that are
+  /// otherwise near-verbatim repeats of each other.
+  static double _bestWordOverlapRatio(List<String> chunkWords, List<String> recentWords) {
+    if (chunkWords.isEmpty || recentWords.isEmpty) return 0;
+    var best = 0.0;
+    for (final windowLen in {chunkWords.length - 1, chunkWords.length, chunkWords.length + 1}) {
+      if (windowLen <= 0 || windowLen > recentWords.length) continue;
+      for (var start = 0; start <= recentWords.length - windowLen; start++) {
+        final window = recentWords.sublist(start, start + windowLen);
+        final matches = chunkWords.where(window.contains).length;
+        final ratio = matches / chunkWords.length;
+        if (ratio > best) best = ratio;
+      }
+    }
+    return best;
+  }
+
+  // P0 ECHO FALSE-POSITIVE FIX — the actual word-sequence-similarity
+  // algorithm (word-level edit distance, deliberately DIFFERENT from
+  // [_bestWordOverlapRatio]'s unordered overlap — see that function's own
+  // doc comment for why) now lives in `echo_sequence_matcher.dart`
+  // ([wordEditDistance]/[looksLikeCloseSequenceMatch], imported above),
+  // split out the same way `trigger_phrase_matcher.dart`/
+  // `photo_decision_classifier.dart`/`completion_claim_detector.dart`
+  // already were — a P0-severity text-matching fix earns its own
+  // unit-testable module rather than staying an inline private method with
+  // no automated regression coverage of its own.
+
+  /// P0 ECHO FALSE-POSITIVE FIX — regression guard (item 3 of the fix this
+  /// belongs to): an echo discard is, by [_looksLikeGeminiEcho]'s own
+  /// deliberately conservative design, ALWAYS accepted as correct without
+  /// further proof — there's no way to be MORE sure from text alone. This
+  /// makes a false positive VISIBLE the moment it happens instead of
+  /// silently swallowing a real command: checked right before the discard
+  /// actually takes effect, against every real deterministic trigger this
+  /// app has (every [_deterministicTriggers] entry, PLUS the keep/retake
+  /// decision, which lives outside that map). Logging only — this NEVER
+  /// changes the discard decision itself (this backstop still can't tell
+  /// "genuine echo that happens to resemble a command" from "a real
+  /// command wrongly caught" from text alone), but a line naming exactly
+  /// which pattern it would have matched turns an invisible loss into
+  /// something the next real run's log can be grepped for directly.
+  void _logIfEchoDiscardWouldHaveMatchedATrigger(String chunk) {
+    final matchedTriggers = _commandsMatchingText(chunk);
+    if (matchedTriggers.isEmpty) return;
+    _log_(
+      'ECHO BACKSTOP FALSE-POSITIVE RISK: the chunk just discarded as echo ("$chunk") ALSO matches '
+      '${matchedTriggers.join(", ")} — if this was genuinely the technician speaking, that command was just '
+      'silently swallowed. The discard itself is unchanged; this line exists purely to make that risk visible '
+      'in the log instead of invisible.',
+    );
+  }
+
+  /// Every command [chunk] would trigger — the same set the FALSE-POSITIVE
+  /// RISK line reports.
+  List<String> _commandsMatchingText(String chunk) {
+    final matchedTriggers = [
+      for (final trigger in _deterministicTriggers.values)
+        if (trigger.matches(chunk)) trigger.name,
+    ];
+    final photoDecision = classifyPhotoDecision(chunk);
+    if (photoDecision != PhotoDecision.none) {
+      matchedTriggers.add('photo_decision:${photoDecision.name}');
+    }
+    return matchedTriggers;
+  }
+
+  /// When the current utterance's speech began (the "genuinely new
+  /// utterance" edge in [_trackSpeechLevel]).
+  DateTime? _currentUtteranceStartedAt;
+
+  /// When the native player last confirmed it had played everything fed to
+  /// it (a "0 remaining" report covering every acknowledged feed), or its
+  /// queue was torn down — see [_nativePlaybackDrainConfirmed].
+  DateTime? _nativePlaybackEndConfirmedAt;
+
+  /// When the most recent response playback started (outgoing mic paused
+  /// for it).
+  DateTime? _lastResponsePlaybackStartedAt;
+
+  /// The echo backstop's text match stays the default verdict; this lets a
+  /// matched COMMAND through only when the technician started speaking
+  /// after our audio had provably finished — see `echo_override_policy.dart`
+  /// for the rule and the trace it was checked against.
+  EchoDecision _decideEchoOverride(String chunk) {
+    final commands = _commandsMatchingText(chunk);
+    final decision = decideEcho(
+      textLooksLikeEcho: true,
+      commandMatched: commands.isNotEmpty,
+      speechStartedAt: _currentUtteranceStartedAt,
+      playbackConfirmedEndedAt: _nativePlaybackEndConfirmedAt,
+      lastPlaybackStartedAt: _lastResponsePlaybackStartedAt,
+    );
+    if (decision == EchoDecision.override) {
+      final gapMs = _currentUtteranceStartedAt!.difference(_nativePlaybackEndConfirmedAt!).inMilliseconds;
+      _log_(
+        'ECHO BACKSTOP OVERRIDDEN: "$chunk" reads like our own recent speech, but it matches '
+        '${commands.join(", ")} and the technician started speaking ${gapMs}ms AFTER the player confirmed our '
+        'audio had finished — nothing of ours was playing, so this cannot be mic bleed. Treating it as a real '
+        'command and letting it fire.',
+      );
+      _pipelineLog(
+        'echo_override',
+        'command ${commands.join(", ")} fires despite echo-like text (speech began ${gapMs}ms after playback '
+            'confirmed ended)',
+      );
+    }
+    return decision;
+  }
+
+  /// BUG 2 backstop: is [chunk] very likely Gemini's own voice leaking back
+  /// through the mic rather than genuine technician speech?
+  ///
+  /// P0 ECHO FALSE-POSITIVE FIX (CONFIRMED, a real ~2.5 minute session): the
+  /// PREVIOUS design compared [chunk] against a single accumulated string
+  /// spanning the WHOLE session (nominally capped at 600 characters, but
+  /// 600 characters is ~100-120 words — easily several DISTINCT turns of
+  /// unrelated conversation). A genuine "Take the photo." was discarded
+  /// because "take"/"the"/"photo" each happened to appear SOMEWHERE nearby
+  /// each other in that long blob, unrelated to anything actually just
+  /// said — capture_photo fired ZERO times in the entire session as a
+  /// direct result.
+  ///
+  /// The comparison pool is now exactly two entries, each checked
+  /// SEPARATELY (never concatenated — concatenating them would just
+  /// recreate the same blob problem one level up):
+  ///  - [_currentTurnAudiblyPlayedText] — whatever Gemini is speaking RIGHT
+  ///    NOW, if anything (the most likely real echo source).
+  ///  - [_lastCompletedTurnAudiblyPlayedText] — the turn Gemini MOST
+  ///    RECENTLY finished, but ONLY while still within
+  ///    [_echoComparisonTrailingWindowFor] of finishing (scaled by that
+  ///    turn's own length — see its doc comment). Once that window
+  ///    passes, it drops out of the pool entirely — never "anything said
+  ///    this session," exactly as this fix requires.
+  /// Each candidate is tried verbatim-substring first (cheap, zero false-
+  /// positive risk when it hits), then [looksLikeCloseSequenceMatch]
+  /// (word-level edit distance, NOT [_bestWordOverlapRatio]'s unordered
+  /// overlap — see that function's own doc comment for why this backstop
+  /// specifically needed a stricter, ORDER-aware algorithm).
   bool _looksLikeGeminiEcho(String chunk) {
     final normalizedChunk = _normalizeForEchoCompare(chunk);
     if (normalizedChunk.length < _echoBackstopMinChars) return false;
-    if (normalizedChunk.split(' ').where((w) => w.isNotEmpty).length < _echoBackstopMinWords) return false;
-    final normalizedRecent = _normalizeForEchoCompare(_recentGeminiOutputText);
-    if (normalizedRecent.isEmpty) return false;
-    return normalizedRecent.contains(normalizedChunk);
+    final chunkWords = normalizedChunk.split(' ').where((w) => w.isNotEmpty).toList();
+    if (chunkWords.length < _echoBackstopMinWords) return false;
+
+    final candidates = <String>[_currentTurnAudiblyPlayedText];
+    var lastFinishedAt = _lastCompletedTurnFinishedAt;
+    // ECHO LOOP FIX — see [_pcmFeedsInFlight]: the trailing window counts
+    // from when that audio actually finished PLAYING, not from the server's
+    // turnComplete. On the camera screens the native player routinely got
+    // the audio seconds late (CONFIRMED: an echo of a line generated 17s
+    // earlier slipped past this window), so a server-time window closed
+    // before the echo was even audible.
+    final ackEnd = _ackBasedPlaybackEndAt;
+    if (lastFinishedAt != null && ackEnd != null && ackEnd.isAfter(lastFinishedAt)) lastFinishedAt = ackEnd;
+    if (lastFinishedAt != null) {
+      final window = _echoComparisonTrailingWindowFor(_lastCompletedTurnAudiblyPlayedText);
+      if (DateTime.now().difference(lastFinishedAt) <= window) {
+        candidates.add(_lastCompletedTurnAudiblyPlayedText);
+      }
+    }
+
+    for (final candidate in candidates) {
+      if (_chunkEchoesTurn(chunk, normalizedChunk, chunkWords, candidate)) return true;
+    }
+
+    // P1 FIX (CONFIRMED: "I'm here, loud and clear. What can I do for you?"
+    // came back through the mic as input 42s/77s after Gemini said it, but a
+    // newer turn had finished in between, so it was no longer in the pool
+    // above and was treated as real speech). Older turns from
+    // [_recentAudibleTurns] are checked too — but ONLY as a whole-turn
+    // echo: the chunk must cover most of that turn. Our own prompts contain
+    // command phrases ("say 'take the photo' when you're ready"), and
+    // matching a short real command against any recent prompt is exactly
+    // the false positive the P0 fix above removed.
+    final now = DateTime.now();
+    for (final turn in _recentAudibleTurns.reversed) {
+      if (now.difference(turn.at) > _recentAudibleTurnsWindow) break;
+      final turnWords = _normalizeForEchoCompare(turn.text).split(' ').where((w) => w.isNotEmpty).toList();
+      if (turnWords.isEmpty ||
+          chunkWords.length < _olderTurnEchoMinWords ||
+          chunkWords.length < turnWords.length * _olderTurnEchoMinCoverage) {
+        continue;
+      }
+      if (_chunkEchoesTurn(chunk, normalizedChunk, chunkWords, turn.text)) {
+        _log_(
+          'ECHO BACKSTOP: "$chunk" is a whole-turn echo of Gemini speech from '
+          '${now.difference(turn.at).inSeconds}s ago ("${turn.text}")',
+        );
+        return true;
+      }
+    }
+    // P1 FIX (CONFIRMED via flutter_run_log_new.txt, build #65): note that
+    // a RECOGNIZED echo above is discarded regardless of whether it ALSO
+    // matches a command pattern — see
+    // [_logIfEchoDiscardWouldHaveMatchedATrigger]'s doc comment for why
+    // that's now made visible in the log rather than silently accepted,
+    // and this function's own header for why the matching itself is now
+    // far less likely to be a false alarm in the first place.
+    return false;
+  }
+
+  /// One candidate comparison for [_looksLikeGeminiEcho]: verbatim substring
+  /// first, then [looksLikeCloseSequenceMatch].
+  bool _chunkEchoesTurn(String chunk, String normalizedChunk, List<String> chunkWords, String candidate) {
+    final normalizedCandidate = _normalizeForEchoCompare(candidate);
+    if (normalizedCandidate.isEmpty) return false;
+    if (normalizedCandidate.contains(normalizedChunk)) {
+      _logIfEchoDiscardWouldHaveMatchedATrigger(chunk);
+      return true;
+    }
+    final candidateWords = normalizedCandidate.split(' ').where((w) => w.isNotEmpty).toList();
+    if (looksLikeCloseSequenceMatch(chunkWords, candidateWords)) {
+      _log_(
+        'ECHO BACKSTOP: "$chunk" did not match verbatim but closely matches (word-sequence edit distance, '
+        'not unordered overlap) recent Gemini speech ("$candidate") — treating as likely ASR-drifted echo.',
+      );
+      _logIfEchoDiscardWouldHaveMatchedATrigger(chunk);
+      return true;
+    }
+    return false;
   }
 
   String _normalizeForEchoCompare(String text) {
     return text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  /// P0 FIX (CONFIRMED via a real session: "Show me the estimate. Try me
+  /// again. For example, show the job history or take a photo." — the
+  /// technician's real request, followed in the SAME STT segment by this
+  /// app's OWN scripted fallback prompt — `_unrecognizedUtteranceReplies`'
+  /// "I missed that one. Try me again — for example, show the job history
+  /// or take a photo." — leaking back and being transcribed as one
+  /// continuous chunk). [_looksLikeGeminiEcho] is deliberately whole-chunk:
+  /// it can only say "this ENTIRE chunk is (or isn't) essentially a
+  /// near-verbatim echo," which correctly refuses to fire here — the
+  /// chunk is NOT purely echo, it genuinely contains the technician's own
+  /// words too, and discarding the whole thing would lose that.
+  ///
+  /// The actual longest-trailing-match search lives in
+  /// `echo_sequence_matcher.dart`'s [longestTrailingEchoStrip] — same
+  /// module, same reasoning as [looksLikeCloseSequenceMatch]/
+  /// [wordEditDistance], and testable the same way. This is the thin
+  /// screen-side wrapper: builds the SAME comparison pool
+  /// ([_currentTurnAudiblyPlayedText]/[_lastCompletedTurnAudiblyPlayedText])
+  /// [_looksLikeGeminiEcho] already uses, then does the actual slicing and
+  /// logging.
+  String _stripTrailingEchoContamination(String chunk) {
+    final normalizedChunk = _normalizeForEchoCompare(chunk);
+    final chunkWords = normalizedChunk.split(' ').where((w) => w.isNotEmpty).toList();
+    final candidates = <List<String>>[
+      for (final candidate in [_currentTurnAudiblyPlayedText, _lastCompletedTurnAudiblyPlayedText])
+        _normalizeForEchoCompare(candidate).split(' ').where((w) => w.isNotEmpty).toList(),
+    ];
+    final stripCount = longestTrailingEchoStrip(chunkWords, candidates, minWords: _echoBackstopMinWords);
+    if (stripCount == 0) return chunk;
+
+    // Stripping happens on the NORMALIZED word list (letters/spaces only,
+    // apostrophes already split) rather than the raw string — a raw-text
+    // word count can differ from the normalized one (e.g. "don't" is one
+    // raw word but two normalized ones), and every trigger matcher already
+    // re-normalizes its input the same way internally, so handing them an
+    // already-normalized, stripped string costs nothing downstream.
+    final keptWords = chunkWords.sublist(0, chunkWords.length - stripCount);
+    final stripped = keptWords.join(' ');
+    _log_(
+      'TRANSCRIPT CONTAMINATION STRIPPED: removed a trailing $stripCount-word run closely matching Gemini\'s '
+      'own recent speech from "$chunk" -> "$stripped"',
+    );
+    return stripped;
   }
 
   /// STEP 3 audio-echo investigation: `FlutterPcmSound`'s self-reported
@@ -5208,24 +8759,75 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// resuming; [_onResponseAudioChunk] cancels/restarts it if more audio
   /// arrives first, so a still-playing response is never cut short by this.
   Timer? _resumeGraceTimer;
-  // BUG 2 fix (CONFIRMED: full Gemini sentences leaking into
-  // inputTranscription, e.g. "I'm showing the preview now, can you confirm
-  // you can see the picture?"): 250ms was sized only for the DOCUMENTED
-  // native-buffering lag ("tens to a couple hundred ms"). Raised to a more
-  // conservative real-device margin — cheap to widen, and a genuinely
-  // truncated sentence leaking through is a worse failure than the mic
-  // resuming an extra 150ms later than strictly necessary.
+  // P0 AUDIO-ECHO FIX (CONFIRMED via a real session: "Camera's open — ready
+  // when you are." spoken identically three times, ~6-7s apart, each
+  // immediately preceded by an ECHO BACKSTOP log discarding an
+  // inputTranscription chunk that verbatim-matched this exact sentence —
+  // i.e. echo was STILL leaking into the mic well after this delay had
+  // already elapsed and sending had already resumed). Two earlier rounds
+  // already raised this fixed delay once (250ms -> 400ms -> 600ms) chasing
+  // the same symptom each time, and it was STILL too short — proof a
+  // single fixed number can't be sized correctly here at all: how long
+  // trailing speaker output takes to actually decay below what the mic
+  // picks up depends on device speaker/mic proximity, room acoustics,
+  // playback volume and how much the platform's own AEC (this app already
+  // requests `AudioSource.voice_communication` — see `_startMicStreaming`
+  // — which engages Android's built-in acoustic echo cancellation where
+  // available) manages to suppress, none of which is knowable in advance
+  // or stable run to run.
   //
-  // PART L item 1: 4127d46d-flutter_run_log.txt's "I see you good egg."
-  // corruption is CONSISTENT with this exact overlap (a real command
-  // starting while trailing playback was still draining), but not
-  // confirmed — that specific run log isn't available in this environment
-  // to check whether an ECHO BACKSTOP discard fired immediately before this
-  // failure, which would be the direct evidence. Raised defensively anyway
-  // (400ms -> 600ms): cheap to widen further, same reasoning as the
-  // 250ms -> 400ms raise above, pending confirmation from the next real run
-  // log that this was (or wasn't) the actual mechanism here.
-  static const Duration _resumeGraceDelay = Duration(milliseconds: 600);
+  // So this is no longer the ONLY gate: [_resumeGraceDelay] is now
+  // strictly the FLOOR for the ORIGINAL, narrower concern it was created
+  // for (native PCM-buffer under-reporting, "tens to a couple hundred ms"
+  // per FlutterPcmSound's own docs) — lowered back to a value that
+  // reasoning actually justifies, since the much larger, more variable
+  // acoustic-decay concern that drove it up to 600ms is now handled
+  // separately, adaptively, by real signal instead of a guess: see
+  // [_lastLoudMicChunkAt] and [_echoTailQuietRequirement], consulted in
+  // [_maybeResumeOutgoingAudio] AFTER this floor has elapsed. The existing
+  // [_micPauseWatchdogIdleThreshold] (2s) stays exactly as-is as the
+  // ultimate backstop, so a noisy environment that never reports "quiet"
+  // still can't stall the mic forever.
+  static const Duration _resumeGraceDelay = Duration(milliseconds: 400);
+
+  /// P0 AUDIO-ECHO FIX — see [_resumeGraceDelay]'s doc comment. Timestamp
+  /// of the most recent mic chunk whose RMS amplitude exceeded
+  /// [_speechRmsThreshold], updated unconditionally (paused or not) in
+  /// [_trackSpeechLevel] — the one place per-chunk amplitude is already
+  /// computed for every chunk that arrives, echo-relevant or not. Consulted
+  /// only while [_outgoingAudioPaused], where "the mic just registered real
+  /// energy" is the most direct available evidence that trailing speaker
+  /// playback (or anything else audible) hasn't actually finished decaying
+  /// yet, REGARDLESS of what `FlutterPcmSound`'s own self-reported queue
+  /// depth says.
+  DateTime? _lastLoudMicChunkAt;
+
+  /// How long the mic must show NO chunk above [_speechRmsThreshold] before
+  /// [_maybeResumeOutgoingAudio] treats the acoustic tail as genuinely
+  /// settled. Deliberately tighter than [_utteranceBufferResetDebounce]
+  /// (2s — exists to tolerate a technician's natural mid-sentence pause, a
+  /// completely different concern) — this only needs to bridge real
+  /// speaker ring-down, not wait out conversational pacing. Re-armed every
+  /// time a new above-threshold chunk arrives during the wait (see
+  /// [_maybeResumeOutgoingAudio]), so a longer-than-usual echo tail gets
+  /// exactly as long as it actually needs, not a single fixed guess —
+  /// capped only by the pre-existing [_micPauseWatchdogIdleThreshold] (2s)
+  /// safety valve, which runs as a fully independent periodic check and
+  /// forces a resume regardless if this ever stalls unreasonably long (a
+  /// persistently noisy site, not decaying echo).
+  static const Duration _echoTailQuietRequirement = Duration(milliseconds: 450);
+
+  /// P0 AUDIO-ECHO FIX — see [_onInputTranscription]'s "ECHO TIMING" log
+  /// line. Timestamp of the most recent point outgoing mic audio actually
+  /// started sending again (a normal grace-period resume OR a watchdog
+  /// force-resume — both are "the mic started sending" events equally
+  /// relevant here), so a subsequent echo-flagged chunk can report exactly
+  /// how long after resuming it arrived. This is the real, run-to-run
+  /// measurement data this fix's own reasoning depends on: proof of
+  /// whether [_resumeGraceDelay] + [_echoTailQuietRequirement] together are
+  /// now wide enough, taken from the actual device instead of guessed at
+  /// again.
+  DateTime? _lastOutgoingMicResumedAt;
 
   /// BUG 2 fix: timestamp of the most recent GENUINE (non-suppressed,
   /// `_pcmReady`) `FlutterPcmSound.feed()` call — see
@@ -5264,6 +8866,57 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// turn arrives.
   bool _suppressResponseAudioForDeterministic = false;
 
+  /// P0 FIX (CONFIRMED via two separate real runs: one where queued PCM
+  /// chunks for "I've uploaded the photo." got wiped by
+  /// [_trackSpeechLevel]'s raw-amplitude "new utterance" reset — see that
+  /// method's own doc comment — and a SECOND, DIFFERENT run where every
+  /// chunk for the SAME line was instead dropped here, in
+  /// [_onResponseAudioChunk], logged "DETERMINISTIC INTERRUPT: dropping
+  /// N-byte response chunk (stale/superseded turn)"). Root cause of the
+  /// second path: [_muteImmediatelyOnFirstChunkOfUtterance] preemptively
+  /// re-arms [_suppressResponseAudioForDeterministic] the INSTANT any new
+  /// transcript chunk arrives — including incidental background
+  /// speech/mumbling that never resolves into any real command — racing
+  /// against and re-suppressing the confirmation's own just-requested audio
+  /// before it ever plays. The turn-interrupt system treats ALL Gemini
+  /// audio as equally interruptible, with no notion that some of it is a
+  /// direct, app-triggered consequence of an action the app itself just
+  /// took (a real upload that took real seconds) and deserves priority over
+  /// an utterance that hasn't resolved into anything yet.
+  ///
+  /// True for a short, bounded grace window (see
+  /// [_protectedConfirmationGraceDuration]) starting the instant a
+  /// protected confirmation (currently: confirm_photo_upload's own
+  /// "uploaded" line) is requested. While true,
+  /// [_muteImmediatelyOnFirstChunkOfUtterance] does NOT preemptively mute
+  /// for an incidental utterance that hasn't matched anything yet — a
+  /// GENUINE resolved command (open_camera, retake_photo, a real KB
+  /// question, ...) still interrupts normally through its own trigger-
+  /// specific [_interruptGeminiForDeterministicTrigger] call once it
+  /// actually matches; only the blind, unconditional "mute on literally any
+  /// new chunk" head-start is deferred for this window. Auto-clears via
+  /// [_protectedConfirmationTimer] rather than needing to track exactly
+  /// which turn a later `interrupted`/`turnComplete` server message belongs
+  /// to (the Live API gives no turn ID to key off).
+  bool _protectedConfirmationActive = false;
+  Timer? _protectedConfirmationTimer;
+
+  /// Generous for a short spoken confirmation sentence's worth of TTS
+  /// generation + playback (a real observed case took ~1s from request to
+  /// first audio byte) without leaving normal preemptive-mute responsiveness
+  /// degraded for any longer than necessary.
+  static const Duration _protectedConfirmationGraceDuration = Duration(seconds: 8);
+
+  /// See [_protectedConfirmationActive]'s doc comment.
+  void _beginProtectedConfirmation() {
+    _protectedConfirmationActive = true;
+    _protectedConfirmationTimer?.cancel();
+    _protectedConfirmationTimer = Timer(_protectedConfirmationGraceDuration, () {
+      _protectedConfirmationActive = false;
+      _protectedConfirmationTimer = null;
+    });
+  }
+
   /// Safety net for [_suppressResponseAudioForDeterministic]: cleared the
   /// instant a genuine `interrupted`/`turnComplete` server message arrives
   /// (see [_onServerMessage]), but if the server never sends either for
@@ -5284,6 +8937,17 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// here since there's no way to tell them apart from the wire alone.
   Timer? _suppressResponseAudioSafetyTimer;
   static const Duration _suppressResponseAudioSafetyDelay = Duration(milliseconds: 1200);
+
+  /// P0 FIX — see [_interruptGeminiForDeterministicTrigger]'s doc comment.
+  /// Used instead of [_suppressResponseAudioSafetyDelay] whenever
+  /// [_turnComplete] was ALREADY true the instant a deterministic trigger's
+  /// own interrupt call fired — meaning there was genuinely nothing
+  /// mid-turn for the server to ever send an `interrupted`/`turnComplete`
+  /// ack for, so waiting the full delay only blocks THIS SAME call's own
+  /// brand new audio behind a signal that will never arrive. Still long
+  /// enough to safely drop a couple of already-in-flight network chunks
+  /// from a genuinely old turn, if any physically remain.
+  static const Duration _suppressResponseAudioSafetyDelayWhenIdle = Duration(milliseconds: 150);
 
   /// BUG 1 fix (CONFIRMED crash: `PlatformException(Setup, must call setup
   /// first)`, repeated): root-caused to a race between
@@ -5335,57 +8999,215 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// problem this is meant to fix. Called both from the
   /// turnComplete/interrupted handling in [_onServerMessage] and from
   /// [_onPcmFeedCallback], since either can be the one that arrives second.
+  /// MIC WATCHDOG (CONFIRMED via build #38's flutter_run_log.txt, two ~55s
+  /// stalls: mic paused 13:51:42 -> resumed 13:52:37, and 13:52:46 ->
+  /// 13:53:41, both resolving right around the 50s inactivity warning). The
+  /// normal resume path in [_maybeResumeOutgoingAudio] needs BOTH a server
+  /// `turnComplete`/`interrupted` AND a native feed callback reporting
+  /// drained playback. After a client-side interrupt ([_interruptGeminiForDeterministicTrigger]
+  /// tears the native player down with release()/setup()) neither is
+  /// guaranteed: the stale turn's server signal can be late/absent, and the
+  /// native feed callback has nothing left to fire about — so the only thing
+  /// that ever re-ran the check was some unrelated event. This watchdog does
+  /// not depend on either signal: it polls independently for as long as the
+  /// mic is paused, and force-resumes once the estimated real end of
+  /// playback ([_expectedPlaybackEndAt], derived from the bytes actually
+  /// fed) is more than [_micPauseWatchdogIdleThreshold] in the past.
+  Timer? _micPauseWatchdogTimer;
+  DateTime? _micPausedAt;
+  DateTime? _expectedPlaybackEndAt;
+  static const Duration _micPauseWatchdogPollInterval = Duration(seconds: 1);
+  static const Duration _micPauseWatchdogIdleThreshold = Duration(seconds: 2);
+
+  void _startMicPauseWatchdog() {
+    _micPausedAt = DateTime.now();
+    _micPauseWatchdogTimer?.cancel();
+    _micPauseWatchdogTimer = Timer.periodic(_micPauseWatchdogPollInterval, (_) => _checkMicPauseWatchdog());
+  }
+
+  void _stopMicPauseWatchdog() {
+    _micPauseWatchdogTimer?.cancel();
+    _micPauseWatchdogTimer = null;
+    _micPausedAt = null;
+  }
+
+  /// Force-resumes the mic if it's paused and no genuine playback is (or is
+  /// expected to still be) underway. [idleThreshold] is shortened by the
+  /// mute/drop paths (see [_onResponseAudioChunk]) — chunks being DROPPED
+  /// are proof nothing real is playing for them, so there's no reason to
+  /// wait out the full default.
+  void _checkMicPauseWatchdog({Duration idleThreshold = _micPauseWatchdogIdleThreshold}) {
+    if (!_outgoingAudioPaused) {
+      _stopMicPauseWatchdog();
+      return;
+    }
+    // ECHO LOOP FIX — see [_pcmFeedsInFlight]: audio still on its way to
+    // the native player hasn't even started playing yet, so nothing about
+    // it can be "idle". Capped: a feed that hasn't come back 30s after the
+    // last chunk was sent is never going to, and the mic must not stay
+    // paused forever on it.
+    //
+    // Nor while the player still reports queued frames or hasn't confirmed
+    // it played everything (CONFIRMED in a real trace: every one of six
+    // echo transcripts came right after this watchdog force-resumed on its
+    // time estimate — once with 7341 frames still reported queued — while
+    // the reply was still playing, 2.6-11.7s before the player's own "0
+    // remaining" arrived).
+    final now = DateTime.now();
+    final lastFedAt = _lastAudioChunkFedAt;
+    final playerNotConfirmedDone = _pcmFeedsInFlight > 0 || _pcmRemainingFrames > 0 || !_nativePlaybackDrainConfirmed;
+    if (playerNotConfirmedDone && lastFedAt != null && now.difference(lastFedAt) < const Duration(seconds: 30)) {
+      return;
+    }
+    final pausedAt = _micPausedAt ?? now;
+    // Idle time is measured from whichever is LATEST: when the pause began,
+    // when the audio we fed should have finished playing counting from when
+    // we SENT it, or counting from when the native player actually GOT it
+    // ([_ackBasedPlaybackEndAt] — later than the first whenever the Android
+    // main thread delays delivery, which the camera screens routinely do).
+    var idleSince = pausedAt;
+    for (final end in [_expectedPlaybackEndAt, _ackBasedPlaybackEndAt]) {
+      if (end != null && end.isAfter(idleSince)) idleSince = end;
+    }
+    final idleFor = now.difference(idleSince);
+    if (idleFor < idleThreshold) return;
+    final stuckMs = now.difference(pausedAt).inMilliseconds;
+    _log_(
+      'MIC WATCHDOG: forcing resume after ${stuckMs}ms stuck paused (no audio playing or expected to be playing '
+      'for ${idleFor.inMilliseconds}ms; turnComplete=$_turnComplete, pcmRemainingFrames=$_pcmRemainingFrames)',
+    );
+    _resumeGraceTimer?.cancel();
+    _resumeGraceTimer = null;
+    _turnComplete = true;
+    _outgoingAudioPaused = false;
+    _stopMicPauseWatchdog();
+    // P0 AUDIO-ECHO FIX — see [_lastOutgoingMicResumedAt]'s doc comment: a
+    // forced watchdog resume is still "the mic started sending again" for
+    // the ECHO TIMING measurement's purposes, so it counts too.
+    _lastOutgoingMicResumedAt = DateTime.now();
+    _syncVoicePhase();
+    _resetInactivityTimer(reason: 'mic watchdog forced resume');
+  }
+
   void _maybeResumeOutgoingAudio() {
     if (!_outgoingAudioPaused) return;
     if (!_turnComplete) return;
     if (_pcmRemainingFrames > 0) return;
+    // ECHO LOOP FIX — see [_pcmFeedsInFlight]. `_pcmRemainingFrames == 0`
+    // only means "drained" if it was reported AFTER the native player had
+    // received every chunk we fed; before that it's a stale reading of an
+    // empty queue the reply hasn't reached yet.
+    if (!_nativePlaybackDrainConfirmed) return;
+    if (_pcmPrebuffer.isNotEmpty) return; // jitter buffer still holds audio not yet written
     if (_resumeGraceTimer != null) return;
     _log_(
-      'outgoing mic audio: playback appears drained — waiting ${_resumeGraceDelay.inMilliseconds}ms grace '
-      'period before resuming (STEP 3 audio-echo fix: absorbs native audio buffering lag beyond what '
-      'FlutterPcmSound self-reports, so trailing speaker output has time to actually finish before the mic '
-      'sends again)',
+      'outgoing mic audio: playback appears drained — waiting at least ${_resumeGraceDelay.inMilliseconds}ms '
+      '(native-buffer floor) before resuming, then requiring the mic itself to report '
+      '${_echoTailQuietRequirement.inMilliseconds}ms of genuine quiet on top of that (P0 audio-echo fix — see '
+      '[_resumeGraceDelay]\'s doc comment for why a single fixed delay alone was proven insufficient)',
     );
-    _resumeGraceTimer = Timer(_resumeGraceDelay, () {
-      _resumeGraceTimer = null;
-      // Re-check: more audio may have arrived (a new response chunk, or the
-      // turn was un-completed) during the grace period itself.
-      if (!_outgoingAudioPaused || !_turnComplete || _pcmRemainingFrames > 0) {
-        _log_('outgoing mic audio: grace period elapsed but conditions changed — not resuming yet');
+    // P0 AUDIO-ECHO FIX: every re-arm below now schedules
+    // [_resumeGraceTimerFired] itself (never this outer method) as the
+    // timer callback, and that shared callback unconditionally nulls
+    // [_resumeGraceTimer] as its very first line. Previously a re-armed
+    // timer's callback was this SAME outer method, whose own guard
+    // (`if (_resumeGraceTimer != null) return;`, checked above) would
+    // still see its own not-yet-nulled Timer object as "in flight" the
+    // instant it fired — silently swallowing that resume attempt entirely
+    // until the separate 2s mic-pause watchdog eventually bailed it out.
+    // Rare in practice (only the BUG 2 lastFed race path could hit it),
+    // but the new echo-tail re-arm below would hit this same trap far more
+    // routinely (it's expected to re-arm whenever real trailing echo is
+    // detected), so this is fixed as part of building it correctly rather
+    // than inherited.
+    _resumeGraceTimer = Timer(_resumeGraceDelay, _resumeGraceTimerFired);
+  }
+
+  void _resumeGraceTimerFired() {
+    _resumeGraceTimer = null;
+    // Re-check: more audio may have arrived (a new response chunk, or the
+    // turn was un-completed) since this timer was armed.
+    if (!_outgoingAudioPaused || !_turnComplete || _pcmRemainingFrames > 0) {
+      _log_('outgoing mic audio: grace period elapsed but conditions changed — not resuming yet');
+      return;
+    }
+    // BUG 2 fix: also require real wall-clock time since the last GENUINE
+    // feed() call — closes a sequencing race `_pcmRemainingFrames` alone
+    // can't (see [_lastAudioChunkFedAt]'s doc comment: that field is only
+    // as fresh as the last native callback, so it can still read
+    // "drained" from BEFORE the last chunk's `feed()` call is reflected).
+    // If a chunk was genuinely fed more recently than the full grace
+    // delay, wait out the remainder instead of resuming early.
+    final lastFed = _lastAudioChunkFedAt;
+    if (lastFed != null) {
+      final elapsed = DateTime.now().difference(lastFed);
+      if (elapsed < _resumeGraceDelay) {
+        final remaining = _resumeGraceDelay - elapsed;
+        _log_(
+          'outgoing mic audio: last chunk fed only ${elapsed.inMilliseconds}ms ago (< '
+          '${_resumeGraceDelay.inMilliseconds}ms floor) — waiting ${remaining.inMilliseconds}ms more before '
+          'resuming',
+        );
+        _resumeGraceTimer = Timer(remaining, _resumeGraceTimerFired);
         return;
       }
-      // BUG 2 fix: also require real wall-clock time since the last GENUINE
-      // feed() call — closes a sequencing race `_pcmRemainingFrames` alone
-      // can't (see [_lastAudioChunkFedAt]'s doc comment: that field is only
-      // as fresh as the last native callback, so it can still read
-      // "drained" from BEFORE the last chunk's `feed()` call is reflected).
-      // If a chunk was genuinely fed more recently than the full grace
-      // delay, wait out the remainder instead of resuming early.
-      final lastFed = _lastAudioChunkFedAt;
-      if (lastFed != null) {
-        final elapsed = DateTime.now().difference(lastFed);
-        if (elapsed < _resumeGraceDelay) {
-          final remaining = _resumeGraceDelay - elapsed;
-          _log_(
-            'outgoing mic audio: last chunk fed only ${elapsed.inMilliseconds}ms ago (< '
-            '${_resumeGraceDelay.inMilliseconds}ms grace) — waiting ${remaining.inMilliseconds}ms more before '
-            'resuming',
-          );
-          _resumeGraceTimer = Timer(remaining, _maybeResumeOutgoingAudio);
-          return;
-        }
+    }
+    // P0 AUDIO-ECHO FIX — the real fix. The native-buffer floor above has
+    // now genuinely elapsed; before resuming, also require the MIC ITSELF
+    // to have shown no above-threshold energy for [_echoTailQuietRequirement]
+    // — real evidence trailing speaker output has actually decayed, rather
+    // than trusting a fixed delay to have guessed correctly. If the mic
+    // registered energy very recently (real echo still audible, OR the
+    // technician has already started talking over the tail — either way,
+    // sending right now risks exactly the leak this whole mechanism exists
+    // to prevent), wait out the remainder and re-check; re-armed for as
+    // long as fresh energy keeps arriving, bounded only by the existing,
+    // fully independent [_micPauseWatchdogIdleThreshold] (2s) safety valve
+    // so persistent background noise (a loud job site, not decaying echo)
+    // can never stall the mic indefinitely.
+    final lastLoud = _lastLoudMicChunkAt;
+    if (lastLoud != null) {
+      final sinceLoud = DateTime.now().difference(lastLoud);
+      if (sinceLoud < _echoTailQuietRequirement) {
+        final remaining = _echoTailQuietRequirement - sinceLoud;
+        _log_(
+          'outgoing mic audio: mic registered real energy ${sinceLoud.inMilliseconds}ms ago (< '
+          '${_echoTailQuietRequirement.inMilliseconds}ms quiet requirement) — likely still-decaying speaker '
+          'echo, waiting ${remaining.inMilliseconds}ms more before resuming (P0 audio-echo adaptive fix)',
+        );
+        _resumeGraceTimer = Timer(remaining, _resumeGraceTimerFired);
+        return;
       }
-      _outgoingAudioPaused = false;
-      _log_('outgoing mic audio RESUMED (response playback finished + grace period elapsed)');
-      _pausedVoiceService?.setExternalSessionPhase(VoicePhase.listening);
-      // BUG FIX: a response finishing playback is itself a genuine "the
-      // conversation is active" signal — reset here too, not just on
-      // technician speech/toolCalls, so a session kept alive purely by long
-      // back-and-forth turns (little raw silence, but long stretches where
-      // only Gemini's own audio is playing) never times out while genuinely
-      // active.
-      _resetInactivityTimer(reason: 'outgoing mic audio resumed (response playback finished)');
-    });
+    }
+    _outgoingAudioPaused = false;
+    _stopMicPauseWatchdog();
+    final now = DateTime.now();
+    _lastOutgoingMicResumedAt = now;
+    _log_(
+      'outgoing mic audio RESUMED (response playback finished, ${_resumeGraceDelay.inMilliseconds}ms floor '
+      'elapsed, mic quiet for >= ${_echoTailQuietRequirement.inMilliseconds}ms)',
+    );
+    _syncVoicePhase();
+    // P0 FIX (CONFIRMED regression, REMOVED — was: resetting the
+    // inactivity timer here too "so a session kept alive purely by long
+    // back-and-forth turns never times out while genuinely active"):
+    // this made the 50s-warning/60s-close pair unreliable to the point of
+    // never firing at all. [_fireInactivityWarning] speaks its own "Still
+    // there?" line through this EXACT pause->resume cycle — so the very
+    // act of warning the technician immediately re-armed the FULL 50s/60s
+    // window again, every time, forever. CONFIRMED via a real session:
+    // the warning spoke in full three separate times over ~75s and the
+    // session never actually closed. The genuine "a long real response
+    // must not be mistaken for silence" concern this was protecting is
+    // already covered by TWO other, more targeted mechanisms that don't
+    // have this self-defeating property: [_inFlightFunctionCalls] (every
+    // dispatch, deterministic or toolCall, suspends both timers for its
+    // own duration — this is what actually protects a slow open_camera/
+    // get_kb_answer call, not this site) and the genuine technician input
+    // that started the exchange in the first place (which already reset
+    // the full window via 'technician transcription chunk received'
+    // before Gemini ever started responding). Neither of those can be
+    // re-triggered by Gemini's own voice the way this site could.
   }
 
   /// [FlutterPcmSound.setFeedCallback] fires with how many sample frames are
@@ -5395,7 +9217,47 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// WebSocket (see [_onResponseAudioChunk]).
   void _onPcmFeedCallback(int remainingFrames) {
     _pcmRemainingFrames = remainingFrames;
+    // This report was sent by the native side after it had processed every
+    // feed() already acknowledged back to us (both travel the same
+    // platform-channel queue, in order) — so it describes those chunks.
+    _pcmFeedSeqAtLastReport = _pcmFeedSeqAcked;
+    if (remainingFrames == 0 && _nativePlaybackDrainConfirmed) _nativePlaybackEndConfirmedAt = DateTime.now();
     _maybeResumeOutgoingAudio();
+  }
+
+  /// ECHO LOOP FIX (CONFIRMED in a real trace, every instance on the camera
+  /// screens): the mic resumed at 14:58:42.167 on a "playback drained"
+  /// reading, and only AFTER that did the native player report
+  /// `remaining_frames: 5675 … 7975 … 0` — Gemini's "Camera's open — ready
+  /// when you are." was still queued and then played into the open mic,
+  /// which transcribed it as the technician speaking, and the replies to
+  /// those echoes echoed in turn. Cause: `FlutterPcmSound.feed()` and the
+  /// native "frames remaining" report both travel through the Android main
+  /// thread, which the camera keeps busy for seconds at a time (the
+  /// capture probe measured 2.4-19s round trips), so the reply was still in
+  /// transit to the player when the stale "0 remaining" was read as
+  /// drained. These three track what the native side has actually
+  /// confirmed: feeds not yet acknowledged, the newest acknowledged feed,
+  /// and which acknowledged feed the latest remaining-frames report covers.
+  int _pcmFeedsInFlight = 0;
+  int _pcmFeedSeq = 0;
+  int _pcmFeedSeqAcked = 0;
+  int _pcmFeedSeqAtLastReport = 0;
+
+  /// Earliest the fed audio can finish playing, counting from when the
+  /// native player acknowledged each chunk rather than when it was sent.
+  DateTime? _ackBasedPlaybackEndAt;
+
+  /// Every chunk fed has reached the native player, and its latest
+  /// remaining-frames report was sent after that.
+  bool get _nativePlaybackDrainConfirmed => _pcmFeedsInFlight == 0 && _pcmFeedSeqAtLastReport == _pcmFeedSeq;
+
+  /// The native player (and its queue) was torn down and rebuilt — nothing
+  /// fed before this can still play, so nothing is left to confirm.
+  void _markNativePlaybackQueueReset() {
+    _pcmFeedSeqAcked = _pcmFeedSeq;
+    _pcmFeedSeqAtLastReport = _pcmFeedSeq;
+    _nativePlaybackEndConfirmedAt = DateTime.now();
   }
 
   /// Matches the `rate=<digits>` parameter Gemini puts on the response
@@ -5420,6 +9282,49 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   ///     in [_onServerMessage]) or [_suppressResponseAudioSafetyDelay]
   ///     elapses, whichever first.
   void _interruptGeminiForDeterministicTrigger(String reason) {
+    // P0 FIX (CONFIRMED via flutter_run_log_new.txt, build #63): the
+    // "protected confirmation" fix from the previous round stopped an
+    // INCIDENTAL utterance from re-arming suppression, but did nothing
+    // about THIS call's own initiating interrupt — confirm_photo_upload's
+    // post-success "I've uploaded the photo." request goes through
+    // [_informGeminiToSpeakVerbatim], which calls this method FIRST,
+    // before sending the clientContent instruction. That call sets
+    // [_suppressResponseAudioForDeterministic] true (correct — it must cut
+    // off any STALE prior audio before the new instruction goes out), but
+    // then [_armSuppressResponseAudioSafetyTimer] waited the FULL
+    // [_suppressResponseAudioSafetyDelay] (1.2s) for a server
+    // `interrupted`/`turnComplete` ack that, in this exact scenario,
+    // NEVER ARRIVES — because the previous turn had already completed
+    // cleanly ~9 seconds earlier (the whole upload duration), so there was
+    // genuinely nothing mid-turn to interrupt in the first place. The
+    // confirmation's OWN brand new audio started streaming back almost
+    // immediately and got dropped as "stale/superseded" for the entire
+    // 1.2s, chunk by chunk, until the safety timeout finally fired — by
+    // which point the whole line had already played out and been
+    // discarded.
+    //
+    // [_turnComplete] (true only once a turn has genuinely finished AND no
+    // new response has started arriving — see its own doc comment)
+    // captured HERE, before anything below changes it, tells us exactly
+    // whether there's a genuine mid-turn stale response to wait for an ack
+    // on. When there isn't, the safety timer uses a much shorter delay —
+    // still enough to safely drop a couple of already-in-flight network
+    // chunks from a truly old turn, if any, but not a full 1.2s blocking
+    // this call's own just-requested audio.
+    final safetyDelay = _turnComplete ? _suppressResponseAudioSafetyDelayWhenIdle : _suppressResponseAudioSafetyDelay;
+    // Snapshot BEFORE anything below zeroes it: was the native player
+    // actually holding any audio? Outgoing mic audio only resumes once
+    // playback has fully drained (see [_maybeResumeOutgoingAudio]), and
+    // [_pcmRemainingFrames] is the native queue's own report — so with the
+    // mic sending and nothing reported queued, a release/setup below would
+    // have nothing to discard. See the camera branch in the reinit chain.
+    // Also requires the player's own confirmation that it played every
+    // chunk we fed it ([_nativePlaybackDrainConfirmed]) — the time estimate
+    // alone was proven wrong by seconds on the camera screens.
+    final nativePlaybackWasIdle = !_outgoingAudioPaused &&
+        _pcmRemainingFrames == 0 &&
+        _nativePlaybackDrainConfirmed &&
+        !(_expectedPlaybackEndAt?.isAfter(DateTime.now()) ?? false);
     // PART F items 4-5: any REAL resolution (a known trigger firing, or
     // the KB catch-all's own real answer/boundary decline — anything
     // other than the preemptive mute's own initial call) graduates/
@@ -5434,8 +9339,19 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
     _log_('DETERMINISTIC INTERRUPT: muting/discarding any in-progress Gemini audio ($reason)');
     debugPrint('PHOTO TIMING [interrupt]: deterministic trigger cutting off Gemini\'s own response ($reason)');
+    // P0 FIX — see [_currentResponseTurnId]'s doc comment: unconditionally,
+    // every call (not gated on whether a real PCM reinit happens below) —
+    // "I'm about to ask for something new" is true regardless of whether
+    // the native player itself needs rebuilding.
+    _currentResponseTurnId++;
     _suppressResponseAudioForDeterministic = true;
     _pcmRemainingFrames = 0;
+    _discardPcmPrebuffer('deterministic interrupt');
+    // MIC WATCHDOG — the native player is being torn down right now, so
+    // whatever was queued for playback is silenced immediately: the
+    // estimated playback end is now, not whenever the discarded audio would
+    // have finished.
+    _expectedPlaybackEndAt = DateTime.now();
     // BUG 1 fix: `_pcmReady = false` is set SYNCHRONOUSLY, right now, before
     // any `await` — so even if `_suppressResponseAudioForDeterministic`
     // gets cleared a moment later by a completely independent code path
@@ -5452,15 +9368,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         'PHOTO TIMING [interrupt]: PCM reinit SKIPPED (no-op, reason=$reason) — already reinitialized once for '
         'this utterance (generation $_pcmReinitGeneration)',
       );
-      _suppressResponseAudioSafetyTimer?.cancel();
-      _suppressResponseAudioSafetyTimer = Timer(_suppressResponseAudioSafetyDelay, () {
-        if (!_suppressResponseAudioForDeterministic) return;
-        _log_(
-          'DETERMINISTIC INTERRUPT: safety timeout (${_suppressResponseAudioSafetyDelay.inSeconds}s) — no '
-          'interrupted/turnComplete seen for the stale turn, un-muting anyway',
-        );
-        _suppressResponseAudioForDeterministic = false;
-      });
+      _armSuppressResponseAudioSafetyTimer(safetyDelay);
       return;
     }
     _pcmReinitIssuedForCurrentUtterance = true;
@@ -5471,9 +9379,55 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // firing a second concurrent release()/setup() pair at the native side —
     // see [_pcmReinitChain]'s doc comment.
     _pcmReinitChain = _pcmReinitChain.then((_) async {
+      // CAPTURE SPEED FIX (CONFIRMED via a real trace: platform_capture_call
+      // took 11.1s, ~6.4s of it BEFORE CameraX even started the capture).
+      // FlutterPcmSound's release()/setup() both run `cleanup()` ON THE
+      // ANDROID MAIN THREAD, which joins the playback thread (blocked in a
+      // WRITE_BLOCKING AudioTrack write) — measured 0.8-4.4s per reinit in
+      // that trace, and this reinit is issued on the first transcript chunk
+      // of EVERY utterance, i.e. milliseconds before the capture/open it
+      // resolves to starts its own chain of main-thread CameraX calls. When
+      // that camera call is in flight AND the player held nothing to
+      // discard (the normal case: the technician could only be heard
+      // because playback had already drained), tearing the player down
+      // bought nothing and cost the camera seconds — so the native
+      // release/setup is skipped. Every other effect of the interrupt
+      // (turn id bump, Dart-side suppression and prebuffer discard) already
+      // ran above, unchanged; if anything WAS playing, this reinit runs
+      // exactly as before.
+      //
+      // LATENCY FIX (CONFIRMED in the next trace): the same skip now applies
+      // whenever the player is confirmed idle, not only during a camera
+      // call. Every large reply-latency spike in that trace (19.1s, 16.7s,
+      // 11.5s, and a 15s-late scripted line) was a scripted reply that
+      // Gemini had generated correctly within ~0.7s, then held in the PCM
+      // queue behind one of these release/setup pairs taking 1.5-15s on the
+      // congested main thread — while the player had nothing to discard.
+      if (nativePlaybackWasIdle) {
+        if (myGeneration == _pcmReinitGeneration) {
+          _pcmReady = true;
+          debugPrint(
+            'PHOTO TIMING [interrupt]: PCM reinit SKIPPED — player confirmed idle (generation $myGeneration, '
+            'reason=$reason, cameraNativeCallInProgress=$_cameraNativeCallInProgress) — nothing was queued for '
+            'playback, and release/setup would hold the next reply behind seconds of Android main-thread work',
+          );
+          _flushQueuedPcmChunksForGeneration(myGeneration);
+        }
+        return;
+      }
       try {
+        final nativeWatch = Stopwatch()..start();
         await FlutterPcmSound.release();
+        final releaseMs = nativeWatch.elapsedMilliseconds;
         await FlutterPcmSound.setup(sampleRate: _outputSampleRateHz, channelCount: 1);
+        // Every feed sent before the release was processed ahead of it
+        // (same platform queue), then destroyed with the old player.
+        _markNativePlaybackQueueReset();
+        debugPrint(
+          'PHOTO TIMING [interrupt]: PCM native release took ${releaseMs}ms, setup took '
+          '${nativeWatch.elapsedMilliseconds - releaseMs}ms (both on the Android main thread; '
+          'cameraNativeCallInProgress=$_cameraNativeCallInProgress)',
+        );
         FlutterPcmSound.setFeedCallback(_onPcmFeedCallback);
         FlutterPcmSound.start();
         if (myGeneration == _pcmReinitGeneration) {
@@ -5490,12 +9444,45 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         debugPrint('GEMINI LIVE TEST ERROR (interrupt: PCM reinit): $e\n$stackTrace');
       }
     });
+    _armSuppressResponseAudioSafetyTimer(safetyDelay);
+  }
+
+  /// ISSUE 3(b) (CONFIRMED via f5a8bd8b-flutter_run_log.txt: this 1.2s
+  /// safety timeout un-muted Gemini's audio while the technician's real
+  /// get_kb_answer request was still genuinely being resolved — a stale/
+  /// forbidden general-knowledge fragment played audibly in the resulting
+  /// window before the request actually finished). Un-muting after a fixed
+  /// delay is only correct for the genuine "nothing is happening, stop
+  /// waiting" case — a real dispatch that's simply slow (backend latency,
+  /// not a bug on its own) must never be treated the same way. Checks
+  /// [_inFlightFunctionCalls] (see [_beginFunctionCallInFlight]/
+  /// [_endFunctionCallInFlight] — incremented the instant ANY real function
+  /// call, deterministic or genuine toolCall, starts dispatching) before
+  /// actually un-muting: if something is still genuinely in flight, this
+  /// defers by re-arming itself for another [delay] instead, repeating for
+  /// as long as that stays true. Only un-mutes once nothing is pending — a
+  /// genuine STT/pattern-match failure with no dispatch to wait for at all.
+  /// [delay] is [_suppressResponseAudioSafetyDelay] normally, or the much
+  /// shorter [_suppressResponseAudioSafetyDelayWhenIdle] when the caller
+  /// ([_interruptGeminiForDeterministicTrigger]) already knew nothing was
+  /// genuinely mid-turn — see that method's doc comment.
+  void _armSuppressResponseAudioSafetyTimer(Duration delay) {
     _suppressResponseAudioSafetyTimer?.cancel();
-    _suppressResponseAudioSafetyTimer = Timer(_suppressResponseAudioSafetyDelay, () {
+    _suppressResponseAudioSafetyTimer = Timer(delay, () {
       if (!_suppressResponseAudioForDeterministic) return;
+      if (_inFlightFunctionCalls > 0) {
+        _log_(
+          'DETERMINISTIC INTERRUPT: safety timeout (${delay.inMilliseconds}ms) reached but '
+          '$_inFlightFunctionCalls function call(s) still genuinely in flight — deferring un-mute instead of '
+          'letting a stale/forbidden response play over a real dispatch still in progress; checking again in '
+          'another ${delay.inMilliseconds}ms.',
+        );
+        _armSuppressResponseAudioSafetyTimer(delay);
+        return;
+      }
       _log_(
-        'DETERMINISTIC INTERRUPT: safety timeout (${_suppressResponseAudioSafetyDelay.inSeconds}s) — no '
-        'interrupted/turnComplete seen for the stale turn, un-muting anyway',
+        'DETERMINISTIC INTERRUPT: safety timeout (${delay.inMilliseconds}ms) — no '
+        'interrupted/turnComplete seen for the stale turn, nothing genuinely in flight either, un-muting anyway',
       );
       _suppressResponseAudioForDeterministic = false;
     });
@@ -5515,13 +9502,76 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// every informing call already did, so whatever Gemini might already be
   /// generating for the ORIGINAL utterance is cut off before this new,
   /// correct turn plays.
-  void _informGeminiToSpeakVerbatim(String text, {required String reason}) {
+  ///
+  /// P0 investigation (double-generation regression — see
+  /// [_currentResponseTurnId]'s doc comment for the actual fix): confirmed
+  /// this file's OWN existing doc comments are correct that the Live API
+  /// client protocol has no separate cancel-then-wait-then-instruct
+  /// exchange — `setup`/`clientContent`/`realtimeInput`/`toolResponse` are
+  /// the entire client message vocabulary, so sending a new `clientContent`
+  /// turn IS simultaneously the interrupt signal AND the new instruction;
+  /// there is no earlier, separate message this method could send and
+  /// await an ack for before the real instruction goes out. This method
+  /// already sends its interrupt (via [_interruptGeminiForDeterministicTrigger])
+  /// as early as this app's text-based trigger matching can possibly fire
+  /// (synchronously, the instant a match resolves — see
+  /// [_muteImmediatelyOnFirstChunkOfUtterance], which goes further and
+  /// interrupts unconditionally on an utterance's FIRST transcript chunk,
+  /// before any specific trigger has even matched). Given the model can
+  /// start generating a free-text reply from raw realtimeInput audio
+  /// BEFORE this app's own transcript-based matching has anything to react
+  /// to at all, some window for a race is architecturally unavoidable —
+  /// what actually closes the confirmed failure (the technician hearing
+  /// NOTHING) is making sure the client-side handling of that race can
+  /// never silently eat the one turn that should have played, which is
+  /// what [_currentResponseTurnId]'s per-chunk tagging now guarantees.
+  void _informGeminiToSpeakVerbatim(String text, {required String reason, bool isFiller = false}) {
     final channel = _channel;
+    _pipelineLog(
+      'reply_requested',
+      'reason=$reason${channel == null ? ' — NOT SENT: WebSocket already closed' : ''} text="$text"',
+    );
     if (channel == null) {
       _log_('$reason: WebSocket already closed — cannot inform Gemini');
       return;
     }
+    // P1 FIX — a no-change status line ("We're already on the estimate.")
+    // repeated word-for-word seconds later, because the technician repeated
+    // the command, reads as the app being stuck. Only these no-op lines are
+    // shortened; a real action's confirmation always speaks in full.
+    if (!isFiller && _isNoChangeStatusLine(text)) {
+      final last = _lastNoChangeStatusLine;
+      final now = DateTime.now();
+      if (last != null && last.text == text && now.difference(last.at) < _noChangeRepeatWindow) {
+        _log_('$reason: same no-change line spoken ${now.difference(last.at).inMilliseconds}ms ago — short ack instead');
+        text = _noChangeRepeatAck;
+      } else {
+        _lastNoChangeStatusLine = (text: text, at: now);
+      }
+    }
     _interruptGeminiForDeterministicTrigger(reason);
+    // See [_awaitingFirstTranscriptOfUtterance]: this line's audio is ours.
+    _scriptedResponsePending = true;
+    // P0 FIX — see [_verbatimInstructionRetryCount]'s doc comment: the
+    // retry budget is per-LINE, not a single session-wide allowance. A
+    // genuinely NEW/different line (not [reason] itself — a retry reuses
+    // the exact same [text] under a different reason string) gets a fresh
+    // budget; a retry of the SAME text (the leak-recovery call site
+    // itself) must NOT reset its own counter back to 0, or the bound
+    // would never actually apply.
+    //
+    // [isFiller] — see [_speakPendingCallFiller]: a filler must not touch
+    // either field, or it would become the line the audit exempts and the
+    // leak-retry re-speaks.
+    if (!isFiller) {
+      if (text != _lastVerbatimScriptText) {
+        _verbatimInstructionRetryCount = 0;
+      }
+      // P0 TRUST FIX — see [_lastVerbatimScriptText]: remembered so
+      // [_auditGeminiCompletionClaim] can tell a line WE scripted (always
+      // post-success by construction) from a free-text guess.
+      _lastVerbatimScriptText = text;
+    }
     final instruction =
         'Say exactly and only the following, with no additions, no preamble, and no extra commentary: '
         "'$text'";
@@ -5540,6 +9590,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     });
     channel.sink.add(message);
     _log_('$reason: informed Gemini via clientContent (constrained verbatim instruction)');
+    // See [_awaitingScriptedTurnWords]: from THIS send on, a turn only
+    // plays once it's identified as this line, not because a timer fired.
+    _beginAwaitingScriptedTurn(text);
   }
 
   /// Un-mutes [_suppressResponseAudioForDeterministic] the instant the
@@ -5557,19 +9610,113 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   }
 
   void _onResponseAudioChunk(Uint8List pcmBytes, {required String? mimeType}) {
-    // PART K — see [_cameraNativeCallInProgress]'s doc comment: no legitimate NEW
-    // response is expected while the camera is mid-open (its own
-    // acknowledgment is sent only after this flag clears), so this is a
-    // hard drop, not a queue — nothing worth preserving arrives here.
-    if (_cameraNativeCallInProgress) {
-      _log_(
-        'CAMERA OPEN IN PROGRESS: dropping ${pcmBytes.length}-byte response chunk — all audio feed processing '
-        'is hard-paused until the camera controller reports back',
+    // ISSUE 3(c) (CONFIRMED via fbd877f0-flutter_run_log.txt: "Skipped 120
+    // frames" — a genuine ~2s main-thread freeze — fired DURING the live
+    // camera preview window). Root cause: every one of the three drop
+    // branches below used to call `_log_`, which calls `setState` — a full
+    // widget-tree rebuild — for EVERY SINGLE dropped response chunk, not
+    // just once per gate engaging. While muted (preemptive-default-mute in
+    // particular can now legitimately last several seconds waiting on a
+    // real KB answer — see ISSUE 1), Gemini's own response audio keeps
+    // streaming in at normal chunk cadence, so this was tens of setState
+    // calls per second, competing directly with CameraX's own preview
+    // rendering for the same main thread/isolate. `debugPrint` alone (same
+    // text, same "PHOTO TIMING"-style convention every high-frequency log
+    // line in this file already uses — see [_onMicChunk]'s own
+    // edge-triggered logging for the identical "don't flood the log/UI"
+    // reasoning) keeps this fully visible in the real log file without ever
+    // touching widget state.
+    // MIC WATCHDOG item 4 — a chunk dropped by any mute path below is proof
+    // nothing real is playing for it, so don't make the technician's mic
+    // wait out that discarded turn: check the watchdog immediately with a
+    // short idle threshold (a no-op unless the mic is actually paused, and
+    // only ever logs when it force-resumes).
+    if (_cameraNativeCallInProgress && !_fillerPassthroughActive) {
+      debugPrint(
+        'GEMINI LIVE TEST: CAMERA OPEN IN PROGRESS: dropping ${pcmBytes.length}-byte response chunk — all audio '
+        'feed processing is hard-paused until the camera controller reports back',
+      );
+      return;
+    }
+    if (_holdingForUnclassifiedUtterance) {
+      debugPrint(
+        'GEMINI LIVE TEST: UNCLASSIFIED UTTERANCE HOLD: dropping ${pcmBytes.length}-byte response chunk — '
+        'technician is speaking and no transcript has arrived yet to classify it',
+      );
+      return;
+    }
+    // Turn-identity gate — see [_awaitingScriptedTurnWords]. While we're
+    // waiting to see which turn is the scripted one, a known-stale turn is
+    // dropped and an unidentified one is HELD, never played on timing alone.
+    if (_awaitingScriptedTurnWords != null) {
+      if (_currentTurnKnownStale) {
+        debugPrint(
+          'GEMINI LIVE TEST: STALE TURN: dropping ${pcmBytes.length}-byte response chunk — this turn is not '
+          'the scripted line we asked for (it started before our clientContent was processed)',
+        );
+        if (_outgoingAudioPaused) _checkMicPauseWatchdog(idleThreshold: const Duration(milliseconds: 1000));
+        return;
+      }
+      if (_heldUnidentifiedTurnChunks.isEmpty) _armScriptIdentityTimer(_scriptIdentityHoldTimeout);
+      _heldUnidentifiedTurnChunks.add((bytes: pcmBytes, mimeType: mimeType));
+      debugPrint(
+        'GEMINI LIVE TEST: TURN IDENTITY: holding ${pcmBytes.length}-byte response chunk '
+        '(${_heldUnidentifiedTurnChunks.length} held) until its transcript shows whether it is the scripted line',
       );
       return;
     }
     if (_suppressResponseAudioForDeterministic) {
-      _log_('DETERMINISTIC INTERRUPT: dropping ${pcmBytes.length}-byte response chunk (stale/superseded turn)');
+      // P0 FIX — see [_protectedConfirmationActive]'s doc comment: this is
+      // exactly the second code path that CONFIRMED-dropped an entire
+      // post-confirm_photo_upload "uploaded" confirmation, chunk by chunk,
+      // in a real run. [_muteImmediatelyOnFirstChunkOfUtterance] no longer
+      // re-arms suppression for an incidental unresolved utterance during
+      // the protected window, so reaching this branch while
+      // [_protectedConfirmationActive] is still true means suppression was
+      // re-armed by something else — most likely a GENUINE resolved command
+      // legitimately interrupting, which is correct, but loud and
+      // greppable either way so a future regression here can't hide.
+      if (_protectedConfirmationActive) {
+        debugPrint(
+          'GEMINI LIVE TEST: PROTECTED CONFIRMATION AUDIO DROPPED: ${pcmBytes.length}-byte chunk dropped as '
+          'stale/superseded WHILE a protected confirmation was still pending — check what re-armed '
+          '_suppressResponseAudioForDeterministic during this window.',
+        );
+      }
+      debugPrint(
+        'GEMINI LIVE TEST: DETERMINISTIC INTERRUPT: dropping ${pcmBytes.length}-byte response chunk '
+        '(stale/superseded turn)',
+      );
+      if (_outgoingAudioPaused) _checkMicPauseWatchdog(idleThreshold: const Duration(milliseconds: 1000));
+      return;
+    }
+    // P0 AUDIO-ECHO FIX — see [_suppressResponseAudioForDuplicate]'s doc
+    // comment: a SEPARATE gate from the one above, deliberately not
+    // sharing its machinery. [_auditGeminiDuplicateResponse] already
+    // logged the one detailed "DUPLICATE RESPONSE SUPPRESSED" line the
+    // instant it made this call; every chunk dropped here for the rest of
+    // the turn only needs a cheap, high-frequency-safe debugPrint (same
+    // "don't setState per dropped chunk" reasoning as every other drop
+    // branch in this method).
+    if (_suppressResponseAudioForDuplicate) {
+      debugPrint(
+        'GEMINI LIVE TEST: DUPLICATE RESPONSE: dropping ${pcmBytes.length}-byte response chunk — this turn was '
+        'already identified as repeating a recent prior turn',
+      );
+      if (_outgoingAudioPaused) _checkMicPauseWatchdog(idleThreshold: const Duration(milliseconds: 1000));
+      return;
+    }
+    // P0 FIX — see [_suppressResponseAudioForLeakedWrapper]'s doc comment:
+    // a SEPARATE gate, same reasoning as the duplicate-response one just
+    // above. [_auditGeminiForLeakedInstructionWrapper] already logged the
+    // one detailed "VERBATIM INSTRUCTION LEAK" line the instant it made
+    // this call.
+    if (_suppressResponseAudioForLeakedWrapper) {
+      debugPrint(
+        'GEMINI LIVE TEST: LEAKED WRAPPER: dropping ${pcmBytes.length}-byte response chunk — this turn was '
+        'identified as Gemini reading its own "say exactly" instruction out loud',
+      );
+      if (_outgoingAudioPaused) _checkMicPauseWatchdog(idleThreshold: const Duration(milliseconds: 1000));
       return;
     }
     // PART F items 4-5: SEPARATE gate from the one above — see
@@ -5579,11 +9726,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // before a real resolution exists). Never lets an utterance that
     // hasn't yet matched a known command get raw Gemini speech.
     if (_preemptiveDefaultMuteActive) {
-      _log_(
-        'PREEMPTIVE DEFAULT MUTE: dropping ${pcmBytes.length}-byte response chunk — not yet resolved by a known '
-        'trigger or the KB catch-all',
+      debugPrint(
+        'GEMINI LIVE TEST: PREEMPTIVE DEFAULT MUTE: dropping ${pcmBytes.length}-byte response chunk — not yet '
+        'resolved by a known trigger or the KB catch-all',
       );
+      if (_outgoingAudioPaused) _checkMicPauseWatchdog(idleThreshold: const Duration(milliseconds: 1000));
       return;
+    }
+    if (_fillerPassthroughActive && !_fillerAudioStarted) {
+      _fillerAudioStarted = true;
+      debugPrint('PENDING CALL FILLER: first filler chunk passed all gates at ${DateTime.now()} — playing');
     }
     // BUG 1 fix: never call `FlutterPcmSound.feed()` while a
     // release()/setup() reinit is still in flight (see `_pcmReady`'s doc
@@ -5614,11 +9766,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         _pendingPcmChunksAwaitingReinit.clear();
         _pendingPcmChunksGeneration = _pcmReinitGeneration;
       }
-      _pendingPcmChunksAwaitingReinit.add((bytes: pcmBytes, mimeType: mimeType));
+      // P0 FIX — see [_currentResponseTurnId]'s doc comment: tagged with
+      // WHICH TURN this chunk belongs to, not just which reinit generation,
+      // so a later per-turn decision (duplicate suppression) can find and
+      // remove exactly this turn's entries without touching any other
+      // turn's still-queued, still-wanted audio.
+      _pendingPcmChunksAwaitingReinit.add((bytes: pcmBytes, mimeType: mimeType, turnId: _currentResponseTurnId));
       _log_(
-        'PCM QUEUE: queuing ${pcmBytes.length}-byte response chunk (generation $_pcmReinitGeneration, '
-        '${_pendingPcmChunksAwaitingReinit.length} now queued) — PCM reinit still in flight, will flush in order '
-        'once ready, NOT dropped',
+        'PCM QUEUE: queuing ${pcmBytes.length}-byte response chunk (generation $_pcmReinitGeneration, turn '
+        '$_currentResponseTurnId, ${_pendingPcmChunksAwaitingReinit.length} now queued) — PCM reinit still in '
+        'flight, will flush in order once ready, NOT dropped',
       );
       return;
     }
@@ -5634,14 +9791,29 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
     if (!_outgoingAudioPaused) {
       _outgoingAudioPaused = true;
+      _lastResponsePlaybackStartedAt = DateTime.now();
+      _startMicPauseWatchdog();
       _turnComplete = false;
+      // P0 AUDIO-ECHO FIX — a loud reading from BEFORE this pause even
+      // began (e.g. a brief incidental mic blip just before playback
+      // started) must never count toward THIS pause's own echo-tail-quiet
+      // requirement; cleared here so [_resumeGraceTimerFired] only ever
+      // sees energy genuinely observed during (or after) this playback.
+      _lastLoudMicChunkAt = null;
       _log_('outgoing mic audio PAUSED (response playback starting — avoids the mic picking up the speaker and Gemini self-interrupting)');
-      _pausedVoiceService?.setExternalSessionPhase(VoicePhase.speaking);
-      // BUG FIX (confirmed via log evidence): a warning fired mid-response
-      // because nothing reset the timer while Gemini was actively talking —
-      // a response starting to play IS the conversation being active, so
-      // this must count as a turn exactly like technician speech does.
-      _resetInactivityTimer(reason: 'outgoing mic audio paused (response playback starting)');
+      _syncVoicePhase();
+      // P0 FIX (CONFIRMED regression, REMOVED — was: resetting the
+      // inactivity timer here too, "a response starting to play IS the
+      // conversation being active"). Same self-defeating loop as the
+      // matching RESUME-side removal a few hundred lines down (see that
+      // one's doc comment for the full evidence/reasoning) — this PAUSE
+      // reset alone was already enough to re-arm the full 50s/60s window
+      // every single time Gemini spoke ANYTHING, including its own
+      // inactivity warning, which is what let the warning fire on an
+      // infinite loop instead of the session ever actually closing.
+      // Removing both sites together (this one alone would have been
+      // sufficient to keep re-arming the loop even with the RESUME site
+      // fixed) is what actually breaks the cycle.
     }
 
     // Confirmed via mimeType logging that Gemini's real output rate matches
@@ -5665,15 +9837,146 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
     final stoppedAt = _speechStoppedAt;
     if (stoppedAt != null) {
-      final latency = DateTime.now().difference(stoppedAt);
       _speechStoppedAt = null;
+      final now = DateTime.now();
+      // MEASUREMENT ONLY (nothing here affects triggers, audio or timing).
+      // CONFIRMED misattribution: the stopwatch used to start on ANY
+      // "stopped speaking" edge — including bursts heard while outgoing
+      // mic audio was paused (our own reply, or speech over it, none of
+      // which Gemini ever received) — so a 12.9s figure was really ~2.4s of
+      // response after a transcript for speech the level meter never saw.
+      // Now: measured from the end of speech Gemini actually received
+      // ([_latencySpeechEndAt]); if the level meter never caught that
+      // speech, or its edge predates this transcript by more than the late
+      // -transcript window (so it belongs to earlier, unrelated sound),
+      // from when the transcript arrived instead — labelled either way,
+      // with the split, so a slow transcript still shows as slow.
+      final speechEnd = _latencySpeechEndAt;
+      final transcriptAt = _latencyTranscriptAt;
+      final speechEndUsable = speechEnd != null &&
+          (transcriptAt == null || !transcriptAt.isAfter(speechEnd.add(_lateTranscriptMaxWait)));
+      final reference = speechEndUsable ? speechEnd : (transcriptAt ?? stoppedAt);
+      final latency = now.difference(reference);
       _lastLatency = latency;
-      _log_('LATENCY (stopped speaking -> first response byte): ${latency.inMilliseconds}ms');
+      final from = speechEndUsable
+          ? 'end of speech Gemini received'
+          : (transcriptAt != null ? 'transcript arrival (end of that speech not detected)' : 'last silence edge');
+      _log_('LATENCY (stopped speaking -> first response byte): ${latency.inMilliseconds}ms (from $from)');
+      _log_(
+        'LATENCY BREAKDOWN: speech end -> transcript '
+        '${speechEnd != null && transcriptAt != null ? '${transcriptAt.difference(speechEnd).inMilliseconds}ms${speechEndUsable ? '' : ' (too far apart to be the same speech)'}' : 'n/a'}, '
+        'transcript -> first response byte ${transcriptAt != null ? '${now.difference(transcriptAt).inMilliseconds}ms' : 'n/a'}, '
+        'old any-silence-edge figure ${now.difference(stoppedAt).inMilliseconds}ms',
+      );
+      _latencySpeechEndAt = null;
+      _latencyTranscriptAt = null;
       if (mounted) setState(() {});
     }
 
-    _lastAudioChunkFedAt = DateTime.now();
-    unawaited(FlutterPcmSound.feed(PcmArrayInt16.fromList(_pcm16BytesToSamples(pcmBytes))));
+    _enqueuePcmForPlayback(pcmBytes);
+  }
+
+  /// JITTER BUFFER (P1, CONFIRMED: "W/AudioTrack: releaseBuffer() ...
+  /// disabled due to previous underrun, restarting" 13x in one ~6 min
+  /// session). flutter_pcm_sound sizes its native AudioTrack at
+  /// `getMinBufferSize` — only tens of ms at 24kHz mono — and writes each
+  /// chunk the moment it arrives, so any network gap between Gemini's
+  /// chunks longer than that drains the track mid-speech. The native size
+  /// isn't configurable without forking the plugin, so the headroom is
+  /// built here instead: when nothing is playing, chunks are collected until
+  /// [_pcmPrebufferTarget] of audio (or [_pcmPrebufferMaxWait] passes) and
+  /// written as one block; while playback is ahead, chunks go straight
+  /// through, landing in the plugin's own queue behind that headroom.
+  final List<Uint8List> _pcmPrebuffer = [];
+  int _pcmPrebufferBytes = 0;
+  Timer? _pcmPrebufferTimer;
+  static const Duration _pcmPrebufferTarget = Duration(milliseconds: 200);
+  static const Duration _pcmPrebufferMaxWait = Duration(milliseconds: 250);
+
+  /// Playback counts as "running" only while this much queued audio is
+  /// still ahead — below it, the next chunk starts a fresh prebuffer.
+  static const Duration _pcmPlayingMargin = Duration(milliseconds: 40);
+
+  void _enqueuePcmForPlayback(Uint8List pcmBytes) {
+    final end = _expectedPlaybackEndAt;
+    final playing = end != null && end.isAfter(DateTime.now().add(_pcmPlayingMargin));
+    if (playing && _pcmPrebuffer.isEmpty) {
+      _feedPcmNow(pcmBytes);
+      return;
+    }
+    _pcmPrebuffer.add(pcmBytes);
+    _pcmPrebufferBytes += pcmBytes.length;
+    final buffered = Duration(microseconds: (_pcmPrebufferBytes ~/ 2) * 1000000 ~/ _outputSampleRateHz);
+    if (buffered >= _pcmPrebufferTarget) {
+      _flushPcmPrebuffer('${buffered.inMilliseconds}ms buffered');
+      return;
+    }
+    _pcmPrebufferTimer ??= Timer(_pcmPrebufferMaxWait, () => _flushPcmPrebuffer('max wait reached'));
+  }
+
+  /// Writes whatever the jitter buffer holds as one block — also called at
+  /// `turnComplete` so a response shorter than [_pcmPrebufferTarget] isn't
+  /// held back.
+  void _flushPcmPrebuffer(String reason) {
+    _pcmPrebufferTimer?.cancel();
+    _pcmPrebufferTimer = null;
+    if (_pcmPrebuffer.isEmpty) return;
+    if (!_pcmReady) {
+      // A reinit started since these were buffered (see
+      // [_interruptGeminiForDeterministicTrigger]) — they belong to audio
+      // that was just cut off.
+      _discardPcmPrebuffer('PCM reinit in flight');
+      return;
+    }
+    final builder = BytesBuilder(copy: false);
+    for (final chunk in _pcmPrebuffer) {
+      builder.add(chunk);
+    }
+    final count = _pcmPrebuffer.length;
+    _pcmPrebuffer.clear();
+    _pcmPrebufferBytes = 0;
+    final block = builder.takeBytes();
+    debugPrint('PCM JITTER BUFFER: feeding $count chunk(s) as one ${block.length}-byte block ($reason)');
+    _feedPcmNow(block);
+  }
+
+  void _discardPcmPrebuffer(String reason) {
+    _pcmPrebufferTimer?.cancel();
+    _pcmPrebufferTimer = null;
+    if (_pcmPrebuffer.isEmpty) return;
+    debugPrint('PCM JITTER BUFFER: discarding ${_pcmPrebuffer.length} buffered chunk(s) ($reason)');
+    _pcmPrebuffer.clear();
+    _pcmPrebufferBytes = 0;
+  }
+
+  void _feedPcmNow(Uint8List pcmBytes) {
+    final fedAt = DateTime.now();
+    _lastAudioChunkFedAt = fedAt;
+    // MIC WATCHDOG — see [_micPauseWatchdogTimer]: accumulate when this fed
+    // audio should actually finish playing (chunks queue back-to-back), so
+    // the watchdog never force-resumes while real playback is still going.
+    final chunkDuration = Duration(microseconds: (pcmBytes.length ~/ 2) * 1000000 ~/ _outputSampleRateHz);
+    final currentEnd = _expectedPlaybackEndAt;
+    final playbackStart = (currentEnd != null && currentEnd.isAfter(fedAt)) ? currentEnd : fedAt;
+    _expectedPlaybackEndAt = playbackStart.add(chunkDuration);
+    final seq = ++_pcmFeedSeq;
+    _pcmFeedsInFlight++;
+    unawaited(
+      FlutterPcmSound.feed(PcmArrayInt16.fromList(_pcm16BytesToSamples(pcmBytes))).whenComplete(() {
+        _pcmFeedsInFlight--;
+        if (seq > _pcmFeedSeqAcked) _pcmFeedSeqAcked = seq;
+        final ackedAt = DateTime.now();
+        final ackEnd = _ackBasedPlaybackEndAt;
+        _ackBasedPlaybackEndAt = (ackEnd != null && ackEnd.isAfter(ackedAt) ? ackEnd : ackedAt).add(chunkDuration);
+        final lagMs = ackedAt.difference(fedAt).inMilliseconds;
+        if (lagMs >= 500) {
+          debugPrint(
+            'PCM FEED LAG: a response chunk reached the native player ${lagMs}ms after it was fed (Android main '
+            'thread busy) — mic stays paused until the player confirms it has played',
+          );
+        }
+      }),
+    );
   }
 
   /// PART J item 2/4 — see [_pendingPcmChunksAwaitingReinit]'s doc comment.
@@ -5693,9 +9996,17 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (_pendingPcmChunksGeneration != generation || _pendingPcmChunksAwaitingReinit.isEmpty) return;
     final queued = List.of(_pendingPcmChunksAwaitingReinit);
     _pendingPcmChunksAwaitingReinit.clear();
+    // P0 FIX — the turn ids present here are purely informational at this
+    // point: any turn [_auditGeminiDuplicateResponse] already decided to
+    // suppress had its own entries PROACTIVELY purged from the queue the
+    // instant that decision was made (see that method's doc comment), so
+    // whatever remains by the time this runs is exactly what should still
+    // be fed — no per-chunk filtering needed HERE, just visibility into
+    // which turn(s) this flush actually covers.
+    final turnIds = queued.map((c) => c.turnId).toSet().toList()..sort();
     _log_(
-      'PCM QUEUE: flushing ${queued.length} queued response chunk(s) (generation $generation) now that the PCM '
-      'reinit has completed — feeding them in order, none dropped.',
+      'PCM QUEUE: flushing ${queued.length} queued response chunk(s) (generation $generation, turn(s) '
+      '$turnIds) now that the PCM reinit has completed — feeding them in order, none dropped.',
     );
     for (final chunk in queued) {
       _onResponseAudioChunk(chunk.bytes, mimeType: chunk.mimeType);
@@ -5713,14 +10024,23 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   }
 
   void _onWsError(Object error, StackTrace stackTrace) {
-    debugPrint('GEMINI LIVE TEST ERROR (WebSocket): $error\n$stackTrace');
-    _log_('ERROR (WebSocket): $error');
+    final message = _scrubCredentials(error);
+    debugPrint('GEMINI LIVE TEST ERROR (WebSocket): $message\n$stackTrace');
+    _log_('ERROR (WebSocket): $message');
     if (!mounted) return;
     setState(() {
       _phase = _TestPhase.error;
-      _errorMessage = error.toString();
+      _errorMessage = message;
     });
   }
+
+  /// `dart:io`'s WebSocket handshake errors quote the full connection URL —
+  /// including `?access_token=<the Gemini token>` — so every error that can
+  /// come from the socket goes through this before being logged or shown.
+  static String _scrubCredentials(Object error) => error.toString().replaceAllMapped(
+    RegExp(r'((?:access_token|key)=)[^&\s"' "'" r')]+'),
+    (m) => '${m[1]}<redacted>',
+  );
 
   void _onWsDone() {
     _log_('WebSocket closed by server (closeCode=${_channel?.closeCode}, closeReason=${_channel?.closeReason})');
@@ -5728,8 +10048,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     setState(() => _phase = _TestPhase.closed);
   }
 
-  Future<void> _stopTest() async {
-    _log_('Stop Test tapped');
+  /// [reason] is logged so a trace shows what ended the session — CONFIRMED
+  /// needed: a real session ended mid-capture with only "Stop Test tapped" in
+  /// the log, indistinguishable between the End button, end_session and the
+  /// inactivity timeout (it was the button, pressed ~68s into a silent capture).
+  Future<void> _stopTest({String reason = 'Stop/End button tapped'}) async {
+    _log_(
+      'Stop Test tapped (reason: $reason)'
+      '${_inFlightFunctionCalls > 0 ? ' — WARNING: $_inFlightFunctionCalls function call(s) still in flight; their results will have no session to report to' : ''}',
+    );
     await _teardown();
     if (!mounted) return;
     setState(() => _phase = _TestPhase.closed);
@@ -5762,19 +10089,6 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   }
 
   Future<void> _teardown() async {
-    // PART M — see the late-completion `open_camera` handler's use of this
-    // (`_teardownStarted`): teardown resets `_screenTask` back to `none`
-    // unconditionally, right below — the SAME value that handler already
-    // treats as "nothing else happened, safe to hand over the live
-    // preview." Without a signal that's specifically "teardown itself is
-    // why `_screenTask` reads `none` right now," a camera call resolving
-    // late WHILE teardown is running (or has already run) could wrongly
-    // read that as "still on the same screen" and try to revive a session
-    // that's ending. Set unconditionally, idempotently, the instant
-    // teardown starts — safe to set true twice (this function runs twice
-    // per session end; see the doc comment just below) and never reset,
-    // since a torn-down session never un-tears-down.
-    _teardownStarted = true;
     // CONFIRMED CRASH ("_lifecycleState != _ElementLifecycle.defunct") — the
     // same class of bug fixed several times elsewhere in this codebase (see
     // e.g. JobDetailScreen.dispose's `Future(() { _viewedJobIdController.state
@@ -5801,14 +10115,58 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       if (mounted) setState(() {});
     });
     _screenTask = _ScreenTask.none;
+    _cameraOpenConfirmed = false;
     _silenceTimer?.cancel();
     _silenceTimer = null;
+    _speechStuckWatchdogTimer?.cancel();
+    _speechStuckWatchdogTimer = null;
+    _protectedConfirmationTimer?.cancel();
+    _protectedConfirmationTimer = null;
+    _awaitingFirstTranscriptTimer?.cancel();
+    _awaitingFirstTranscriptTimer = null;
+    _scriptIdentityTimer?.cancel();
+    _scriptIdentityTimer = null;
+    _awaitingScriptedTurnWords = null;
+    _heldUnidentifiedTurnChunks.clear();
     _resumeGraceTimer?.cancel();
     _resumeGraceTimer = null;
+    _cameraReleaseTimer?.cancel();
+    _cameraOpeningTicker?.cancel();
+    _cameraOpeningTicker = null;
+    _discardPcmPrebuffer('teardown');
+    _recentAudibleTurns.clear();
+    _cameraReleaseTimer = null;
+    _cameraPrewarmAutoReleaseTimer?.cancel();
+    _cameraPrewarmAutoReleaseTimer = null;
+    _cameraSpeculativelyPrewarming = false;
+    _stopMicPauseWatchdog();
+    _expectedPlaybackEndAt = null;
     _suppressResponseAudioSafetyTimer?.cancel();
     _suppressResponseAudioSafetyTimer = null;
     _suppressResponseAudioForDeterministic = false;
     _cancelInactivityTimer();
+    _lateTranscriptTimeout?.cancel();
+    _lateTranscriptTimeout = null;
+    _lateTranscriptFinalizeTimer?.cancel();
+    _lateTranscriptFinalizeTimer = null;
+    _awaitingLateTranscript = false;
+    // A session that failed or ended before setupComplete: its buffered
+    // audio is discarded, never sent. A capture still opening is stopped
+    // (generation bump) and waited for, so the recorder stop/close below
+    // always sees its final state.
+    _micCaptureGeneration++;
+    _bufferingPreSetupAudio = false;
+    _preSetupAudio.clear();
+    _preSetupAudioBytes = 0;
+    final pendingCapture = _micCaptureFuture;
+    _micCaptureFuture = null;
+    if (pendingCapture != null) {
+      try {
+        await pendingCapture;
+      } catch (e) {
+        debugPrint('GEMINI LIVE TEST: mic capture had failed before teardown ($e)');
+      }
+    }
     await _micSub?.cancel();
     _micSub = null;
     await _wsSub?.cancel();
@@ -6121,6 +10479,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   }
 
   String get _screenTaskTitle => switch (_screenTask) {
+    _ScreenTask.cameraOpening => 'Opening Camera',
+    _ScreenTask.cameraClosing => 'Closing Camera',
     _ScreenTask.cameraLive => 'Camera',
     _ScreenTask.cameraCaptured => 'Review Photo',
     _ScreenTask.none => 'Voice Assistant',
@@ -6224,7 +10584,57 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// calls (see [_handleToolCall]) â€” this purely shows what's already
   /// happening, matching ambient mode's existing no-manual-controls design
   /// (see [GeminiLiveTestScreen.ambient]'s doc comment).
+  /// The camera-shaped dark surface shown while opening or closing — a
+  /// spinner, a caption, and optional actions.
+  Widget _buildCameraStatusSurface({required String caption, required Color spinnerColor, List<Widget>? actions}) {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: Container(
+          width: double.infinity,
+          color: const Color(0xFF15181A),
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: CircularProgressIndicator(strokeWidth: 2.5, color: spinnerColor),
+                  ),
+                  const SizedBox(height: 14),
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 250),
+                    child: Text(
+                      caption,
+                      key: ValueKey(caption),
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: Colors.white70, fontSize: 14),
+                    ),
+                  ),
+                  if (actions != null) ...[
+                    const SizedBox(height: 18),
+                    Row(mainAxisSize: MainAxisSize.min, children: actions),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildCameraTaskBody() {
+    // See [_ScreenTask.cameraClosing]. Checked first: the controller is
+    // still initialized (and mid-release) here, so the live-preview branch
+    // below must never render it.
+    if (_screenTask == _ScreenTask.cameraClosing) {
+      return _buildCameraStatusSurface(caption: 'Closing the camera…', spinnerColor: AppColors.amber);
+    }
     if (_screenTask == _ScreenTask.cameraCaptured) {
       final capturedFile = _cameraSession.capturedFile;
       if (capturedFile == null) {
@@ -6240,7 +10650,41 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           child: Container(
             width: double.infinity,
             color: const Color(0xFF15181A),
-            child: Image.file(File(capturedFile.path), fit: BoxFit.contain),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                Image.file(File(capturedFile.path), fit: BoxFit.contain),
+                // Purely visual — the audio side of this same window is the
+                // confirm_photo_upload pending-call filler.
+                AnimatedOpacity(
+                  opacity: _photoUploadInFlight ? 1 : 0,
+                  duration: const Duration(milliseconds: 250),
+                  child: IgnorePointer(
+                    child: Container(
+                      color: Colors.black54,
+                      child: const Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            SizedBox(
+                              width: 180,
+                              child: LinearProgressIndicator(
+                                minHeight: 4,
+                                color: Colors.white,
+                                backgroundColor: Colors.white24,
+                                borderRadius: BorderRadius.all(Radius.circular(2)),
+                              ),
+                            ),
+                            SizedBox(height: 14),
+                            Text('Uploading photo…', style: TextStyle(color: Colors.white, fontSize: 14)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -6248,7 +10692,51 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
     final controller = _cameraSession.controller;
     if (controller == null || !controller.value.isInitialized) {
-      return const Center(child: CircularProgressIndicator());
+      // P2 — see [_ScreenTask.cameraOpening]. This window has measured 9-30s
+      // on real hardware, and it used to render nothing at all (the screen
+      // task stayed `none` until open_camera returned, so the ambient
+      // pure-conversation overlay was all the technician saw). A bare
+      // spinner over a black rectangle is not much better: it doesn't say
+      // what is happening or that it is expected to take a moment. Shows the
+      // camera-shaped surface it is about to become instead, so the swap to
+      // the live preview is a fill-in rather than a screen change.
+      // Elapsed-time aware (see [_cameraOpeningTicker]) so a slow open never
+      // reads as frozen: the caption escalates, and past
+      // [cameraOpenSlowWarningAfter] Retry/Cancel are offered.
+      final startedAt = _cameraOpeningStartedAt;
+      final elapsed = startedAt == null ? Duration.zero : DateTime.now().difference(startedAt);
+      final slow = elapsed >= _cameraOpenSlowCaptionAfter;
+      final offerActions = elapsed >= cameraOpenSlowWarningAfter;
+      final String caption;
+      if (offerActions) {
+        caption = 'The camera is taking a while to open.';
+      } else if (slow) {
+        caption = 'Still opening the camera — this is taking longer than usual…';
+      } else {
+        caption = _cameraOpenIsRetry ? 'Retrying the camera…' : 'Opening the camera…';
+      }
+      return _buildCameraStatusSurface(
+        caption: caption,
+        spinnerColor: Colors.white70,
+        actions: offerActions
+            ? [
+                OutlinedButton(
+                  onPressed: () => _onSlowCameraOpenAction(retry: false),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Colors.white38),
+                  ),
+                  child: const Text('Cancel'),
+                ),
+                const SizedBox(width: 12),
+                FilledButton(
+                  onPressed: () => _onSlowCameraOpenAction(retry: true),
+                  style: FilledButton.styleFrom(backgroundColor: Colors.white, foregroundColor: Colors.black),
+                  child: const Text('Retry'),
+                ),
+              ]
+            : null,
+      );
     }
     return Padding(
       padding: const EdgeInsets.all(16),

@@ -20,6 +20,11 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
+    companion object {
+        /** See [installSlowMainThreadMessageLogger]. Debug builds only, even when true. */
+        private const val PROFILE_MAIN_THREAD = false
+    }
+
     private val audioDiagnosticsChannel = "com.fieldloop.fielloop/audio_diagnostics"
 
     // Guards [startBluetoothScoAudio]'s broadcast wait so a second call
@@ -38,6 +43,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         engine = flutterEngine
+        installSlowMainThreadMessageLogger()
         // Bluetooth-headset-mic-ignored investigation/fix — see each
         // handler function's own doc comment. getAudioRouteInfo is
         // read-only diagnostics; isBluetoothAudioDevicePresent/
@@ -333,6 +339,77 @@ class MainActivity : FlutterActivity() {
             true
         } catch (e: Exception) {
             false
+        }
+    }
+
+    /**
+     * DIAGNOSTIC, debug builds only — names whatever is holding the Android
+     * main thread. The Dart-side `main_thread_probe` (see
+     * `gemini_function_dispatcher.dart`) proved it was blocked for 2-19s at a
+     * time during photo capture (the capture itself took 27s and 88s in one
+     * trace), but nothing native logged in that window, so the probe can say
+     * THAT it's blocked, not by WHAT. Android's Looper reports each message it
+     * dispatches ("Dispatching to Handler (...) {callback}") and when it
+     * finishes; any message that ran 200ms+ is logged with that description,
+     * which names the plugin/handler class doing the work. Off in release
+     * builds: the Printer runs for every main-thread message.
+     */
+    private fun installSlowMainThreadMessageLogger() {
+        // OFF by default now that it has done its job (it identified
+        // flutter_sound's FlautoRecorderEngine$5 main-thread read loop,
+        // ~3,600 messages/s). With a Printer installed, Looper formats two
+        // description strings for EVERY main-thread message, and the backlog
+        // profile below adds a regex per message — at that message rate the
+        // instrumentation itself adds real main-thread and CPU load to the
+        // very debug builds used to measure camera timing. Flip to true for a
+        // dedicated diagnostic run only.
+        if (!PROFILE_MAIN_THREAD) return
+        val debuggable = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        if (!debuggable) return
+        var dispatchedAt = 0L
+        var dispatching: String? = null
+        // Backlog profile (CONFIRMED needed: during two slow photo captures
+        // the Dart-side probe saw 0.7-2.3s main-thread round trips, yet not a
+        // single message crossed the 200ms line above — the thread was busy
+        // with MANY short messages, not one long one). Every message's time
+        // is summed per handler/callback class; any 2s window in which the
+        // thread was more than 30% busy logs its top contributors.
+        val windowMs = 2000L
+        var windowStartedAt = android.os.SystemClock.uptimeMillis()
+        val busyByKey = HashMap<String, Long>()
+        val countByKey = HashMap<String, Int>()
+        val keyPattern = Regex("""\(([^)]*)\) \{[0-9a-f]+\} ([^@:\s]+)""")
+        Looper.getMainLooper().setMessageLogging { line ->
+            if (line.startsWith(">>>>> Dispatching")) {
+                dispatchedAt = android.os.SystemClock.uptimeMillis()
+                dispatching = line
+            } else if (line.startsWith("<<<<< Finished")) {
+                val finishedAt = android.os.SystemClock.uptimeMillis()
+                val tookMs = finishedAt - dispatchedAt
+                if (tookMs >= 200) {
+                    android.util.Log.w("MainThreadSlow", "main-thread message took ${tookMs}ms: $dispatching")
+                }
+                val match = dispatching?.let { keyPattern.find(it) }
+                val key = if (match != null) "${match.groupValues[1]} / ${match.groupValues[2]}" else "other"
+                busyByKey[key] = (busyByKey[key] ?: 0L) + tookMs
+                countByKey[key] = (countByKey[key] ?: 0) + 1
+                dispatching = null
+                if (finishedAt - windowStartedAt >= windowMs) {
+                    val busy = busyByKey.values.sum()
+                    val elapsed = finishedAt - windowStartedAt
+                    if (busy * 100 >= elapsed * 30) {
+                        val top = busyByKey.entries.sortedByDescending { it.value }.take(5)
+                            .joinToString("; ") { "${it.value}ms/${countByKey[it.key]}x ${it.key}" }
+                        android.util.Log.w(
+                            "MainThreadBusy",
+                            "main thread ${busy}ms busy in the last ${elapsed}ms (${busy * 100 / elapsed}%) — top: $top",
+                        )
+                    }
+                    busyByKey.clear()
+                    countByKey.clear()
+                    windowStartedAt = finishedAt
+                }
+            }
         }
     }
 
