@@ -14,6 +14,7 @@ import '../config/env.dart';
 import '../models/change_order.dart';
 import '../models/job_history_entry.dart';
 import '../models/job_photo.dart';
+import '../models/kept_photo_ref.dart';
 import '../models/mock_job.dart';
 import '../providers/auth_provider.dart';
 import '../providers/job_change_orders_provider.dart';
@@ -72,6 +73,35 @@ class _OpenAttempt {
   }
 }
 
+/// A photo the technician said to keep, held for [GeminiCameraSession.
+/// uploadKept] — see [GeminiCameraSession.keep].
+class _KeptCapture {
+  _KeptCapture({
+    required this.file,
+    required this.jobId,
+    required this.ref,
+    required this.photos,
+    this.prefetchedUploadUrl,
+  });
+
+  final XFile file;
+  final String jobId;
+  final WidgetRef ref;
+  final JobPhotosController photos;
+  final Future<UploadUrlInfo>? prefetchedUploadUrl;
+
+  /// The job's CURRENT photo controller (the provider may have been
+  /// invalidated and rebuilt since [GeminiCameraSession.keep]) — or, once
+  /// the screen owning [ref] is gone, the one read at keep time.
+  JobPhotosController currentPhotosController() {
+    try {
+      return ref.read(jobPhotosProvider(jobId).notifier);
+    } catch (_) {
+      return photos;
+    }
+  }
+}
+
 class GeminiCameraSession {
   CameraController? _controller;
   XFile? _capturedFile;
@@ -123,6 +153,13 @@ class GeminiCameraSession {
   /// honest trade-off this makes (an orphaned-but-harmless DB row on
   /// retake) in exchange for the latency win.
   Future<UploadUrlInfo>? _prefetchedUploadUrl;
+
+  /// The photo the most recent successful [confirm] kept — its own
+  /// `field_events` row id (or queued-upload id), for the voice photo
+  /// description flow to target. Replaced on every keep; never reset by a
+  /// retake (a retaken photo was never kept, so this still names the last
+  /// one that was).
+  KeptPhotoRef? lastKeptPhoto;
 
   /// The device's list of cameras never changes at runtime — cached across
   /// EVERY [GeminiCameraSession] instance (static, not per-session: a new
@@ -698,25 +735,91 @@ class GeminiCameraSession {
     final prefetch = prefetchUploadUrl(jobId: jobId);
     _prefetchedUploadUrl = prefetch;
     unawaited(
-      prefetch.then((_) {}, onError: (Object e) {
+      prefetch.then((info) {
+        // The upload-url call is what INSERTs this photo's field_events row
+        // — its id travels with this same Future into [confirm] and on to
+        // [lastKeptPhoto], so every later step targets exactly this row.
+        debugPrint(
+          'PHOTO TIMING [capture_photo]: field_event_row_reserved at ${DateTime.now()} '
+          '(field_events.id=${info.fieldEventId ?? 'UNKNOWN'}, job_id=$jobId, s3Key=${info.s3Key})',
+        );
+      }, onError: (Object e) {
         debugPrint('CAMERA (dispatcher): prefetch upload-url failed (confirm_photo_upload will retry fresh if reached): $e');
       }),
     );
   }
 
-  /// Same [compressPhotoForUpload] + `JobPhotosController.uploadPhoto` call
-  /// `PhotoPreviewScreen._confirm`'s Confirm button makes, on the file
-  /// [capture] already took — throws if there isn't one (Gemini called this
-  /// without a `capture_photo` first). Leaves the camera controller OPEN
-  /// afterward (same as the real flow: Photo Preview pops back to a still-
-  /// live Photo Capture, ready for another shot).
-  Future<PhotoUploadResult> confirm(WidgetRef ref, String jobId) async {
+  /// Photos the technician said to KEEP, still waiting for their upload —
+  /// see [keep]. Deliberately separate from [_capturedFile]: nothing that
+  /// discards a pending capture ([_discardCapturedFileOnly], [retake], the
+  /// idle camera release's [dispose]) may touch a kept photo; only
+  /// [uploadKept] ever consumes (and finally deletes) one. Keyed by the id
+  /// [keep] returns, so each photo-note flow can only ever upload its own
+  /// photo.
+  final Map<int, _KeptCapture> _keptCaptures = {};
+  int _nextKeptId = 0;
+
+  /// Ids of kept photos still waiting for [uploadKept].
+  List<int> get keptPhotoIdsAwaitingUpload => _keptCaptures.keys.toList();
+
+  /// The kept photo's file, for the screen to keep showing it while the
+  /// photo-note question is asked — `null` once its upload has started.
+  XFile? keptFile(int keptId) => _keptCaptures[keptId]?.file;
+
+  /// `confirm_photo_upload`: the technician said "keep". Does NOT compress
+  /// or upload — the photo-note question is asked first, and [uploadKept]
+  /// runs once that's answered (with the note, or without one). Moves the
+  /// captured file (and its upload-url prefetch) into [_keptCaptures] so it
+  /// survives untouched however long that takes. Throws if there's nothing
+  /// captured (Gemini called this without a `capture_photo` first).
+  /// Returns the kept photo's id for [uploadKept].
+  ///
+  /// Also reads the job's photo controller NOW, while [ref] is certainly
+  /// still usable — the fallback for an [uploadKept] that runs after the
+  /// screen owning [ref] is gone (a session closing mid-question still
+  /// uploads the photo).
+  int keep(WidgetRef ref, String jobId) {
     final file = _capturedFile;
     if (file == null) {
       throw StateError('No photo has been captured yet — call capture_photo before confirm_photo_upload.');
     }
-
+    final keptId = ++_nextKeptId;
+    _keptCaptures[keptId] = _KeptCapture(
+      file: file,
+      jobId: jobId,
+      ref: ref,
+      photos: ref.read(jobPhotosProvider(jobId).notifier),
+      prefetchedUploadUrl: _prefetchedUploadUrl,
+    );
+    _capturedFile = null;
+    _prefetchedUploadUrl = null;
     debugPrint('PHOTO CONFIRM: keep chosen for job $jobId');
+    debugPrint(
+      'PHOTO CONFIRM: upload deferred (kept_id=$keptId) — asking about a note first; ${file.path} held untouched '
+      'until the upload',
+    );
+    return keptId;
+  }
+
+  /// Compresses and uploads the photo [keep] is holding — with [note] in
+  /// the same `field_events` write when the technician confirmed one (see
+  /// `JobPhotosController.uploadPhotoDetailed`'s `transcript`), or no note
+  /// on a decline/skip/timeout. Same [compressPhotoForUpload] +
+  /// `JobPhotosController.uploadPhoto` path `PhotoPreviewScreen._confirm`'s
+  /// Confirm button uses, offline-queue fallback included. Throws if
+  /// [keptId] isn't waiting (never kept, or already uploaded). The kept
+  /// file is deleted only here, after the upload.
+  Future<PhotoUploadOutcome> uploadKept(int keptId, {String? note}) async {
+    final kept = _keptCaptures.remove(keptId);
+    if (kept == null) {
+      throw StateError('Kept photo $keptId is not waiting to upload (already uploaded?).');
+    }
+    final file = kept.file;
+    final jobId = kept.jobId;
+    debugPrint(
+      'PHOTO CONFIRM: upload starting for job $jobId, kept_id=$keptId '
+      '(${note == null ? 'no note' : 'with note, ${note.length} chars — one field_events write'})',
+    );
     debugPrint('CAMERA (dispatcher): compressing ${file.path} for job $jobId...');
     int? originalBytes;
     try {
@@ -732,27 +835,23 @@ class GeminiCameraSession {
     final uploadWatch = Stopwatch()..start();
     debugPrint('PHOTO CONFIRM: S3 upload started (${compressed.length} bytes)');
     // P1 FIX — see [_prefetchedUploadUrl]'s doc comment: reuses the prefetch
-    // [capture] started, rather than fetching a fresh upload URL now.
-    final prefetchedUploadUrl = _prefetchedUploadUrl;
-    _prefetchedUploadUrl = null;
-    final result = await ref
-        .read(jobPhotosProvider(jobId).notifier)
-        .uploadPhoto(compressed, prefetchedUploadUrl: prefetchedUploadUrl);
-    String? s3Key;
-    for (final p in (ref.read(jobPhotosProvider(jobId)).valueOrNull ?? const <JobPhoto>[]).reversed) {
-      if (p.s3Key != null) {
-        s3Key = p.s3Key;
-        break;
-      }
-    }
-    debugPrint(
-      'PHOTO CONFIRM: S3 upload done (result=$result, key=${s3Key ?? 'n/a — queued offline'}, '
-      '${uploadWatch.elapsedMilliseconds}ms)',
+    // [capture] started (carried over by [keep]), rather than fetching a
+    // fresh upload URL now.
+    final outcome = await kept.currentPhotosController().uploadPhotoDetailed(
+      compressed,
+      prefetchedUploadUrl: kept.prefetchedUploadUrl,
+      transcript: note,
     );
+    final result = outcome.result;
+    lastKeptPhoto = outcome.ref;
+    debugPrint(
+      'PHOTO CONFIRM: S3 upload done (result=$result, key=${outcome.ref.s3Key ?? 'n/a — queued offline'}, '
+      '${note == null ? 'no note' : 'note=${outcome.noteStatus?.name}'}, ${uploadWatch.elapsedMilliseconds}ms)',
+    );
+    debugPrint('PHOTO CONFIRM: kept photo is ${outcome.ref.describe()}');
 
     unawaited(File(file.path).delete().catchError((_) => File(file.path)));
-    _capturedFile = null;
-    return result;
+    return outcome;
   }
 
   /// Same `File(...).delete()` `PhotoPreviewScreen._retake`'s Retake button
@@ -850,6 +949,13 @@ Future<Map<String, dynamic>> dispatchGeminiFunctionCall({
       return _confirmPhotoUpload(ref: ref, cameraSession: cameraSession, jobId: _requireString(args, 'job_id'));
     case 'retake_photo':
       return _retakePhoto(cameraSession: cameraSession, jobId: _requireString(args, 'job_id'));
+    case uploadKeptPhotoFunctionName:
+      return _uploadKeptPhoto(
+        cameraSession: cameraSession,
+        jobId: _requireString(args, 'job_id'),
+        keptId: args['kept_id'] as int,
+        note: args['note'] as String?,
+      );
   }
 
   switch (name) {
@@ -999,16 +1105,14 @@ Future<Map<String, dynamic>> _captureStagedPhoto({
   }
 }
 
-/// `confirm_photo_upload` — see [GeminiCameraSession.confirm] for the real
-/// code path (same [compressPhotoForUpload] +
-/// `JobPhotosController.uploadPhoto` calls `PhotoPreviewScreen._confirm`'s
-/// Confirm button makes, offline-queue fallback included).
+/// `confirm_photo_upload` — the technician chose "keep". See
+/// [GeminiCameraSession.keep]: the photo is only HELD here; the photo-note
+/// question comes first and [_uploadKeptPhoto] does the compress + upload
+/// once it's answered.
 ///
-/// Reliability audit finding (upgraded from diagnostic-only logging):
-/// [GeminiCameraSession.confirm] reads `_capturedFile`, uploads it, and only
-/// THEN nulls it — two overlapping calls both read the same non-null file
-/// before either clears it, so both would compress and upload the SAME
-/// photo, attaching two rows to the job for one shot. Rejects the same way
+/// Reliability audit finding (upgraded from diagnostic-only logging): two
+/// overlapping calls must never both act on the same captured photo (two
+/// rows attached to the job for one shot). Rejects the same way
 /// [_openCamera]/[_captureStagedPhoto] do (a `rejected_overlap` status, not
 /// a thrown error — see their doc comments for why that distinction
 /// matters to `_updateScreenTaskForToolCall`).
@@ -1031,11 +1135,51 @@ Future<Map<String, dynamic>> _confirmPhotoUpload({
     };
   }
   try {
-    final result = await cameraSession.confirm(ref, jobId);
-    final queuedOffline = result == PhotoUploadResult.queuedOffline;
-    return {'status': queuedOffline ? 'queued_offline' : 'uploaded', 'job_id': jobId};
+    final keptId = cameraSession.keep(ref, jobId);
+    return {
+      'status': 'kept',
+      'job_id': jobId,
+      'kept_id': keptId,
+      'message': 'Photo kept. The app is asking the technician about a note and uploads the photo once that is '
+          'answered — do not say it has been uploaded.',
+    };
   } finally {
     cameraSession._clearInFlight('confirm_photo_upload');
+  }
+}
+
+/// App-internal step after `confirm_photo_upload`, never declared to
+/// Gemini: compresses and uploads the kept photo once the photo-note
+/// question is answered — see [GeminiCameraSession.uploadKept]. Dispatched
+/// by `gemini_live_test_screen.dart` through the same wrapper (audio hard
+/// pause + pending-call filler) confirm_photo_upload's own upload used to
+/// get. The `field_events` row reference goes to
+/// [GeminiCameraSession.lastKeptPhoto], same as before.
+const String uploadKeptPhotoFunctionName = 'upload_kept_photo';
+
+Future<Map<String, dynamic>> _uploadKeptPhoto({
+  required GeminiCameraSession cameraSession,
+  required String jobId,
+  required int keptId,
+  required String? note,
+}) async {
+  final overlapMs = cameraSession._checkAndMarkInFlight(uploadKeptPhotoFunctionName);
+  if (overlapMs != null) {
+    debugPrint('PHOTO TIMING: $uploadKeptPhotoFunctionName called while previous call still in-flight (started ${overlapMs}ms ago).');
+  }
+  try {
+    final outcome = await cameraSession.uploadKept(keptId, note: note);
+    final queuedOffline = outcome.result == PhotoUploadResult.queuedOffline;
+    return {
+      'status': queuedOffline ? 'queued_offline' : 'uploaded',
+      'job_id': jobId,
+      if (note != null) 'note_status': outcome.noteStatus?.name ?? PhotoNoteWriteStatus.failed.name,
+      // App-internal only (this result is never sent to Gemini): exactly
+      // which row this upload created, for this photo's own note flow.
+      'kept_photo_ref': outcome.ref,
+    };
+  } finally {
+    cameraSession._clearInFlight(uploadKeptPhotoFunctionName);
   }
 }
 

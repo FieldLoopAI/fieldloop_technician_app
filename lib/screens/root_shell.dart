@@ -7,6 +7,7 @@ import '../providers/jobs_provider.dart';
 import '../providers/offline_upload_queue_provider.dart';
 import '../providers/permission_providers.dart';
 import '../providers/visit_tracking_service.dart';
+import '../services/voice_session_power.dart';
 import 'history_screen.dart';
 import 'home_screen.dart';
 import 'profile_screen.dart';
@@ -77,6 +78,12 @@ class _RootShellState extends ConsumerState<RootShell> {
     if (!_offlineQueueStarted) {
       _offlineQueueStarted = true;
       ref.read(offlineUploadQueueProvider.notifier).start();
+      // Battery-optimization exemption, asked once per install (see
+      // BatteryOptimizationExemption.askOnceIfNeeded) — here, at app start,
+      // rather than at voice-session start where Android's dialog would
+      // cover the screen mid-conversation. New installs are asked in
+      // Permissions Setup first, which marks it asked.
+      BatteryOptimizationExemption.askOnceIfNeeded();
     }
 
     // Same unconditional-on-first-build reasoning as the offline queue

@@ -35,6 +35,18 @@
          new job assignments and estimate/change order approvals — requested
          at runtime via permission_handler in the Permissions Setup flow. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- Live Gemini voice session as a microphone foreground service
+         (VoiceSessionService) so an installed, untethered release build
+         keeps mic + network access with the screen off / app backgrounded;
+         WAKE_LOCK keeps the CPU running that session's audio loop. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- Lets the app ask (via permission_handler's
+         Permission.ignoreBatteryOptimizations) to be exempted from battery
+         optimization, so Doze/App Standby don't throttle a hands-free voice
+         session. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <application
         android:label="fielloop"
         android:name="${applicationName}"
@@ -62,6 +74,10 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <service
+            android:name=".VoiceSessionService"
+            android:exported="false"
+            android:foregroundServiceType="microphone"/>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

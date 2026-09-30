@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../models/kept_photo_ref.dart';
 import '../models/pending_upload.dart';
 import '../utils/network_error.dart';
 import 'job_photos_provider.dart';
@@ -104,6 +105,91 @@ class OfflineUploadQueueService extends StateNotifier<OfflineUploadQueueState> {
       await _uploadOne(upload);
     }
     await _refreshCounts();
+    await _drainPhotoNotes();
+  }
+
+  /// `pending_uploads.id` -> the `field_events.id` its upload created, for
+  /// items drained this session — lets [savePhotoNote] still reach the
+  /// right row when a description is confirmed for a queued photo that
+  /// finished uploading a moment earlier.
+  final Map<int, int> _uploadedFieldEventIdByPendingId = {};
+
+  Future<void> _drainPhotoNotes() async {
+    final notes = await PendingUploadsDb.instance.queryPhotoNotes();
+    if (notes.isEmpty) return;
+    debugPrint('PHOTO NOTE [queue]: draining ${notes.length} queued photo note(s)');
+    for (final note in notes) {
+      try {
+        await writePhotoTranscript(fieldEventId: note.fieldEventId, jobId: note.jobId, transcript: note.transcript);
+        await PendingUploadsDb.instance.deletePhotoNote(note.id);
+        debugPrint('PHOTO NOTE [save]: SUCCESS (from offline queue) field_events.id=${note.fieldEventId} job_id=${note.jobId}');
+        _ref.invalidate(jobPhotosProvider(note.jobId));
+      } catch (e) {
+        // Left queued either way — a network failure retries on the next
+        // reconnect; anything else is logged loudly so it's diagnosable.
+        debugPrint(
+          'PHOTO NOTE [save]: FAILED (from offline queue, will retry) field_events.id=${note.fieldEventId} '
+          'job_id=${note.jobId}${isNetworkError(e) ? ' — network error' : ''}: $e',
+        );
+      }
+    }
+  }
+
+  /// Saves a technician's CONFIRMED voice description of the photo [photo]
+  /// names into that exact row's `field_events.transcript` — see
+  /// [writePhotoTranscript] for the id + job_id + event_type match. Rides
+  /// the same offline tolerance as the photo upload itself:
+  ///  - row known, online: written now.
+  ///  - row known, offline or a network error: kept in
+  ///    `pending_photo_notes` and written on the next reconnect.
+  ///  - photo itself still queued (no row yet): stored as that queued
+  ///    photo's `caption`, and written by [_uploadOne] right after the
+  ///    upload creates the row.
+  /// Returns `true` if the note was written now, `false` if it was queued.
+  /// Throws only when it can't be saved or queued at all.
+  Future<bool> savePhotoNote(KeptPhotoRef photo, String transcript) async {
+    final fieldEventId = photo.fieldEventId;
+    if (fieldEventId != null) {
+      return _writeOrQueuePhotoNote(jobId: photo.jobId, fieldEventId: fieldEventId, transcript: transcript);
+    }
+    final pendingUploadId = photo.pendingUploadId;
+    if (pendingUploadId == null) {
+      throw StateError('No field_events id or queued upload for this photo — cannot target its row.');
+    }
+    final updated = await PendingUploadsDb.instance.updateCaption(pendingUploadId, transcript);
+    final drainedTo = _uploadedFieldEventIdByPendingId[pendingUploadId];
+    if (drainedTo != null) {
+      // Drained in the meantime (or mid-drain) — its row now exists, write
+      // straight to it. Harmless if [_uploadOne] also picked the caption
+      // up: both write the same text to the same row.
+      debugPrint('PHOTO NOTE [queue]: queued photo $pendingUploadId already uploaded as field_events.id=$drainedTo');
+      return _writeOrQueuePhotoNote(jobId: photo.jobId, fieldEventId: drainedTo, transcript: transcript);
+    }
+    if (updated == 0) {
+      throw StateError('Queued photo $pendingUploadId is gone and its field_events id is unknown.');
+    }
+    debugPrint('PHOTO NOTE [queue]: attached to queued photo pending_upload_id=$pendingUploadId — written once it uploads');
+    return false;
+  }
+
+  Future<bool> _writeOrQueuePhotoNote({
+    required String jobId,
+    required int fieldEventId,
+    required String transcript,
+  }) async {
+    final connectivity = await _connectivity.checkConnectivity();
+    if (!isOfflineResult(connectivity)) {
+      try {
+        await writePhotoTranscript(fieldEventId: fieldEventId, jobId: jobId, transcript: transcript);
+        return true;
+      } catch (e) {
+        if (!isNetworkError(e)) rethrow;
+        debugPrint('PHOTO NOTE [queue]: network error writing field_events.id=$fieldEventId ($e) — queuing');
+      }
+    }
+    await PendingUploadsDb.instance.insertPhotoNote(jobId: jobId, fieldEventId: fieldEventId, transcript: transcript);
+    debugPrint('PHOTO NOTE [queue]: queued note for field_events.id=$fieldEventId job_id=$jobId until back online');
+    return false;
   }
 
   Future<void> _uploadOne(PendingUpload upload) async {
@@ -117,11 +203,49 @@ class OfflineUploadQueueService extends StateNotifier<OfflineUploadQueueState> {
         throw StateError('Queued photo file missing on disk: ${upload.localFilePath}');
       }
       final bytes = await file.readAsBytes();
+      // A note already attached when the photo was queued (the voice note
+      // is asked BEFORE the upload) goes in the same field_events write as
+      // the photo itself — see [uploadPhotoBytes]'s `transcript`.
+      final captionAtUpload = await PendingUploadsDb.instance.readCaption(id);
+      final noteAtUpload = captionAtUpload != null && captionAtUpload.trim().isNotEmpty ? captionAtUpload : null;
       // Same upload-url + PUT + field_events-update sequence the live
       // capture path uses — called exactly once per photo, here, since a
       // queued item never reached (or never completed) that sequence
       // itself.
-      await uploadPhotoBytes(jobId: upload.jobId, bytes: bytes);
+      final uploaded = await uploadPhotoBytes(jobId: upload.jobId, bytes: bytes, transcript: noteAtUpload);
+      if (noteAtUpload != null) {
+        debugPrint(
+          'PHOTO NOTE [save]: ${uploaded.noteStatus?.name.toUpperCase()} (queued photo $id, photo+note in one write) '
+          'field_events.id=${uploaded.fieldEventId} job_id=${upload.jobId}',
+        );
+      }
+      // A voice description confirmed while this photo was still queued
+      // (see [savePhotoNote]) goes onto the row this upload just created.
+      // Re-read, not `upload.caption`: it may have been attached mid-upload
+      // — only written separately when it differs from what already went
+      // with the upload.
+      final fieldEventId = uploaded.fieldEventId;
+      if (fieldEventId != null) _uploadedFieldEventIdByPendingId[id] = fieldEventId;
+      final caption = await PendingUploadsDb.instance.readCaption(id);
+      if (caption != null && caption.trim().isNotEmpty && caption != noteAtUpload) {
+        if (fieldEventId == null) {
+          debugPrint('PHOTO NOTE [save]: FAILED — queued item $id uploaded but its field_events id is unknown; note not saved');
+        } else {
+          try {
+            final wroteNow = await _writeOrQueuePhotoNote(
+              jobId: upload.jobId,
+              fieldEventId: fieldEventId,
+              transcript: caption,
+            );
+            debugPrint(
+              'PHOTO NOTE [save]: ${wroteNow ? 'SUCCESS' : 'QUEUED'} (queued photo $id) '
+              'field_events.id=$fieldEventId job_id=${upload.jobId}',
+            );
+          } catch (e) {
+            debugPrint('PHOTO NOTE [save]: FAILED (queued photo $id) field_events.id=$fieldEventId: $e');
+          }
+        }
+      }
       await PendingUploadsDb.instance.delete(id);
       unawaited(file.delete().catchError((_) => file));
       debugPrint('OFFLINE QUEUE: item $id uploaded successfully');
@@ -157,10 +281,14 @@ class OfflineUploadQueueService extends StateNotifier<OfflineUploadQueueState> {
   }
 
   /// Saves [bytes] to persistent app storage and inserts a `pending_uploads`
-  /// row. Returns the saved file's path. This is the ONLY place a photo
-  /// enters the durable queue — everything else in this class only ever
-  /// reads rows back out and retries them.
-  Future<String> enqueue({required String jobId, required Uint8List bytes, String? caption}) async {
+  /// row. Returns the saved file's path and the row's id. This is the ONLY
+  /// place a photo enters the durable queue — everything else in this class
+  /// only ever reads rows back out and retries them.
+  Future<({String localPath, int pendingUploadId})> enqueue({
+    required String jobId,
+    required Uint8List bytes,
+    String? caption,
+  }) async {
     final docsDir = await getApplicationDocumentsDirectory();
     final queueDir = Directory(p.join(docsDir.path, 'pending_uploads'));
     if (!await queueDir.exists()) {
@@ -170,12 +298,12 @@ class OfflineUploadQueueService extends StateNotifier<OfflineUploadQueueState> {
     final file = File(p.join(queueDir.path, fileName));
     await file.writeAsBytes(bytes, flush: true);
 
-    await PendingUploadsDb.instance.insert(
+    final pendingUploadId = await PendingUploadsDb.instance.insert(
       PendingUpload(jobId: jobId, localFilePath: file.path, caption: caption, createdAt: DateTime.now()),
     );
     debugPrint('OFFLINE QUEUE: queued photo for job $jobId at ${file.path}');
     await _refreshCounts();
-    return file.path;
+    return (localPath: file.path, pendingUploadId: pendingUploadId);
   }
 
   Future<void> _refreshCounts() async {

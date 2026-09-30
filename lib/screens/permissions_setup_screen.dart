@@ -5,6 +5,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../providers/permission_providers.dart';
 import '../routing/fade_slide_page_route.dart';
+import '../services/voice_session_power.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../widgets/primary_button.dart';
@@ -38,6 +39,17 @@ class _PermissionsSetupScreenState extends ConsumerState<PermissionsSetupScreen>
   bool _requestingBackground = false;
   bool _backgroundRequested = false;
 
+  /// Battery-optimization exemption — see [BatteryOptimizationExemption].
+  bool _batteryExempt = false;
+
+  @override
+  void initState() {
+    super.initState();
+    BatteryOptimizationExemption.isGranted().then((granted) {
+      if (mounted) setState(() => _batteryExempt = granted);
+    });
+  }
+
   /// Camera, then Microphone, then Location ("when in use") — in that
   /// order, per the requested flow. [CameraMicController.request] issues
   /// camera and microphone as a single list request, which the
@@ -49,6 +61,8 @@ class _PermissionsSetupScreenState extends ConsumerState<PermissionsSetupScreen>
       await ref.read(cameraMicProvider.notifier).request();
       await ref.read(locationProvider.notifier).requestForeground();
       await ref.read(notificationPermissionProvider.notifier).request();
+      final exempt = await BatteryOptimizationExemption.request();
+      if (mounted) setState(() => _batteryExempt = exempt);
     } catch (e, stackTrace) {
       debugPrint('PERMISSIONS SETUP ERROR (initial request): $e\n$stackTrace');
     } finally {
@@ -169,6 +183,20 @@ class _PermissionsSetupScreenState extends ConsumerState<PermissionsSetupScreen>
                         ? _statusFor(
                             granted: notifications.granted,
                             deniedNote: "You won't be notified about new jobs or approvals — check the app to see updates instead.",
+                          )
+                        : null,
+                  ),
+                  const SizedBox(height: 12),
+                  _PermissionExplainerCard(
+                    icon: Icons.battery_charging_full_rounded,
+                    title: 'Run in background',
+                    message:
+                        'Keeps the hands-free voice assistant listening reliably while your screen is off or '
+                        'the phone is in your pocket, instead of Android putting it to sleep to save battery.',
+                    status: _primaryRequested
+                        ? _statusFor(
+                            granted: _batteryExempt,
+                            deniedNote: 'Voice may pause when the screen turns off — keep FieldLoop open while talking to it.',
                           )
                         : null,
                   ),

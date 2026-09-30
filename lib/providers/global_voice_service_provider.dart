@@ -263,7 +263,23 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// Called from `FieldLoopApp`'s lifecycle observer. Backgrounded: drop
   /// the spare and stop refreshing it (same release-on-pause the camera
   /// does). Foregrounded: fetch a new spare if voice is still live.
+  ///
+  /// Also the Gemini Live session's app-close/background handling. Closing
+  /// (`detached`): the session is ended right away — its recorder, player
+  /// and socket stopped explicitly (see `GeminiLiveTestScreen.endRequest`),
+  /// never left to the engine disconnecting, which CONFIRMED does not stop
+  /// the native flutter_sound recorder. Backgrounded (`paused`): a session is
+  /// only kept while a job is still in scope — that is exactly what the
+  /// microphone foreground service (VoiceSessionService) exists for;
+  /// anything else is ended.
   void onAppLifecycleChanged(AppLifecycleState lifecycle) {
+    if (lifecycle == AppLifecycleState.detached) {
+      _endActiveGeminiSession('app closing (AppLifecycleState.detached)');
+      return;
+    }
+    if (lifecycle == AppLifecycleState.paused && !_jobScopeActive) {
+      _endActiveGeminiSession('app backgrounded outside job scope');
+    }
     if (lifecycle == AppLifecycleState.paused) {
       _appBackgrounded = true;
     } else if (lifecycle == AppLifecycleState.resumed) {
@@ -1022,6 +1038,11 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   void exitJobScope() {
     debugPrint('VOICE: exiting job scope (mic stops listening)');
     _jobScopeActive = false;
+    // CONFIRMED BUG (logcat): leaving the job only stopped the wake-word
+    // recognizer — an open Gemini Live session kept streaming mic audio and
+    // answering ("Are you there?" -> "Yes, I can hear you...") on Home.
+    // Gemini is only ever reachable inside an active job: close it too.
+    _endActiveGeminiSession('left job scope');
     _syncGeminiTokenPrefetch();
     _stage = _ListenStage.idle;
     _cancelCommandSettleTimer();
@@ -1185,6 +1206,21 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// (a [Completer]) stands in for that: [GeminiLiveTestScreen.
   /// onAmbientSessionEnded] removes the entry AND completes it, together,
   /// exactly once per session — see that field's doc comment.
+  /// The running ambient session's end signal (see
+  /// `GeminiLiveTestScreen.endRequest`) — `null` when no session is up.
+  ValueNotifier<String?>? _activeGeminiSessionEndRequest;
+
+  /// Closes the ambient Gemini Live session on screen, if any — mic, socket
+  /// and any pending transcript/reply all stop at once (see
+  /// `GeminiLiveTestScreen._onEndRequest`).
+  void _endActiveGeminiSession(String reason) {
+    final endRequest = _activeGeminiSessionEndRequest;
+    if (endRequest == null) return;
+    _activeGeminiSessionEndRequest = null;
+    debugPrint('VOICE: ending the active Gemini Live session ($reason)');
+    endRequest.value = reason;
+  }
+
   Future<void> _triggerGeminiSession() async {
     // Claimed BEFORE the recognizer is stopped below, not after: releasing
     // the mic takes real time, and there's no reason the token (usually
@@ -1196,6 +1232,15 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     unawaited(tokenFuture.then((_) {}, onError: (Object _) {}));
 
     await pauseForExternalSession('wake_word');
+
+    // Gemini is reachable only inside an active job — the same scope the
+    // wake-word loop itself runs in. Also catches the job being left while
+    // the mic was being released just above.
+    if (!_jobScopeActive) {
+      debugPrint('VOICE: wake word heard but job scope is not active — not starting a Gemini session');
+      await resumeAfterExternalSession('wake_word_out_of_scope');
+      return;
+    }
 
     final jobId = _ref.read(currentlyViewedJobIdProvider);
     if (jobId == null) {
@@ -1227,12 +1272,15 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
 
     debugPrint('VOICE: wake word heard — starting ambient Gemini Live session for job $jobId');
     final sessionEnded = Completer<void>();
+    final endRequest = ValueNotifier<String?>(null);
+    _activeGeminiSessionEndRequest = endRequest;
     late final OverlayEntry entry;
     entry = OverlayEntry(
       builder: (_) => GeminiLiveTestScreen(
         jobId: jobId,
         ambient: true,
         tokenFuture: tokenFuture,
+        endRequest: endRequest,
         onAmbientSessionEnded: () {
           entry.remove();
           if (!sessionEnded.isCompleted) sessionEnded.complete();
@@ -1241,6 +1289,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     );
     overlay.insert(entry);
     await sessionEnded.future;
+    if (identical(_activeGeminiSessionEndRequest, endRequest)) _activeGeminiSessionEndRequest = null;
 
     // Defensive backstop, not the primary resume path: GeminiLiveTestScreen
     // already calls resumeAfterExternalSession itself from _teardown()

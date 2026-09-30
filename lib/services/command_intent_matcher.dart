@@ -93,7 +93,11 @@ const List<CommandIntent> defaultCommandIntents = [
     objects: [
       ['photo'], ['picture'], ['pic'], ['image'], ['shot'], ['snapshot'], ['camera'],
     ],
-    actions: {'take', 'snap', 'grab', 'get', 'capture', 'shoot', 'open', 'start', 'turn', 'need', 'want', 'make'},
+    actions: {
+      'take', 'snap', 'grab', 'get', 'capture', 'shoot', 'open', 'start', 'turn', 'need', 'want', 'make',
+      // "fire up / pull up / bring up the camera", "click a picture".
+      'fire', 'pull', 'bring', 'click',
+    },
     vetoWords: {'last', 'previous', 'latest', 'recent', 'earlier', 'delete'},
   ),
   CommandIntent(
@@ -268,6 +272,41 @@ IntentScore? scoreIntent(CommandIntent intent, List<String> words) {
   if (onlyObject) return IntentScore(intent, _bareObject, 'bare object $objectNote');
   if (content.length <= 4) {
     return IntentScore(intent, _objectInShortUtterance, 'object $objectNote without an action word');
+  }
+  return null;
+}
+
+/// Photo nouns that — ONLY once the live camera preview is up and armed —
+/// can only mean "take the picture now" (see [liveCameraShotNoun]).
+const Set<String> liveCameraShotNouns = {'shot', 'pic', 'snap', 'snapshot', 'photo', 'picture', 'image'};
+
+/// The more lenient capture rule, for a caller that has ALREADY checked the
+/// live camera preview is showing and armed — never use it otherwise. A
+/// bare photo noun normally scores FUZZY WEAK (no action verb, e.g. ASR's
+/// "Tika shot" for "take a shot"), but with the camera live and nothing
+/// else going on, the context alone makes the intent clear. Returns the
+/// heard noun, or `null` when the utterance:
+///  - is question-shaped ("is the photo okay?"),
+///  - negates the noun ("no photo yet"),
+///  - names an earlier photo ("last"/"previous"/..., get_last_photo's
+///    territory — same vetoes as the open_camera intent),
+///  - or carries more than two other content words ("the photo needs more
+///    light" is a remark, not a shutter command).
+String? liveCameraShotNoun(String transcript) {
+  if (looksLikeQuestion(transcript)) return null;
+  final words = normalizeCommandWords(transcript);
+  if (words.isEmpty) return null;
+  const vetoWords = {'last', 'previous', 'latest', 'recent', 'earlier', 'delete'};
+  if (words.any((w) => vetoWords.any((v) => _sameWord(w, v)))) return null;
+  for (var i = 0; i < words.length; i++) {
+    if (!liveCameraShotNouns.any((n) => _sameWord(words[i], n))) continue;
+    if (_negatedBefore(words, i)) return null;
+    final otherContent = [
+      for (var j = 0; j < words.length; j++)
+        if (j != i && !_nonContentWords.contains(words[j])) words[j],
+    ];
+    if (otherContent.length > 2) return null;
+    return words[i];
   }
   return null;
 }

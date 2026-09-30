@@ -141,4 +141,55 @@ void main() {
       expect(_decide('um uh okay').kind, IntentDecisionKind.none);
     });
   });
+
+  group('shot/snap/pic phrasings (logcat 09-29: "take a shot" heard as "Tika shot")', () {
+    final capturePhrases = _productionPhrases('_capturePhotoIndicatorPhrases');
+    final openPhrases = _productionPhrases('_openCameraIndicatorPhrases');
+
+    test('capture_photo phrase list matches them', () {
+      for (final text in [
+        'take a shot', 'Get a shot.', 'grab a shot', 'snap a shot', 'get a snap', 'grab a pic', 'take a pic',
+        'get the picture', 'shoot it', 'shoot this', 'photograph it', 'photograph this', 'click a picture',
+        'click the photo', 'okay take a quick shot',
+      ]) {
+        expect(matchAnyTriggerPhrase(text, capturePhrases), isNotNull, reason: text);
+      }
+    });
+
+    test('open_camera phrase list matches them', () {
+      for (final text in [
+        "let's get a shot", 'get the camera up', 'fire up the camera', 'pull up the camera', 'take a shot',
+        'click a picture',
+      ]) {
+        expect(matchAnyTriggerPhrase(text, openPhrases), isNotNull, reason: text);
+      }
+    });
+
+    test('restating "take a photo" still never matches capture_photo\'s list', () {
+      expect(matchAnyTriggerPhrase("let's take a photo", capturePhrases), isNull);
+      expect(matchAnyTriggerPhrase('take a picture', capturePhrases), isNull);
+    });
+  });
+
+  group('liveCameraShotNoun (only ever consulted with the camera live)', () {
+    test('a bare photo noun is a shutter command', () {
+      for (final text in ['Tika shot', 'shot', 'the pic', 'snap', 'photo now', 'okay picture', 'image']) {
+        expect(liveCameraShotNoun(text), isNotNull, reason: text);
+      }
+    });
+
+    test('questions, negation, earlier photos and longer remarks are not', () {
+      for (final text in [
+        'is the photo okay?',
+        'no photo yet',
+        "don't take the shot",
+        'show me the last photo',
+        'the photo needs a lot more light',
+        'hold on let me move the ladder',
+        '',
+      ]) {
+        expect(liveCameraShotNoun(text), isNull, reason: text);
+      }
+    });
+  });
 }

@@ -11,6 +11,11 @@ enum JobPhotoStatus { uploading, uploaded, failed, queuedOffline }
 /// thumbnail/full-size view via `CachedNetworkImage` whenever [localBytes]
 /// isn't available. A photo can have neither (still loading) or both
 /// (captured this session, since re-synced from the backend).
+///
+/// [fieldEventId] is this photo's own `field_events.id` once known, and
+/// [transcript] the technician's spoken description saved on that row (see
+/// `savePhotoNote` in `offline_upload_queue_provider.dart`) — `null` when
+/// the photo has no note.
 class JobPhoto {
   const JobPhoto({
     required this.id,
@@ -20,6 +25,8 @@ class JobPhoto {
     this.localBytes,
     this.error,
     this.url,
+    this.fieldEventId,
+    this.transcript,
   });
 
   final String id;
@@ -29,6 +36,10 @@ class JobPhoto {
   final Uint8List? localBytes;
   final String? error;
   final String? url;
+  final int? fieldEventId;
+  final String? transcript;
+
+  bool get hasNote => transcript != null && transcript!.trim().isNotEmpty;
 
   JobPhoto copyWith({
     JobPhotoStatus? status,
@@ -36,6 +47,8 @@ class JobPhoto {
     Uint8List? localBytes,
     String? error,
     String? url,
+    int? fieldEventId,
+    String? transcript,
   }) {
     return JobPhoto(
       id: id,
@@ -45,6 +58,8 @@ class JobPhoto {
       localBytes: localBytes ?? this.localBytes,
       error: error ?? this.error,
       url: url ?? this.url,
+      fieldEventId: fieldEventId ?? this.fieldEventId,
+      transcript: transcript ?? this.transcript,
     );
   }
 }

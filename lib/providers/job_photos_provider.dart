@@ -9,8 +9,10 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/env.dart';
 import '../models/job_photo.dart';
+import '../models/kept_photo_ref.dart';
 import '../utils/network_error.dart';
 import 'offline_upload_queue_provider.dart';
+import 'pending_uploads_db.dart';
 
 /// Outcome of [JobPhotosController.uploadPhoto] — distinct from a thrown
 /// exception because "queued offline" is NOT a failure from the
@@ -18,6 +20,29 @@ import 'offline_upload_queue_provider.dart';
 /// it the same as a real upload: navigate back normally, just with a
 /// different confirmation message).
 enum PhotoUploadResult { uploaded, queuedOffline }
+
+/// [JobPhotosController.uploadPhotoDetailed]'s result: the same
+/// [PhotoUploadResult] [JobPhotosController.uploadPhoto] returns, plus a
+/// [KeptPhotoRef] naming exactly which row (or queued item) this photo is.
+class PhotoUploadOutcome {
+  const PhotoUploadOutcome(this.result, this.ref, {this.noteStatus});
+
+  final PhotoUploadResult result;
+  final KeptPhotoRef ref;
+
+  /// Only when a note rode along with the upload (see
+  /// [JobPhotosController.uploadPhotoDetailed]'s `transcript`).
+  final PhotoNoteWriteStatus? noteStatus;
+}
+
+/// What happened to a note uploaded together with its photo:
+///  - [written]: landed in the same `field_events` write that marked the
+///    photo uploaded;
+///  - [queued]: will be written later — the photo itself was queued
+///    offline (the note travels as its `caption`), or that write hit a
+///    network error and the note went to `pending_photo_notes`;
+///  - [failed]: the photo is uploaded but the note could not be saved.
+enum PhotoNoteWriteStatus { written, queued, failed }
 
 /// Real job-site photos for a job: uploaded ones come from
 /// `GET /photos/for-job` (this job's FULL history — every photo ever
@@ -90,16 +115,27 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
       debugPrint('PHOTOS DIAG: _fetchUploaded() call #$_fetchCount for job_id=$jobId returned ${rows.length} row(s)');
       _lastFetchedAt = DateTime.now();
 
+      // A `/photos/for-job` deployed before photo notes existed returns no
+      // `transcript` key at all — read the notes straight off field_events
+      // instead of showing every photo as note-less.
+      final lambdaReturnsTranscripts = rows.any((raw) => (raw as Map<String, dynamic>).containsKey('transcript'));
+      final fallbackTranscripts = rows.isEmpty || lambdaReturnsTranscripts
+          ? const <int, String>{}
+          : await _fetchPhotoTranscriptsDirect(jobId);
+
       return rows.map((raw) {
         final row = raw as Map<String, dynamic>;
         final s3Key = row['s3Key'] as String?;
         final rawTs = row['capturedAt'] as String?;
+        final fieldEventId = row['id'] is int ? row['id'] as int : int.tryParse('${row['id']}');
         return JobPhoto(
           id: (row['id'] ?? s3Key ?? rawTs).toString(),
           status: JobPhotoStatus.uploaded,
           timestamp: rawTs != null ? DateTime.parse(rawTs).toLocal() : DateTime.now(),
           s3Key: s3Key,
           url: row['url'] as String?,
+          fieldEventId: fieldEventId,
+          transcript: (row['transcript'] as String?) ?? fallbackTranscripts[fieldEventId],
         );
       }).toList();
     } catch (e, stackTrace) {
@@ -196,9 +232,38 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
   /// surface an on-screen error — a network failure queues it instead and
   /// returns [PhotoUploadResult.queuedOffline], not an exception.
   Future<PhotoUploadResult> uploadPhoto(Uint8List bytes, {Future<UploadUrlInfo>? prefetchedUploadUrl}) async {
+    return (await uploadPhotoDetailed(bytes, prefetchedUploadUrl: prefetchedUploadUrl)).result;
+  }
+
+  /// Shows [transcript] on this session's photo matching [ref] right away,
+  /// without waiting for the next `/photos/for-job` refetch.
+  void applyPhotoNote(KeptPhotoRef ref, String transcript) {
+    final current = state.valueOrNull ?? const <JobPhoto>[];
+    for (final photo in current) {
+      final isMatch = photo.id == ref.localPhotoId || (ref.fieldEventId != null && photo.fieldEventId == ref.fieldEventId);
+      if (isMatch) _upsert(photo.copyWith(transcript: transcript));
+    }
+  }
+
+  /// [uploadPhoto], plus the [KeptPhotoRef] naming this photo's own
+  /// `field_events` row (or, when queued offline, its `pending_uploads` row)
+  /// — see [KeptPhotoRef]'s doc comment.
+  ///
+  /// [transcript] is the technician's confirmed voice note for this photo,
+  /// when there is one: it goes into the SAME `field_events` write that
+  /// marks the photo uploaded (see [uploadPhotoBytes]), or rides along as
+  /// the queued photo's `caption` when offline — never a separate write
+  /// after the fact.
+  Future<PhotoUploadOutcome> uploadPhotoDetailed(
+    Uint8List bytes, {
+    Future<UploadUrlInfo>? prefetchedUploadUrl,
+    String? transcript,
+  }) async {
     final id = 'local-${DateTime.now().microsecondsSinceEpoch}';
     final startedAt = DateTime.now();
-    _upsert(JobPhoto(id: id, status: JobPhotoStatus.uploading, timestamp: startedAt, localBytes: bytes));
+    _upsert(
+      JobPhoto(id: id, status: JobPhotoStatus.uploading, timestamp: startedAt, localBytes: bytes, transcript: transcript),
+    );
 
     final connectivity = await Connectivity().checkConnectivity();
     if (isOfflineResult(connectivity)) {
@@ -206,11 +271,17 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
       // The offline queue's own retry always fetches a fresh URL later (see
       // [uploadPhotoBytes]'s doc comment) — any prefetch already in flight
       // for this photo is simply left unawaited/unused, not an error.
-      return _queueOffline(id: id, startedAt: startedAt, bytes: bytes);
+      return _queueOffline(id: id, startedAt: startedAt, bytes: bytes, transcript: transcript);
     }
 
     try {
-      final s3Key = await uploadPhotoBytes(jobId: jobId, bytes: bytes, prefetchedUploadUrl: prefetchedUploadUrl);
+      final uploaded = await uploadPhotoBytes(
+        jobId: jobId,
+        bytes: bytes,
+        prefetchedUploadUrl: prefetchedUploadUrl,
+        transcript: transcript,
+      );
+      final s3Key = uploaded.s3Key;
       // FIX 1 (CRITICAL): this used to also call
       // _ref.invalidate(jobPhotosProvider(jobId)) here — but `_ref` belongs
       // to THIS SAME JobPhotosController instance (the one
@@ -228,13 +299,27 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
       // OfflineUploadQueueService._uploadOne, a genuinely DIFFERENT
       // provider/service, which correctly invalidates jobPhotosProvider
       // from outside it — that call is unrelated and unchanged.
-      _upsert(JobPhoto(id: id, status: JobPhotoStatus.uploaded, timestamp: startedAt, localBytes: bytes, s3Key: s3Key));
+      _upsert(
+        JobPhoto(
+          id: id,
+          status: JobPhotoStatus.uploaded,
+          timestamp: startedAt,
+          localBytes: bytes,
+          s3Key: s3Key,
+          fieldEventId: uploaded.fieldEventId,
+          transcript: uploaded.noteStatus == PhotoNoteWriteStatus.failed ? null : transcript,
+        ),
+      );
       debugPrint('PHOTOS: upload complete for $id, state updated directly (uploaded)');
-      return PhotoUploadResult.uploaded;
+      return PhotoUploadOutcome(
+        PhotoUploadResult.uploaded,
+        KeptPhotoRef(jobId: jobId, localPhotoId: id, fieldEventId: uploaded.fieldEventId, s3Key: s3Key),
+        noteStatus: uploaded.noteStatus,
+      );
     } catch (e, stackTrace) {
       if (isNetworkError(e)) {
         debugPrint('PHOTOS: upload failed with a network error ($e) — queuing offline instead');
-        return _queueOffline(id: id, startedAt: startedAt, bytes: bytes);
+        return _queueOffline(id: id, startedAt: startedAt, bytes: bytes, transcript: transcript);
       }
       debugPrint('PHOTOS ERROR (upload): $e\n$stackTrace');
       _upsert(
@@ -244,18 +329,31 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
     }
   }
 
-  Future<PhotoUploadResult> _queueOffline({
+  Future<PhotoUploadOutcome> _queueOffline({
     required String id,
     required DateTime startedAt,
     required Uint8List bytes,
+    String? transcript,
   }) async {
     try {
-      final localPath = await _ref
+      final queued = await _ref
           .read(offlineUploadQueueProvider.notifier)
-          .enqueue(jobId: jobId, bytes: bytes);
-      debugPrint('PHOTOS: photo queued for offline upload at $localPath');
-      _upsert(JobPhoto(id: id, status: JobPhotoStatus.queuedOffline, timestamp: startedAt, localBytes: bytes));
-      return PhotoUploadResult.queuedOffline;
+          .enqueue(jobId: jobId, bytes: bytes, caption: transcript);
+      debugPrint('PHOTOS: photo queued for offline upload at ${queued.localPath} (pending_upload_id=${queued.pendingUploadId})');
+      _upsert(
+        JobPhoto(
+          id: id,
+          status: JobPhotoStatus.queuedOffline,
+          timestamp: startedAt,
+          localBytes: bytes,
+          transcript: transcript,
+        ),
+      );
+      return PhotoUploadOutcome(
+        PhotoUploadResult.queuedOffline,
+        KeptPhotoRef(jobId: jobId, localPhotoId: id, pendingUploadId: queued.pendingUploadId),
+        noteStatus: transcript == null ? null : PhotoNoteWriteStatus.queued,
+      );
     } catch (e, stackTrace) {
       // Couldn't even persist locally (disk full, etc.) — that IS a real
       // failure the technician needs to know about, not a silent queue.
@@ -269,8 +367,15 @@ class JobPhotosController extends StateNotifier<AsyncValue<List<JobPhoto>>> {
 }
 
 /// A presigned S3 PUT URL plus the `s3Key` the `/photos/upload-url` Lambda
-/// chose for it — see [prefetchUploadUrl].
-typedef UploadUrlInfo = ({String uploadUrl, String s3Key});
+/// chose for it — see [prefetchUploadUrl]. [fieldEventId] is the id of the
+/// `field_events` row that same call inserted for this photo (`null` only
+/// if it genuinely couldn't be determined — see [prefetchUploadUrl]).
+typedef UploadUrlInfo = ({String uploadUrl, String s3Key, int? fieldEventId});
+
+/// What [uploadPhotoBytes] actually uploaded: the S3 key, the
+/// `field_events` row id it belongs to, and — only when a transcript was
+/// passed — what happened to it.
+typedef UploadedPhotoInfo = ({String s3Key, int? fieldEventId, PhotoNoteWriteStatus? noteStatus});
 
 /// Calls the `/photos/upload-url` Lambda alone — the first of
 /// [uploadPhotoBytes]'s two network round trips, split out so it can be
@@ -320,7 +425,104 @@ Future<UploadUrlInfo> prefetchUploadUrl({required String jobId}) async {
     throw StateError('Upload URL response missing uploadUrl/s3Key.');
   }
   debugPrint('PHOTOS: got upload URL, s3Key=$s3Key');
-  return (uploadUrl: uploadUrl, s3Key: s3Key);
+
+  // The row's own id, straight from the Lambda's insert. An older Lambda
+  // deploy doesn't return it; s3_object_key is unique per photo (it
+  // embeds a millisecond timestamp), so the id is looked up by it
+  // instead, scoped to this job and event type.
+  final rawId = decoded['fieldEventId'];
+  var fieldEventId = rawId is int ? rawId : int.tryParse('${rawId ?? ''}');
+  if (fieldEventId == null) {
+    fieldEventId = await _lookupPhotoFieldEventId(jobId: jobId, s3Key: s3Key);
+    debugPrint(
+      'PHOTO NOTE [row_id]: upload-url response had no fieldEventId — looked up by s3_object_key: '
+      'field_events.id=${fieldEventId ?? 'NOT FOUND'} (s3Key=$s3Key)',
+    );
+  }
+  return (uploadUrl: uploadUrl, s3Key: s3Key, fieldEventId: fieldEventId);
+}
+
+/// See [prefetchUploadUrl] — the fallback for a Lambda that doesn't return
+/// the inserted row's id. Returns `null` (never throws) when it can't be
+/// found: the photo upload itself must never fail because of this.
+Future<int?> _lookupPhotoFieldEventId({required String jobId, required String s3Key}) async {
+  try {
+    final rows = await Supabase.instance.client
+        .from('field_events')
+        .select('id')
+        .eq('s3_object_key', s3Key)
+        .eq('job_id', jobId)
+        .eq('event_type', 'photo')
+        .limit(2);
+    if (rows.length != 1) {
+      debugPrint('PHOTO NOTE [row_id]: lookup for s3Key=$s3Key matched ${rows.length} rows — not guessing');
+      return null;
+    }
+    final id = rows.first['id'];
+    return id is int ? id : int.tryParse('$id');
+  } catch (e) {
+    debugPrint('PHOTO NOTE [row_id]: lookup for s3Key=$s3Key failed: $e');
+    return null;
+  }
+}
+
+/// Fallback for [JobPhotosController._fetchUploaded] when `/photos/for-job`
+/// doesn't return `transcript` yet — `field_events.id` -> note for every
+/// photo in [jobId] that has one. Empty (never throws) on failure: a
+/// missing note must never fail the photo grid itself.
+Future<Map<int, String>> _fetchPhotoTranscriptsDirect(String jobId) async {
+  try {
+    final rows = await Supabase.instance.client
+        .from('field_events')
+        .select('id, transcript')
+        .eq('job_id', jobId)
+        .eq('event_type', 'photo')
+        .not('transcript', 'is', null);
+    return {
+      for (final row in rows)
+        if (row['id'] is int && row['transcript'] is String) row['id'] as int: row['transcript'] as String,
+    };
+  } catch (e) {
+    debugPrint('PHOTOS: direct photo-note fetch for job $jobId failed (showing photos without notes): $e');
+    return const {};
+  }
+}
+
+/// Writes the technician's confirmed voice description into [fieldEventId]'s
+/// `transcript` column — matched on the row's own id AND [jobId] AND
+/// `event_type = 'photo'`, never job_id alone, so it can only ever land on
+/// that one photo. `.select()` makes a 0-row match (wrong id, or an RLS
+/// grant gap — see [_markFieldEventUploaded]'s BUG A2 note) throw instead
+/// of silently "succeeding".
+///
+/// Throws on any failure; callers decide whether it's a network failure to
+/// queue (see `savePhotoNote` in `offline_upload_queue_provider.dart`).
+Future<void> writePhotoTranscript({
+  required int fieldEventId,
+  required String jobId,
+  required String transcript,
+}) async {
+  debugPrint(
+    'PHOTO NOTE [save]: field_events.transcript UPDATE REACHED — executing '
+    'WHERE id=$fieldEventId AND job_id=$jobId AND event_type=photo (${transcript.length} chars) at ${DateTime.now()}',
+  );
+  final updated = await Supabase.instance.client
+      .from('field_events')
+      .update({'transcript': transcript})
+      .eq('id', fieldEventId)
+      .eq('job_id', jobId)
+      .eq('event_type', 'photo')
+      .select('id');
+  debugPrint(
+    'PHOTO NOTE [save]: field_events.transcript UPDATE returned ${updated.length} row(s) '
+    '(ids=${updated.map((r) => r['id']).join(',')}) for field_events.id=$fieldEventId at ${DateTime.now()}',
+  );
+  if (updated.isEmpty) {
+    throw StateError(
+      'field_events transcript update for id=$fieldEventId job_id=$jobId event_type=photo matched 0 rows — '
+      'wrong row, or missing RLS UPDATE grant on field_events.',
+    );
+  }
 }
 
 /// Requests a presigned S3 URL from the `/photos/upload-url` Lambda (or
@@ -339,10 +541,15 @@ Future<UploadUrlInfo> prefetchUploadUrl({required String jobId}) async {
 /// `gemini_function_dispatcher.dart`); the offline queue always fetches
 /// fresh, since a queued retry can run long after any prefetch would have
 /// gone stale.
-Future<String> uploadPhotoBytes({
+///
+/// [transcript], when given, is written in that SAME `field_events` update
+/// (photo + note in one write), which is then awaited rather than left in
+/// the background — see [_markFieldEventUploaded].
+Future<UploadedPhotoInfo> uploadPhotoBytes({
   required String jobId,
   required Uint8List bytes,
   Future<UploadUrlInfo>? prefetchedUploadUrl,
+  String? transcript,
 }) async {
   final urlInfo = await (prefetchedUploadUrl ?? prefetchUploadUrl(jobId: jobId));
   final uploadUrl = urlInfo.uploadUrl;
@@ -366,15 +573,43 @@ Future<String> uploadPhotoBytes({
   // still throws loudly on 0 rows (see BUG A2 fix below) — just off the
   // critical path via `unawaited`, with its own error caught and logged
   // rather than propagating into a promise nobody's awaiting.
-  unawaited(_markFieldEventUploaded(s3Key));
+  if (transcript == null) {
+    unawaited(_markFieldEventUploaded(s3Key));
+    return (s3Key: s3Key, fieldEventId: urlInfo.fieldEventId, noteStatus: null);
+  }
 
-  return s3Key;
+  // A note rides along: awaited, so the caller only reports it saved once
+  // it really is. The photo itself is already safe in S3 either way, so a
+  // failure here never fails the upload — a network error keeps the note
+  // in `pending_photo_notes` for the next reconnect.
+  final fieldEventId = urlInfo.fieldEventId;
+  try {
+    await _markFieldEventUploaded(s3Key, transcript: transcript, rethrowErrors: true);
+    return (s3Key: s3Key, fieldEventId: fieldEventId, noteStatus: PhotoNoteWriteStatus.written);
+  } catch (e) {
+    if (fieldEventId != null && isNetworkError(e)) {
+      try {
+        await PendingUploadsDb.instance.insertPhotoNote(jobId: jobId, fieldEventId: fieldEventId, transcript: transcript);
+        debugPrint('PHOTO NOTE [queue]: photo+note write hit a network error ($e) — note queued for field_events.id=$fieldEventId');
+        return (s3Key: s3Key, fieldEventId: fieldEventId, noteStatus: PhotoNoteWriteStatus.queued);
+      } catch (queueError) {
+        debugPrint('PHOTO NOTE [queue]: could not queue note for field_events.id=$fieldEventId: $queueError');
+      }
+    }
+    debugPrint('PHOTO NOTE [save]: FAILED — photo uploaded (s3Key=$s3Key) but its note was not saved: $e');
+    return (s3Key: s3Key, fieldEventId: fieldEventId, noteStatus: PhotoNoteWriteStatus.failed);
+  }
 }
 
 /// See [uploadPhotoBytes]'s BUG 3 FIX doc comment for why this runs
-/// unawaited rather than gating the upload's own return.
-Future<void> _markFieldEventUploaded(String s3Key) async {
-  debugPrint('PHOTOS: marking field_events uploaded for s3Key=$s3Key...');
+/// unawaited rather than gating the upload's own return — except when a
+/// [transcript] rides along, which [uploadPhotoBytes] awaits with
+/// [rethrowErrors] so the note's outcome is known.
+Future<void> _markFieldEventUploaded(String s3Key, {String? transcript, bool rethrowErrors = false}) async {
+  debugPrint(
+    'PHOTOS: marking field_events uploaded for s3Key=$s3Key'
+    '${transcript != null ? ' — PHOTO NOTE [save]: single photo+note write (${transcript.length} chars)' : ''}...',
+  );
   try {
     // BUG A2 fix: this used to fire-and-forget the update with no check on
     // whether it actually touched a row. The field_events row is INSERTed by
@@ -395,6 +630,7 @@ Future<void> _markFieldEventUploaded(String s3Key) async {
         .from('field_events')
         .update({
           'metadata': {'status': 'uploaded'},
+          'transcript': ?transcript,
         })
         .eq('s3_object_key', s3Key)
         .select();
@@ -411,5 +647,6 @@ Future<void> _markFieldEventUploaded(String s3Key) async {
     // here MUST be loud somewhere since nothing awaits this Future anymore
     // — logged, not silently swallowed.
     debugPrint('PHOTOS ERROR (background field_events status update for s3Key=$s3Key): $e\n$stackTrace');
+    if (rethrowErrors) rethrow;
   }
 }

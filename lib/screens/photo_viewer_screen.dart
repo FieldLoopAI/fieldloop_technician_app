@@ -43,7 +43,48 @@ class PhotoViewerScreen extends StatelessWidget {
           style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600),
         ),
       ),
-      body: Center(child: _PhotoViewerImage(photo: photo)),
+      body: Column(
+        children: [
+          Expanded(child: Center(child: _PhotoViewerImage(photo: photo))),
+          if (photo.hasNote) _PhotoNotePanel(note: photo.transcript!.trim()),
+        ],
+      ),
+    );
+  }
+}
+
+/// The technician's spoken description of this photo (its
+/// `field_events.transcript`), shown under the image.
+class _PhotoNotePanel extends StatelessWidget {
+  const _PhotoNotePanel({required this.note});
+
+  final String note;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      top: false,
+      child: Container(
+        width: double.infinity,
+        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.3),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+        color: Colors.white.withValues(alpha: 0.08),
+        child: SingleChildScrollView(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(top: 2),
+                child: Icon(Icons.sticky_note_2_outlined, color: Colors.white70, size: 18),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(note, style: const TextStyle(color: Colors.white, fontSize: 14.5, height: 1.35)),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

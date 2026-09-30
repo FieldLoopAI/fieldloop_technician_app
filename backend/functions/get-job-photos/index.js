@@ -13,7 +13,7 @@ exports.handler = async (event) => {
 
     const { data: photos, error } = await supabase
       .from('field_events')
-      .select('id, s3_object_key, event_ts')
+      .select('id, s3_object_key, event_ts, transcript')
       .eq('job_id', jobId)
       .eq('event_type', 'photo')
       .contains('metadata', { status: 'uploaded' })
@@ -23,7 +23,7 @@ exports.handler = async (event) => {
     const withUrls = await Promise.all(photos.map(async (p) => {
       const command = new GetObjectCommand({ Bucket: 'fieldloop-job-photos', Key: p.s3_object_key });
       const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
-      return { id: p.id, s3Key: p.s3_object_key, url, capturedAt: p.event_ts };
+      return { id: p.id, s3Key: p.s3_object_key, url, capturedAt: p.event_ts, transcript: p.transcript };
     }));
 
     return {

@@ -19,6 +19,28 @@ class JobPhotoThumbnail extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final image = _buildImage();
+    // A photo with a spoken note gets a small badge — too cramped to read
+    // on the tiny timeline nodes, so only on normal-size tiles.
+    if (!photo.hasNote || iconSize < 18) return image;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        image,
+        Positioned(
+          left: 4,
+          bottom: 4,
+          child: Container(
+            padding: const EdgeInsets.all(3),
+            decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.55), shape: BoxShape.circle),
+            child: const Icon(Icons.sticky_note_2_rounded, color: Colors.white, size: 12),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildImage() {
     if (photo.localBytes != null) {
       return Image.memory(photo.localBytes!, fit: BoxFit.cover);
     }

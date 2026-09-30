@@ -27,6 +27,9 @@ class MainActivity : FlutterActivity() {
 
     private val audioDiagnosticsChannel = "com.fieldloop.fielloop/audio_diagnostics"
 
+    /** See [VoiceSessionService] — the live voice session's foreground service. */
+    private val voiceSessionChannel = "com.fieldloop.fielloop/voice_session"
+
     // Guards [startBluetoothScoAudio]'s broadcast wait so a second call
     // (shouldn't normally happen — GlobalVoiceService only calls it once
     // per job-scope session — but defensive against a stray double call)
@@ -64,6 +67,50 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, voiceSessionChannel)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "startForegroundSession" -> result.success(VoiceSessionService.start(applicationContext))
+                    "stopForegroundSession" -> result.success(VoiceSessionService.stop(applicationContext))
+                    "getPowerState" -> result.success(getPowerState())
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * The app is closing (back out of the root screen, or the task removed)
+     * while a Gemini voice session is still live — its foreground service
+     * would otherwise keep the process alive with flutter_sound's native
+     * recorder orphaned. See [VoiceSessionService.endOrphanedProcessSoon].
+     * Only when a session is live: every other close, and every
+     * configuration-change recreation, is untouched.
+     */
+    override fun onDestroy() {
+        if (isFinishing && VoiceSessionService.isRunning) {
+            VoiceSessionService.stop(applicationContext)
+            VoiceSessionService.endOrphanedProcessSoon("activity finishing with a live voice session")
+        }
+        super.onDestroy()
+    }
+
+    /**
+     * Read-only power/background-restriction snapshot for the voice-session
+     * log: whether this app is exempt from battery optimization, whether the
+     * device is in Doze or power-save right now, and whether the user/OEM has
+     * background-restricted the app.
+     */
+    private fun getPowerState(): Map<String, Any?> {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        return mapOf(
+            "ignoringBatteryOptimizations" to powerManager.isIgnoringBatteryOptimizations(packageName),
+            "deviceIdle" to powerManager.isDeviceIdleMode,
+            "powerSave" to powerManager.isPowerSaveMode,
+            "backgroundRestricted" to
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) activityManager.isBackgroundRestricted else null,
+            "foregroundServiceRunning" to VoiceSessionService.isRunning,
+        )
     }
 
     /**

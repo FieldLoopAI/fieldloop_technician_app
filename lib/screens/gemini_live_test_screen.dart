@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'dart:ui' show FrameTiming;
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -15,7 +16,10 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../config/env.dart';
+import '../models/kept_photo_ref.dart';
 import '../providers/global_voice_service_provider.dart';
+import '../providers/job_photos_provider.dart';
+import '../providers/offline_upload_queue_provider.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../services/command_intent_matcher.dart';
 import '../services/completion_claim_detector.dart';
@@ -25,7 +29,9 @@ import '../services/echo_sequence_matcher.dart';
 import '../services/gemini_function_dispatcher.dart';
 import '../services/pending_call_fillers.dart';
 import '../services/photo_decision_classifier.dart';
+import '../services/photo_note_classifier.dart';
 import '../services/transliterated_greeting.dart';
+import '../services/voice_session_power.dart';
 import '../services/trigger_phrase_matcher.dart';
 import '../theme/app_theme.dart';
 import '../widgets/voice_phase_indicator.dart';
@@ -86,7 +92,15 @@ class GeminiLiveTestScreen extends ConsumerStatefulWidget {
     this.ambient = false,
     this.onAmbientSessionEnded,
     this.tokenFuture,
+    this.endRequest,
   });
+
+  /// Set (to a reason) by `GlobalVoiceService` when this session must end
+  /// from OUTSIDE the conversation — the technician left the job (see
+  /// `GlobalVoiceService.exitJobScope`). The session is closed on the spot:
+  /// no further mic audio sent, no transcript processed, no reply spoken
+  /// (see `_GeminiLiveTestScreenState._endForJobScopeExit`).
+  final ValueListenable<String?>? endRequest;
 
   /// The Gemini token for this screen's FIRST session, already requested by
   /// the caller — [GlobalVoiceService._triggerGeminiSession] claims it the
@@ -302,6 +316,27 @@ const String _systemInstruction =
     'initiative. If the technician asks whether a photo was taken or uploaded, do not answer from memory — '
     'say you\'ll check, and call get_job_timeline_answer or get_last_photo. Describing an action you are '
     'about to perform is fine ("opening the camera now"); describing one as already done is not. '
+    // CHANGE 2 — CONFIRMED via logcat: every time a deterministic trigger
+    // fires (open_camera, capture_photo, confirm_photo_upload, ...) Gemini
+    // also free-generates its own reply to the same utterance ("I can't—",
+    // "Great. Is there anything else I can help you with?"). The app's
+    // mute/interrupt/hard-pause logic still catches it and stays in place
+    // as the safety net; this only makes Gemini attempt it less often.
+    'APP-HANDLED COMMANDS — STAY SILENT. The app itself recognizes and carries out these phrases the moment it '
+    'hears them: opening the camera ("take a photo", "open the camera"), capturing ("take it", "ready", '
+    '"capture it"), keeping or retaking a photo ("keep it", "save it", "retake", "try again"), answering the '
+    'photo-note question (adding, confirming, or declining a note — "yes", "no", "skip", "save that", or the '
+    'note\'s own words), and navigation such as "go back", "take me back", or "go home". For any of these, do '
+    'NOT produce a conversational answer of your own — no acknowledgment, no follow-up question, no "anything '
+    'else?", no explanation of what you can or cannot do. You may still call the matching function, but say '
+    'nothing. The app speaks the result itself and then tells you the outcome in a message afterward; only '
+    'respond to what that message asks you to say. '
+    // Wake-word greeting — the app speaks the session's one opening line
+    // itself (see `_maybeSpeakSessionGreeting`); a greeting of Gemini's own
+    // racing it is the double-greeting bug this codebase already had once.
+    'NO GREETING OF YOUR OWN. When a session starts, the app itself speaks the one opening greeting. Never '
+    'greet, introduce yourself, or announce that you are here or listening on your own initiative. At the '
+    'start of a session, stay silent until the technician speaks or the app hands you an exact line to read. '
     'When the technician wants to log a quick observation or note about the site (not a priced estimate or '
     'change order), call site_condition. '
     'When the technician asks to see or review something (the estimate, change orders, the invoice, job '
@@ -378,7 +413,14 @@ const String _systemInstructionReminder =
     'attached, kept, retaken, or discarded unless the app just handed you that exact sentence to read. Saying '
     'a photo exists when none does is the single worst thing you can do to a technician - they will leave the '
     'site believing the job is documented when it is not. When in any doubt at all, say what you are doing or '
-    'about to do, never what is already done.';
+    'about to do, never what is already done. '
+    // CHANGE 2 — see the APP-HANDLED COMMANDS paragraph in
+    // [_systemInstruction]; restated here, the true LAST text Gemini reads,
+    // for the same reason as every other rule in this const.
+    'And for camera, photo, photo-note, and "go back" commands, never speak a reply of your own at all - the '
+    'app handles those and tells you the outcome afterward (this overrides the check-in suggestion above for '
+    'those commands). '
+    'Never greet or announce yourself on your own - the app speaks the opening greeting itself.';
 
 /// Function-calling tool set — the app's real, voice-reliable command set.
 ///
@@ -493,10 +535,11 @@ const List<Map<String, dynamic>> _geminiToolFunctionDeclarations = [
   },
   {
     'name': 'confirm_photo_upload',
-    'description': 'Uploads the photo that was just captured (call capture_photo first) and attaches it to '
-        "the job's photo record. Call this when the technician says to keep, save, upload, or confirm the "
-        'photo — phrases like "keep it", "save it", "upload it", "that looks good", "use that one", or "yes, '
-        'keep that" should ALWAYS trigger this function.',
+    'description': 'Keeps the photo that was just captured (call capture_photo first). The app then asks the '
+        "technician about a note and uploads the photo to the job's photo record itself once that is answered "
+        '— this call does not upload anything yet. Call this when the technician says to keep, save, upload, or '
+        'confirm the photo — phrases like "keep it", "save it", "upload it", "that looks good", "use that one", '
+        'or "yes, keep that" should ALWAYS trigger this function.',
     'parameters': {
       'type': 'OBJECT',
       'properties': {
@@ -948,6 +991,68 @@ class _TranscriptTrigger {
   }
 }
 
+enum _PhotoNotePhase { awaitingDescription, awaitingConfirmation }
+
+/// Outcome of comparing a new turn against the interrupted-turn baseline —
+/// see `_GeminiLiveTestScreenState._evaluateInterruptedTurnBaseline`.
+enum _BaselineVerdict { noBaseline, needMoreWords, notDuplicate, duplicate }
+
+/// State of the voice photo-description flow ("awaitingPhotoDescription") —
+/// see the section of that name in [_GeminiLiveTestScreenState]. Carries
+/// the kept photo's id ([keptId]) for its whole life: the photo is held,
+/// NOT uploaded, until this flow's answer is known.
+class _PhotoNoteFlow {
+  _PhotoNoteFlow(this.keptId, this.jobId, this.enteredAt) : quietSince = enteredAt, stepStartedAt = enteredAt;
+
+  /// See `GeminiCameraSession.keep`/`uploadKept`.
+  final int keptId;
+  final String jobId;
+  final DateTime enteredAt;
+
+  /// This photo's upload — `null` until the note question is answered (see
+  /// `_startPhotoNoteUpload`), then the upload's result (`null` if it
+  /// threw). Started at most once per flow.
+  Future<Map<String, dynamic>?>? upload;
+
+  String describePhoto() =>
+      'kept photo #$keptId job_id=$jobId (${upload == null ? 'upload deferred until the note is answered' : 'upload started'})';
+  _PhotoNotePhase phase = _PhotoNotePhase.awaitingDescription;
+
+  /// The technician's words since the flow last acted on anything.
+  String buffer = '';
+  DateTime? lastHeardAt;
+
+  /// Read back, awaiting "yes" — never saved until confirmed.
+  String? candidate;
+  int reasks = 0;
+  bool prompted = false;
+  bool saving = false;
+  DateTime quietSince;
+
+  /// Whether the current read-back already got its one "Save that note —
+  /// yes or no?" re-prompt. Reset for each new read-back (a correction is
+  /// a new candidate).
+  bool confirmReprompted = false;
+
+  /// Same, for the awaitingDescription ask ("Still there? Want to add a
+  /// note, or should I skip it?"). Reset whenever the flow asks for a note
+  /// again (redo / re-ask).
+  bool descriptionReprompted = false;
+
+  /// When the flow last spoke — the per-step hard ceiling runs from here.
+  DateTime stepStartedAt;
+
+  /// A real command broke out of the confirmation (see
+  /// `_photoNoteBreakOutToRealCommand`) — [resumePending] until the one
+  /// "back to the photo note" prompt is spoken; [resumedAfterCommand] so it
+  /// only ever happens once.
+  bool resumePending = false;
+  bool resumedAfterCommand = false;
+
+  /// The [_GeminiLiveTestScreenState._utteranceSeq] this flow last claimed.
+  int? ownedUtteranceSeq;
+}
+
 /// Debounce shared by every [_TranscriptTrigger] — same 5s value already
 /// proven for [_viewEstimateDebounce]/[_getJobDetailsDebounce].
 const Duration _deterministicTriggerDebounce = Duration(seconds: 5);
@@ -1134,6 +1239,30 @@ const List<String> _openCameraIndicatorPhrases = [
   'open camera',
   'turn on the camera',
   'start the camera',
+  // CONFIRMED gap (logcat 09-29 12:14, "take a shot" heard as "Tika shot"):
+  // no "shot"/"snap"/"pic"/"photograph" phrasing at all, and none of the
+  // common "bring the camera up" phrasings either. The shot/pic/snap/click
+  // phrasings below are ALSO in [_capturePhotoIndicatorPhrases]: each
+  // trigger's guard decides — with the camera closed they open it, with it
+  // live capture_photo fires (a guard-failed open_camera match is a
+  // non-event, see [_maybeTriggerDeterministic]).
+  'lets get a shot',
+  'get the camera up',
+  'fire up the camera',
+  'pull up the camera',
+  'bring up the camera',
+  'take a shot',
+  'get a shot',
+  'grab a shot',
+  'snap a shot',
+  'take a snap',
+  'get a snap',
+  'grab a pic',
+  'get a pic',
+  'snap a pic',
+  'take a photograph',
+  'click a picture',
+  'click a photo',
 ];
 
 /// FIX 2: `capture_photo`'s own deterministic backstop, same pattern as
@@ -1179,6 +1308,43 @@ const List<String> _capturePhotoIndicatorPhrases = [
   'take image',
   'capture the image',
   'snap the image',
+  // CONFIRMED gap (logcat 09-29 12:14, "take a shot" heard as "Tika shot"):
+  // shot/snap/pic/shoot/photograph/click phrasings. Unlike photo/picture,
+  // the "a" forms of these ARE capture phrasings while the camera is live —
+  // "take a shot" said at the live preview means "shoot now"; the article
+  // rule (and [_looksLikeCapturePhotoConfirmation]'s veto) still keeps a
+  // restated "take a photo"/"take a picture" from firing the shutter. Most
+  // of these are also open_camera phrasings for when the camera is closed —
+  // see the note in [_openCameraIndicatorPhrases].
+  'take a shot',
+  'take the shot',
+  'get a shot',
+  'get the shot',
+  'grab a shot',
+  'grab the shot',
+  'snap a shot',
+  'take a snap',
+  'get a snap',
+  'take a pic',
+  'take the pic',
+  'grab a pic',
+  'get a pic',
+  'snap a pic',
+  'get the picture',
+  'get the photo',
+  'grab the picture',
+  'grab the photo',
+  'shoot it',
+  'shoot this',
+  'shoot that',
+  'photograph it',
+  'photograph this',
+  'photograph that',
+  'click a picture',
+  'click the picture',
+  'click a photo',
+  'click the photo',
+  'click it',
   // NOTE: 'confirm'/'keep it'/'upload it' ALSO appear in
   // [_photoConfirmIndicatorPhrases] (confirm_photo_upload's own trigger,
   // guarded on `_ScreenTask.cameraCaptured`) — not a copy-paste duplicate.
@@ -1507,6 +1673,14 @@ const List<String> _getCurrentScreenIndicatorPhrases = [
   'which screen are we on',
   'which page are we on',
   'what page is this',
+  // CONFIRMED miss (flutter_run_log 97579c46): "Can you tell me which
+  // screen we are" — declarative word order matched none of the above.
+  'which screen we are on',
+  'which screen we are',
+  'what screen we are on',
+  'what screen are we on',
+  'which screen is this',
+  'which page we are on',
 ];
 
 /// PART A item 3 (client-confirmed regression: Gemini free-texted a generic
@@ -2839,6 +3013,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _pausedVoiceService?.setScreenTaskActive(false);
     };
     WidgetsBinding.instance.addTimingsCallback(_onFrameTimings);
+    widget.endRequest?.addListener(_onEndRequest);
     if (widget.ambient) {
       // Deferred to a post-frame callback — same reasoning as every other
       // "write provider state / start real work right as a screen first
@@ -2846,14 +3021,92 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // doing this synchronously, mid-build, is unsafe.
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
+        // The job may already have been left before this first frame.
+        if (widget.endRequest?.value != null) {
+          _onEndRequest();
+          return;
+        }
         _log_('ambient mode: auto-starting session (reached via wake word/"Loop On")');
         unawaited(_startTest());
       });
     }
   }
 
+  /// See [GeminiLiveTestScreen.endRequest]. Everything that could still
+  /// reach Gemini or the speaker is cut off synchronously, right here —
+  /// [_teardown] itself awaits the mic capture and camera before closing the
+  /// socket, and nothing may be heard or answered in that window.
+  bool _sessionClosing = false;
+
+  void _onEndRequest() {
+    final reason = widget.endRequest?.value;
+    if (reason == null || _sessionClosing) return;
+    // Synchronously: ONLY the flag every gate reads (mic send, server
+    // messages, scripted replies). CONFIRMED via logcat: this is called from
+    // `JobDetailScreen.dispose()` -> `exitJobScope()`, i.e. while the widget
+    // tree is locked — the old `_log_` (a setState) here threw, so the flag
+    // got set but `_stopTest` never ran: the socket, the OUTGOING AUDIO timer
+    // and the overlay all stayed alive. The rest runs on the next event-loop
+    // turn, outside any build/finalize phase.
+    _sessionClosing = true;
+    debugPrint('GEMINI LIVE TEST: SESSION END requested ($reason) — gates closed, disposing next');
+    _releaseNativeAudioNow(reason);
+    Future(() => _disposeForEndRequest(reason));
+  }
+
+  /// The native pieces — recorder, PCM player, socket — are told to stop
+  /// right away, not after [_teardown]'s awaits: when the app is closing
+  /// (`AppLifecycleState.detached`) the engine may be gone before those
+  /// finish, and a native recorder nobody stopped keeps running orphaned
+  /// (CONFIRMED via logcat: 500+ "FlutterJNI was detached ... Channel:
+  /// xyz.canardoux.flutter_sound_recorder"). No setState anywhere in here —
+  /// safe while the widget tree is locked. [_teardown] still runs afterwards
+  /// and closes everything properly (every step there tolerates this having
+  /// already happened).
+  void _releaseNativeAudioNow(String reason) {
+    _pcmReinitGeneration++;
+    _pcmReady = false;
+    _pcmRemainingFrames = 0;
+    try {
+      FlutterPcmSound.setFeedCallback(null);
+      unawaited(FlutterPcmSound.release().catchError((Object e) {
+        debugPrint('GEMINI LIVE TEST ERROR (pcm sound release on session end): $e');
+      }));
+    } catch (e) {
+      debugPrint('GEMINI LIVE TEST ERROR (pcm sound release on session end): $e');
+    }
+    if (_recorderOpen) {
+      unawaited(() async {
+        try {
+          if (_recorder.isRecording) {
+            await _recorder.stopRecorder();
+            debugPrint('GEMINI LIVE TEST: mic recorder stopped on session end ($reason)');
+          }
+        } catch (e) {
+          debugPrint('GEMINI LIVE TEST ERROR (recorder stop on session end): $e');
+        }
+      }());
+    }
+    final channel = _channel;
+    if (channel != null) {
+      unawaited(channel.sink.close().catchError((Object e) {
+        debugPrint('GEMINI LIVE TEST ERROR (WebSocket close on session end): $e');
+      }));
+    }
+  }
+
+  void _disposeForEndRequest(String reason) {
+    // Already disposed in the meantime — dispose() ran the same teardown.
+    if (!mounted) return;
+    _log_('SESSION END: $reason — closing the Gemini Live session now (no more mic audio, transcripts or replies)');
+    // Anything already queued for the speaker, not just new chunks.
+    _discardPcmPrebuffer('session ending: $reason');
+    unawaited(_stopTest(reason: reason));
+  }
+
   @override
   void dispose() {
+    widget.endRequest?.removeListener(_onEndRequest);
     WidgetsBinding.instance.removeTimingsCallback(_onFrameTimings);
     _teardown();
     super.dispose();
@@ -2962,6 +3215,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
   Future<void> _startTest() async {
     if (_phase == _TestPhase.connecting || _phase == _TestPhase.connected) return;
+    if (_sessionClosing) return;
 
     setState(() {
       _phase = _TestPhase.requestingToken;
@@ -3036,6 +3290,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // comment for why.
     _pausedVoiceService = ref.read(globalVoiceServiceProvider.notifier);
     await _pausedVoiceService!.pauseForExternalSession('gemini_live_session');
+    // Left the job during the pause — teardown has already run (and resumed
+    // the voice service); nothing more may start.
+    if (_sessionClosing || _pausedVoiceService == null) return;
     // `listening`, continuing what the wake word already showed (see
     // GlobalVoiceService's wake-word branch) rather than dropping to
     // "Thinking..." for the length of session setup: from here the mic is
@@ -3052,6 +3309,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       if (!permissionStatus.isGranted) {
         throw StateError('Microphone permission denied.');
       }
+      // Left the job while the permission check was pending — never open
+      // the mic.
+      if (_sessionClosing) return;
+
+      // Release-build background restrictions — see VoiceSessionService.kt.
+      // Started here: the app is in the foreground and the mic is granted,
+      // both of which Android requires for a microphone foreground service.
+      // Best-effort and not awaited — never delays or blocks the session.
+      unawaited(VoiceSessionPower.startForegroundSession());
+      unawaited(VoiceSessionPower.powerState().then((state) => _log_('VOICE POWER: session start — $state')));
 
       // Start capturing NOW — the wake-word recognizer has released the mic
       // (pauseForExternalSession above) — instead of after the token, the
@@ -3066,6 +3333,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _log_('token received');
 
       if (!mounted) return;
+      // Left the job while the token was on its way — never connect.
+      if (_sessionClosing) {
+        _log_('SESSION END: session closed before connecting — not opening the WebSocket');
+        return;
+      }
       setState(() => _phase = _TestPhase.connecting);
 
       // `connectionUri` (real, full token) is what actually opens the socket
@@ -3089,6 +3361,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _channel = channel;
       await channel.ready;
       _log_('WebSocket connected');
+      // Left the job during the handshake: close this socket too (teardown
+      // may already have run and missed it).
+      if (_sessionClosing) {
+        _log_('SESSION END: session closed during the WebSocket handshake — closing it');
+        if (identical(_channel, channel)) _channel = null;
+        unawaited(channel.sink.close().catchError((Object _) {}));
+        return;
+      }
 
       _wsSub = channel.stream.listen(_onServerMessage, onError: _onWsError, onDone: _onWsDone);
 
@@ -3350,7 +3630,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // Gemini's own response mimeType metadata — see the per-chunk
       // rate-mismatch warning in _onResponseAudioChunk for a safety net if
       // that ever stops being true.
+      if (_sessionClosing) return;
       await FlutterPcmSound.setup(sampleRate: _outputSampleRateHz, channelCount: 1);
+      // Left the job while the player was being set up — release it again.
+      if (_sessionClosing) {
+        unawaited(FlutterPcmSound.release().catchError((Object _) {}));
+        return;
+      }
       // Drives the resume half of the mic-pause fix: reports how many
       // sample frames are still queued for playback, so
       // `_maybeResumeOutgoingAudio` can catch the moment playback of the
@@ -3509,6 +3795,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     await (_micCaptureFuture ??= _startMicCapture());
     if (generation != _micCaptureGeneration) return;
 
+    // Before the flush, so the buffered pre-setup audio is counted too.
+    _startOutgoingAudioSummary();
     _flushPreSetupAudio();
 
     // See [_speechMaxContinuousDuration]'s doc comment — armed for the whole
@@ -3524,6 +3812,36 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // back when the WebSocket merely connected or the setup message was
     // sent (neither of which means anyone can be heard yet).
     _resetInactivityTimer(reason: 'session became active');
+
+    // After the flush above, so speech already captured is known about.
+    _maybeSpeakSessionGreeting();
+  }
+
+  /// The ONE opening line of a wake-word session, spoken by the app itself
+  /// through the same constrained verbatim path as every other scripted
+  /// line ("Camera's open — ready when you are.") — never left to Gemini,
+  /// whose own greeting racing an app-triggered one is the double-greeting
+  /// bug this codebase already had once (see [_interruptedTurnBaseline]).
+  /// The system instruction tells Gemini never to greet on its own.
+  static const String _sessionGreetingText = "Hey, I'm here to help — what do you need?";
+
+  /// At most once per session: this screen (and so this flag) is created
+  /// fresh for each wake-word session, and `setupComplete` — the only
+  /// caller — arrives once per connection.
+  bool _sessionGreetingHandled = false;
+
+  void _maybeSpeakSessionGreeting() {
+    if (!widget.ambient || _sessionGreetingHandled) return;
+    _sessionGreetingHandled = true;
+    // "FieldLoop, take a photo" in one breath: the command is already
+    // captured (and on its way to Gemini) — greeting over it would be a
+    // second, competing opening line. Its own reply is the only one.
+    if (_lastSpeechActivityAt != null) {
+      _log_('SESSION GREETING: skipped — the technician was already speaking before the session was ready');
+      return;
+    }
+    _log_('SESSION GREETING: wake-word session ready — speaking the opening line');
+    _informGeminiToSpeakVerbatim(_sessionGreetingText, reason: 'session_greeting');
   }
 
   /// Every recorder chunk lands here: held in [_preSetupAudio] until the
@@ -3565,7 +3883,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
   void _onMicChunk(Uint8List chunk) {
     final channel = _channel;
-    if (channel == null) return;
+    if (channel == null || _sessionClosing) return;
 
     // PART K — see [_cameraNativeCallInProgress]'s doc comment: hard-stop, not
     // just "don't send" — skips [_trackSpeechLevel]'s RMS work too, so this
@@ -3591,6 +3909,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         _micSendCurrentlyPaused = true;
         debugPrint('MIC SEND [t=${DateTime.now().millisecondsSinceEpoch}]: STOPPED (outgoing audio paused) — no more realtimeInput sent to Gemini until resumed');
       }
+      _outgoingHeldChunks++;
       return;
     }
     if (_micSendCurrentlyPaused) {
@@ -3608,12 +3927,272 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (_audioChunksSent == 1) {
       _log_('first audio chunk sent (${chunk.length} bytes)');
     }
+    // OUTGOING AUDIO summary — see [_logOutgoingAudioSummary].
+    _outgoingSentChunks++;
+    _outgoingSentBytes += chunk.length;
+    _outgoingRmsSum += _lastMicChunkRms;
+    if (_lastMicChunkRms > _outgoingRmsPeak) _outgoingRmsPeak = _lastMicChunkRms;
+    if (_lastMicChunkRms < _outgoingAudioSilenceFloorRms) _outgoingSilentChunks++;
+  }
+
+  // ===========================================================================
+  // OUTGOING AUDIO — release-build diagnostic safety net. CONFIRMED need
+  // (flutter_run_log 2801f4bc, release APK only): Gemini returned no
+  // transcript for several utterances in a row ("UNCLEAR INPUT: N in a row")
+  // while the WebSocket stayed alive. Every ~2s this logs what the send path
+  // ACTUALLY did — chunks/bytes sent as realtimeInput, how many of them were
+  // near-silent, and how many were captured but held back (outgoing paused)
+  // — so the next log proves whether real audio reached Gemini during any
+  // "no transcript" stretch. One summary line per window, never per chunk.
+  // Driven by a timer, not by chunks, so "the recorder delivered nothing at
+  // all" shows up as a line too instead of as silence in the log.
+  // ===========================================================================
+
+  /// RMS of the most recent mic chunk, set by [_trackSpeechLevel].
+  double _lastMicChunkRms = 0;
+
+  /// Near-zero int16 RMS floor: below this a chunk is effectively digital
+  /// silence (a muted/dead input), well under [_speechRmsThreshold]'s
+  /// "someone is talking" level — room tone still clears it.
+  static const double _outgoingAudioSilenceFloorRms = 30;
+  static const Duration _outgoingAudioSummaryInterval = Duration(seconds: 2);
+
+  Timer? _outgoingAudioSummaryTimer;
+  DateTime? _outgoingWindowStartedAt;
+  int _outgoingSentChunks = 0;
+  int _outgoingSentBytes = 0;
+  int _outgoingSilentChunks = 0;
+  int _outgoingHeldChunks = 0;
+  double _outgoingRmsSum = 0;
+  double _outgoingRmsPeak = 0;
+
+  void _startOutgoingAudioSummary() {
+    _outgoingAudioSummaryTimer?.cancel();
+    _resetOutgoingAudioWindow();
+    _outgoingAudioSummaryTimer = Timer.periodic(_outgoingAudioSummaryInterval, (_) => _logOutgoingAudioSummary());
+  }
+
+  void _stopOutgoingAudioSummary() {
+    if (_outgoingAudioSummaryTimer == null) return;
+    _outgoingAudioSummaryTimer?.cancel();
+    _outgoingAudioSummaryTimer = null;
+    _logOutgoingAudioSummary(finalWindow: true);
+  }
+
+  void _resetOutgoingAudioWindow() {
+    _outgoingWindowStartedAt = DateTime.now();
+    _outgoingSentChunks = 0;
+    _outgoingSentBytes = 0;
+    _outgoingSilentChunks = 0;
+    _outgoingHeldChunks = 0;
+    _outgoingRmsSum = 0;
+    _outgoingRmsPeak = 0;
+  }
+
+  void _logOutgoingAudioSummary({bool finalWindow = false}) {
+    final startedAt = _outgoingWindowStartedAt;
+    final windowMs = startedAt == null ? 0 : DateTime.now().difference(startedAt).inMilliseconds;
+    final window = '${(windowMs / 1000).toStringAsFixed(1)}s${finalWindow ? ', final window' : ''}';
+    final extras = [
+      if (_outgoingHeldChunks > 0) '$_outgoingHeldChunks chunk(s) captured but NOT sent (outgoing paused)',
+      if (_cameraNativeCallInProgress) 'camera hard-pause active (mic chunks not processed)',
+      if (_channel == null) 'WebSocket closed',
+    ];
+    final String line;
+    if (_outgoingSentChunks == 0) {
+      line = _outgoingHeldChunks == 0 && !_cameraNativeCallInProgress
+          ? 'OUTGOING AUDIO: last $window — NOTHING sent and NO mic chunks captured at all (recorder delivered no audio)'
+          : 'OUTGOING AUDIO: last $window — sent 0 chunks; ${extras.join('; ')}';
+    } else {
+      final avgBytes = _outgoingSentBytes ~/ _outgoingSentChunks;
+      final silentPct = (_outgoingSilentChunks * 100 / _outgoingSentChunks).round();
+      final avgRms = _outgoingRmsSum / _outgoingSentChunks;
+      line = 'OUTGOING AUDIO: last $window — sent $_outgoingSentChunks chunks '
+          '($_outgoingSentBytes bytes, avg $avgBytes bytes/chunk, ~${_pcmBytesToMs(_outgoingSentBytes)}ms audio), '
+          '$silentPct% silent (RMS < ${_outgoingAudioSilenceFloorRms.toStringAsFixed(0)}), '
+          'RMS avg ${avgRms.toStringAsFixed(0)} / peak ${_outgoingRmsPeak.toStringAsFixed(0)}'
+          '${extras.isEmpty ? '' : '; ${extras.join('; ')}'}; total sent this session: $_audioChunksSent';
+    }
+    _logNoState(line);
+    _resetOutgoingAudioWindow();
   }
 
   /// BUG 2 diagnostic: tracks the edge for the [_onMicChunk] logging above —
   /// separate from [_outgoingAudioPaused] itself so the log lines fire
   /// exactly once per transition, at the real send-gating site.
   bool _micSendCurrentlyPaused = false;
+
+  /// The DETERMINISTIC RESET for a genuinely new utterance — what it clears
+  /// is exactly what [_trackSpeechLevel]'s silence->speech edge always
+  /// cleared (moved here unchanged so a second, transcript-based detector —
+  /// [_attributeTranscriptChunkToUtterance] — runs the SAME reset).
+  /// [fromTranscript]: a real transcript chunk is already in hand, so the
+  /// "waiting for the first transcript" hold is not armed.
+  void _startNewUtterance(DateTime now, {required String cause, bool fromTranscript = false}) {
+    _utteranceSeq++;
+    _currentUtteranceStartedAt = now;
+    _latencySpeechEndAt = null;
+    _latencyTranscriptAt = null;
+    _finalizedCurrentUtterance = false;
+    _lateTranscriptFinalizeTimer?.cancel();
+    _lateTranscriptFinalizeTimer = null;
+    _stopAwaitingLateTranscript('new utterance started');
+    _pipelineLog('utterance_start', cause);
+    debugPrint(
+      'DETERMINISTIC RESET: new utterance — clearing all trigger buffers/resolved flags '
+      '(outgoingAudioPaused=$_outgoingAudioPaused${fromTranscript ? ', transcript-detected' : ''})',
+    );
+    _utteranceCommittedAt = null;
+    _utteranceLastChunkAt = null;
+    // Fresh utterance starting — new detection buffers so stale text
+    // from an earlier, unrelated sentence can never combine with this
+    // one to produce a false match.
+    _goBackIntentDetectionBuffer = '';
+    _goBackTriggerResolvedForCurrentUtterance = false;
+    _viewEstimateDetectionBuffer = '';
+    _viewEstimateDetectionResolvedForCurrentUtterance = false;
+    _getJobDetailsDetectionBuffer = '';
+    _getJobDetailsDetectionResolvedForCurrentUtterance = false;
+    _getCurrentScreenDetectionBuffer = '';
+    _getCurrentScreenDetectionResolvedForCurrentUtterance = false;
+    _metaCapabilityDetectionBuffer = '';
+    _metaCapabilityDetectionResolvedForCurrentUtterance = false;
+    _acknowledgePresenceDetectionBuffer = '';
+    _acknowledgePresenceResolvedForCurrentUtterance = false;
+    _photoDecisionDetectionBuffer = '';
+    _photoDecisionResolvedForCurrentUtterance = false;
+    for (final trigger in _deterministicTriggers.values) {
+      trigger.resetForNewUtterance();
+    }
+    // PART G item 1 — see [_utteranceAlreadyResolvedByTrigger]'s doc
+    // comment: THIS is the only place that flag is allowed to clear —
+    // a genuinely new utterance, not the more frequent mid-utterance
+    // reset in [_clearAllTriggerBuffersAfterSuccess].
+    _utteranceAlreadyResolvedByTrigger = false;
+    _guardFailedReplySpokenThisUtterance = false;
+    _pendingGuardFailedReply = null;
+    // P0 FIX — see [_awaitingFirstTranscriptOfUtterance]. Only when mic
+    // audio is actually reaching Gemini: while [_outgoingAudioPaused],
+    // Gemini can't be answering this speech (and it's most likely our
+    // own playback echoing back anyway).
+    if (!_outgoingAudioPaused && !fromTranscript) _beginAwaitingFirstTranscript();
+    // PART J item 1 — see [_pcmReinitIssuedForCurrentUtterance]'s doc
+    // comment: same lifecycle as the flag just above — a genuinely new
+    // utterance is allowed exactly one more real PCM reinit.
+    _pcmReinitIssuedForCurrentUtterance = false;
+    // BUG 4 FIX (CONFIRMED via flutter_run_log_new.txt, build #56):
+    // queued PCM audio used to be discarded RIGHT HERE, on the same
+    // raw-amplitude edge as the text-buffer reset above — but unlike
+    // those buffers (genuinely safe to clear on any 2s-silence gap,
+    // real speech or not), a queued PCM chunk can be a just-generated,
+    // not-yet-played response to something the app ITSELF just did
+    // (e.g. confirm_photo_upload's own "I've uploaded the photo"
+    // confirmation, queued behind that action's own PCM reinit).
+    // Discarding real, wanted audio on nothing but background mic noise
+    // — no real transcript text required — silently ate that exact
+    // confirmation once, 100% reproducibly. The discard now happens in
+    // [_muteImmediatelyOnFirstChunkOfUtterance] instead, gated on a
+    // genuinely new utterance's first REAL transcript chunk arriving,
+    // not a bare amplitude blip. See that method's own doc comment.
+  }
+
+  // ===========================================================================
+  // UTTERANCE ATTRIBUTION — CONFIRMED REGRESSION (logcat 09-28 17:32:03-
+  // 17:33:01): after open_camera committed, "Capture the photo.", "Take the
+  // photo." and "Go back." all arrived under the SAME, already-committed
+  // utterance id and were never evaluated ("utterance was ALREADY committed
+  // before this chunk"); the reset only came ~41s later. New-utterance
+  // detection was purely acoustic ([_trackSpeechLevel]: a chunk over
+  // [_speechRmsThreshold] after [_utteranceBufferResetDebounce] of nothing
+  // over it), so a quieter mic level (headset, voice-communication AGC) or
+  // anything keeping the level up between commands meant no edge, ever.
+  // A transcript chunk is itself proof of speech, so it can now start the
+  // new utterance too, whenever it clearly can't belong to the committed one.
+  // ===========================================================================
+
+  /// When the current utterance committed to a trigger (see
+  /// [_clearAllTriggerBuffersAfterSuccess] and the evaluator loop in
+  /// [_onInputTranscription]); `null` while it hasn't.
+  DateTime? _utteranceCommittedAt;
+
+  /// Arrival time of the last transcript chunk attributed to the current
+  /// utterance.
+  DateTime? _utteranceLastChunkAt;
+
+  /// When the most recent model turn the technician actually HEARD ended
+  /// (`turnComplete`/`interrupted` with audibly played text). A muted turn
+  /// doesn't count: a deterministic trigger interrupts Gemini's own muted
+  /// reply moments after committing, and a trailing chunk of that same
+  /// command arriving after that interrupt must not be split off.
+  DateTime? _lastModelTurnEndedAt;
+
+  /// Called at every model turn boundary, before [_logAndResetTurnShape]
+  /// clears the turn's text.
+  void _noteAudibleModelTurnEnded() {
+    if (_currentTurnAudiblyPlayedText.trim().isNotEmpty) _lastModelTurnEndedAt = DateTime.now();
+  }
+
+  /// A chunk arriving this long after both the commit and this utterance's
+  /// previous chunk can't be one of its trailing chunks (those land within
+  /// about a second of each other).
+  static const Duration _committedUtteranceChunkGap = Duration(milliseconds: 2500);
+
+  /// Called for every real transcript chunk (past the echo backstop),
+  /// before any trigger sees it. If the current utterance has already
+  /// committed AND either a model reply finished after that commit (and
+  /// after this utterance's last chunk), or [_committedUtteranceChunkGap]
+  /// has passed since both — this chunk is a new request, so the same
+  /// [_startNewUtterance] reset runs first. A trailing chunk of the SAME
+  /// utterance (arriving right after the commit, before any reply) stays
+  /// attributed to it, exactly as before.
+  void _attributeTranscriptChunkToUtterance(String textChunk) {
+    final now = DateTime.now();
+    final committedAt = _utteranceCommittedAt;
+    final lastChunkAt = _utteranceLastChunkAt;
+    String? newUtteranceBecause;
+    if (_anyTriggerCommittedThisUtterance && committedAt != null) {
+      final turnEnded = _lastModelTurnEndedAt;
+      final sinceCommit = now.difference(committedAt);
+      final sinceLastChunk = lastChunkAt == null ? null : now.difference(lastChunkAt);
+      if (turnEnded != null && turnEnded.isAfter(committedAt) && (lastChunkAt == null || turnEnded.isAfter(lastChunkAt))) {
+        newUtteranceBecause = 'a model reply ended ${now.difference(turnEnded).inMilliseconds}ms ago, after '
+            'u=$_utteranceSeq committed ${sinceCommit.inMilliseconds}ms ago';
+      } else if (sinceCommit >= _committedUtteranceChunkGap &&
+          (sinceLastChunk == null || sinceLastChunk >= _committedUtteranceChunkGap)) {
+        newUtteranceBecause = '${sinceLastChunk?.inMilliseconds ?? '-'}ms since u=$_utteranceSeq\'s last chunk and '
+            '${sinceCommit.inMilliseconds}ms since it committed';
+      }
+    }
+    final loudAt = _lastLoudMicChunkAt;
+    final micState = 'mic: last chunk over RMS ${_speechRmsThreshold.toStringAsFixed(0)} '
+        '${loudAt == null ? 'never' : '${now.difference(loudAt).inMilliseconds}ms ago'}, last RMS '
+        '${_lastMicChunkRms.toStringAsFixed(0)}, isSpeaking=$_isSpeaking';
+    if (newUtteranceBecause != null) {
+      final previous = _utteranceSeq;
+      _startNewUtterance(
+        now,
+        cause: 'transcript-detected — "$textChunk" arrived for committed u=$previous: $newUtteranceBecause '
+            '(the mic-level edge never fired; $micState)',
+        fromTranscript: true,
+      );
+      // The acoustic edge missed this speech, so don't let a late one split
+      // it again mid-sentence…
+      _lastSpeechActivityAt = now;
+      // …and if the mic doesn't think anyone is talking, the end-of-
+      // utterance routing won't come from the silence edge either — let the
+      // existing late-transcript finalize path run it (see
+      // [_onInputTranscription]'s `arrivedAfterUtteranceEnd`).
+      if (!_isSpeaking) _finalizedCurrentUtterance = true;
+    }
+    _logNoState(
+      'UTTERANCE ATTRIBUTION: chunk at $now attributed to u=$_utteranceSeq'
+      '${newUtteranceBecause != null ? ' (NEW — split from the committed utterance)' : ''}, '
+      '${lastChunkAt == null || newUtteranceBecause != null ? 'first chunk of this utterance' : '${now.difference(lastChunkAt).inMilliseconds}ms since its previous chunk'}, '
+      '${committedAt == null || newUtteranceBecause != null ? 'not committed' : '${now.difference(committedAt).inMilliseconds}ms since it committed'}; '
+      '$micState',
+    );
+    _utteranceLastChunkAt = now;
+  }
 
   /// Rough int16 RMS over [chunk], used only to time "user stopped
   /// speaking" for the latency stopwatch — not sent anywhere, not used for
@@ -3629,6 +4208,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
     final rms = sampleCount == 0 ? 0.0 : (sumSquares / sampleCount);
     final amplitude = rms <= 0 ? 0.0 : _sqrt(rms);
+    // Read by the OUTGOING AUDIO summary in [_onMicChunk] — reuses this RMS
+    // rather than computing it a second time per chunk.
+    _lastMicChunkRms = amplitude;
 
     if (amplitude > _speechRmsThreshold) {
       final now = DateTime.now();
@@ -3687,69 +4269,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // positive — there is no in-progress utterance's buffer content this
       // could wrongly discard.
       if (isGenuinelyNewUtterance) {
-        _utteranceSeq++;
-        _currentUtteranceStartedAt = now;
-        _latencySpeechEndAt = null;
-        _latencyTranscriptAt = null;
-        _finalizedCurrentUtterance = false;
-        _lateTranscriptFinalizeTimer?.cancel();
-        _lateTranscriptFinalizeTimer = null;
-        _stopAwaitingLateTranscript('new utterance started');
-        _pipelineLog('utterance_start', 'mic heard speech after silence (outgoingAudioPaused=$_outgoingAudioPaused)');
-        debugPrint(
-          'DETERMINISTIC RESET: new utterance — clearing all trigger buffers/resolved flags '
-          '(outgoingAudioPaused=$_outgoingAudioPaused)',
-        );
-        // Fresh utterance starting — new detection buffers so stale text
-        // from an earlier, unrelated sentence can never combine with this
-        // one to produce a false match.
-        _goBackIntentDetectionBuffer = '';
-        _goBackTriggerResolvedForCurrentUtterance = false;
-        _viewEstimateDetectionBuffer = '';
-        _viewEstimateDetectionResolvedForCurrentUtterance = false;
-        _getJobDetailsDetectionBuffer = '';
-        _getJobDetailsDetectionResolvedForCurrentUtterance = false;
-        _getCurrentScreenDetectionBuffer = '';
-        _getCurrentScreenDetectionResolvedForCurrentUtterance = false;
-        _metaCapabilityDetectionBuffer = '';
-        _metaCapabilityDetectionResolvedForCurrentUtterance = false;
-        _acknowledgePresenceDetectionBuffer = '';
-        _acknowledgePresenceResolvedForCurrentUtterance = false;
-        _photoDecisionDetectionBuffer = '';
-        _photoDecisionResolvedForCurrentUtterance = false;
-        for (final trigger in _deterministicTriggers.values) {
-          trigger.resetForNewUtterance();
-        }
-        // PART G item 1 — see [_utteranceAlreadyResolvedByTrigger]'s doc
-        // comment: THIS is the only place that flag is allowed to clear —
-        // a genuinely new utterance, not the more frequent mid-utterance
-        // reset in [_clearAllTriggerBuffersAfterSuccess].
-        _utteranceAlreadyResolvedByTrigger = false;
-        _guardFailedReplySpokenThisUtterance = false;
-        _pendingGuardFailedReply = null;
-        // P0 FIX — see [_awaitingFirstTranscriptOfUtterance]. Only when mic
-        // audio is actually reaching Gemini: while [_outgoingAudioPaused],
-        // Gemini can't be answering this speech (and it's most likely our
-        // own playback echoing back anyway).
-        if (!_outgoingAudioPaused) _beginAwaitingFirstTranscript();
-        // PART J item 1 — see [_pcmReinitIssuedForCurrentUtterance]'s doc
-        // comment: same lifecycle as the flag just above — a genuinely new
-        // utterance is allowed exactly one more real PCM reinit.
-        _pcmReinitIssuedForCurrentUtterance = false;
-        // BUG 4 FIX (CONFIRMED via flutter_run_log_new.txt, build #56):
-        // queued PCM audio used to be discarded RIGHT HERE, on the same
-        // raw-amplitude edge as the text-buffer reset above — but unlike
-        // those buffers (genuinely safe to clear on any 2s-silence gap,
-        // real speech or not), a queued PCM chunk can be a just-generated,
-        // not-yet-played response to something the app ITSELF just did
-        // (e.g. confirm_photo_upload's own "I've uploaded the photo"
-        // confirmation, queued behind that action's own PCM reinit).
-        // Discarding real, wanted audio on nothing but background mic noise
-        // — no real transcript text required — silently ate that exact
-        // confirmation once, 100% reproducibly. The discard now happens in
-        // [_muteImmediatelyOnFirstChunkOfUtterance] instead, gated on a
-        // genuinely new utterance's first REAL transcript chunk arriving,
-        // not a bare amplitude blip. See that method's own doc comment.
+        _startNewUtterance(now, cause: 'mic heard speech after silence (outgoingAudioPaused=$_outgoingAudioPaused)');
       }
       // See [_speechMaxContinuousDuration]'s doc comment: edge-only, exactly
       // like [_lastSpeechActivityAt] below it — marks when THIS burst began,
@@ -4149,7 +4669,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // reprompt while the upload is genuinely in flight — the real spoken
       // "I've uploaded the photo" confirmation is only ever requested AFTER
       // this method (and therefore this hard-pause) has already returned.
-      final needsAudioHardPause = name == 'capture_photo' || name == 'confirm_photo_upload';
+      //
+      // The compress + upload now runs AFTER the photo-note question, as
+      // [uploadKeptPhotoFunctionName] (confirm_photo_upload itself only
+      // marks the photo kept) — the protection and the "Still uploading,
+      // one more second." filler moved with it, keyed under the same
+      // confirm_photo_upload filler entry.
+      final needsAudioHardPause = name == 'capture_photo' || name == uploadKeptPhotoFunctionName;
+      final fillerKey = name == uploadKeptPhotoFunctionName ? 'confirm_photo_upload' : name;
       if (needsAudioHardPause) {
         _cameraNativeCallInProgress = true;
         _syncVoicePhase();
@@ -4163,7 +4690,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       }
       // P0 FIX — see [_fillerPassthroughActive]: a slow native call gets one
       // spoken filler instead of total silence for however long it takes.
-      final filler = needsAudioHardPause ? pendingCallFillers[name] : null;
+      final filler = needsAudioHardPause ? pendingCallFillers[fillerKey] : null;
       final fillerTimer = filler == null
           ? null
           : Timer(filler.delay, () {
@@ -4172,7 +4699,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
             });
       // One follow-up for a call that's still going much later — see
       // `pendingCallFollowUpFillers`. Same passthrough, same cancel point.
-      final followUp = needsAudioHardPause ? pendingCallFollowUpFillers[name] : null;
+      final followUp = needsAudioHardPause ? pendingCallFollowUpFillers[fillerKey] : null;
       final followUpTimer = followUp == null
           ? null
           : Timer(followUp.delay, () {
@@ -4314,6 +4841,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   }
 
   void _onServerMessage(dynamic raw) {
+    // See [_onEndRequest]: outside job scope nothing is processed.
+    if (_sessionClosing) return;
     try {
       final text = raw is String ? raw : utf8.decode(raw as List<int>);
       final decoded = jsonDecode(text) as Map<String, dynamic>;
@@ -4481,6 +5010,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         // since the whole failure mode is the model generating a fresh
         // turn that happens to restate a turn it already said seconds ago.
         _auditGeminiDuplicateResponse(outputTranscriptionText);
+        // Second baseline source for the same safety net: a restart of a
+        // turn that was INTERRUPTED earlier in this utterance.
+        _maybeAuditAgainstInterruptedTurnBaseline();
         // BUG 2 backstop (step 3 of the echo-leak fix), REDESIGNED — see
         // [_currentTurnAudiblyPlayedText]'s doc comment for the P0
         // regression this replaces (an unbounded-in-practice, whole-session
@@ -4503,6 +5035,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
       if (serverContent['turnComplete'] == true) {
         _log_('model turn complete');
+        _noteAudibleModelTurnEnded();
         _turnComplete = true;
         _flushPcmPrebuffer('turnComplete');
         _maybeResumeOutgoingAudio();
@@ -4514,6 +5047,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       }
       if (serverContent['interrupted'] == true) {
         _log_('model turn interrupted');
+        _noteAudibleModelTurnEnded();
+        // Must run before [_logAndResetTurnShape] below clears this turn's
+        // text — see [_recordInterruptedTurnBaseline].
+        _recordInterruptedTurnBaseline();
         _turnComplete = true;
         _discardPcmPrebuffer('turn interrupted');
         _maybeResumeOutgoingAudio();
@@ -5109,6 +5646,186 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
   }
 
+  /// The [_currentResponseTurnId] the interrupted-turn baseline was last
+  /// evaluated for — it's checked once per turn (see
+  /// [_maybeAuditAgainstInterruptedTurnBaseline]).
+  int? _interruptedBaselineAuditedTurnId;
+
+  /// Runs [_auditAgainstInterruptedTurnBaseline] ONCE per turn, as soon as
+  /// this turn has as many words as the interrupted partial — deliberately
+  /// NOT behind [_auditGeminiDuplicateResponse]'s 3-word/12-char gate, so a
+  /// restart of "Yes, I…" is cut at "Yes, I" rather than after "Yes, I can
+  /// hear". Separate from (and never touching) the completed-turn check's
+  /// own gate, flag and history.
+  void _maybeAuditAgainstInterruptedTurnBaseline() {
+    final baseline = _interruptedTurnBaseline;
+    if (baseline == null || _fillerPassthroughActive || _suppressResponseAudioForDuplicate) return;
+    if (_interruptedBaselineAuditedTurnId == _currentResponseTurnId) return;
+    final soFar = _currentTurnGeminiText;
+    final words = _normalizeForEchoCompare(soFar).split(' ').where((w) => w.isNotEmpty).toList();
+    final baselineWordCount = _normalizeForEchoCompare(baseline.text).split(' ').where((w) => w.isNotEmpty).length;
+    if (words.isEmpty || words.length < baselineWordCount) return;
+    _interruptedBaselineAuditedTurnId = _currentResponseTurnId;
+    _auditAgainstInterruptedTurnBaseline(words, soFar);
+  }
+
+  /// CONFIRMED via flutter_run_log 97579c46 (acknowledge_presence): a
+  /// scripted line's first attempt was `interrupted` after only 1-2 words
+  /// (then an empty `turnComplete`), and a completely fresh generation of
+  /// the SAME line then played in full — the technician heard the greeting
+  /// start twice. The completed-turn history above never caught it: the
+  /// interrupted attempt's text DOES reach [_recordGeminiTurnForDuplicateDetection]
+  /// via [_logAndResetTurnShape], but 1-2 words is below that function's
+  /// [_echoBackstopMinWords]/[_echoBackstopMinChars] gate (kept as is — it
+  /// correctly ignores short generic replies), so nothing was recorded.
+  ///
+  /// This baseline keeps whatever was AUDIBLY played of an interrupted turn
+  /// (same audible-only rule as the completed-turn history's P1 fix: a
+  /// muted attempt was never heard, so it can never be "heard twice"),
+  /// with the scripted line in effect and the utterance it belonged to.
+  ({String text, DateTime at, int utteranceSeq, String script})? _interruptedTurnBaseline;
+
+  void _recordInterruptedTurnBaseline() {
+    final partial = _currentTurnAudiblyPlayedText.trim();
+    if (partial.isEmpty) return;
+    _interruptedTurnBaseline = (
+      text: partial,
+      at: DateTime.now(),
+      utteranceSeq: _utteranceSeq,
+      script: _lastVerbatimScriptText,
+    );
+    _log_(
+      'DUPLICATE RESPONSE BASELINE: turn interrupted after audibly playing "$partial" — kept as an interrupted-turn '
+      'baseline (utterance u=$_utteranceSeq, scripted line "$_lastVerbatimScriptText") so a fresh restart of the same '
+      'line is caught as a duplicate.',
+    );
+  }
+
+  /// When the speech behind the most recent real technician transcript
+  /// STARTED (a chunk that got past the echo backstop, stamped with its
+  /// utterance's start) — the "same utterance" test for
+  /// [_auditAgainstInterruptedTurnBaseline]: a new turn with NO technician
+  /// speech begun since an interrupted one can only be the model answering
+  /// the same thing again.
+  DateTime? _lastTechnicianTranscriptAt;
+
+  /// See [_interruptedTurnBaseline]. CONFIRMED via flutter_run_log 43ae0942:
+  /// the first version of this check never fired — "Yes, I" was recorded,
+  /// then "Yes, I can hear you. What do you need on the job?" played in
+  /// full. Two reasons, both fixed here:
+  ///  - "Same utterance" was `_utteranceSeq` equality, but that counter
+  ///    bumps on any mic-amplitude edge after 2s of quiet — the greeting's
+  ///    own speaker bleed included. It's now "no genuine technician
+  ///    transcript since the baseline" ([_lastTechnicianTranscriptAt]).
+  ///  - It also demanded the scripted line be unchanged and word-for-word
+  ///    prefix-equal. It now uses the SAME [_bestWordOverlapRatio] and
+  ///    [_duplicateResponseOverlapThreshold] (85%) as the completed-turn
+  ///    check — oriented baseline-into-current (what fraction of the
+  ///    interrupted partial reappears at the START of this turn), because
+  ///    the completed-turn orientation (current-into-prior) scores a
+  ///    4-word turn against a 2-word partial as 0 by construction.
+  /// A 1-word partial is too weak alone ("Yes…" opens many replies) and
+  /// additionally needs this turn to be restarting the current scripted
+  /// line. Every skip is logged so the next device log says why.
+  void _auditAgainstInterruptedTurnBaseline(List<String> words, String soFar) {
+    final result = _evaluateInterruptedTurnBaseline(words, soFar);
+    if (result.verdict == _BaselineVerdict.duplicate) _suppressTurnAsInterruptedDuplicate(soFar, result.overlap);
+  }
+
+  /// Words of the interrupted partial compared when TURN IDENTITY is
+  /// deciding whether to release a held scripted turn (see
+  /// [_classifyTurnAgainstScript]). The comparison itself is unchanged —
+  /// same [_bestWordOverlapRatio], same 85% threshold — it just runs on the
+  /// partial's opening words, so the decision is ready after a few words of
+  /// transcript instead of the whole partial (10 words in flutter_run_log
+  /// 6038bc76, i.e. longer than TURN IDENTITY's own hold timeout).
+  static const int _baselineHoldCompareWords = 4;
+
+  /// Side-effect-free except for dropping a baseline that no longer
+  /// applies (expired / new technician speech) — the "is this turn a
+  /// restart of the interrupted one" decision, shared by the post-release
+  /// audit ([_auditAgainstInterruptedTurnBaseline]) and the pre-release
+  /// hold in [_classifyTurnAgainstScript]. [maxBaselineWords] limits how
+  /// much of the partial is compared (see [_baselineHoldCompareWords]).
+  ({_BaselineVerdict verdict, double overlap}) _evaluateInterruptedTurnBaseline(
+    List<String> words,
+    String soFar, {
+    int? maxBaselineWords,
+  }) {
+    const none = (verdict: _BaselineVerdict.noBaseline, overlap: 0.0);
+    final baseline = _interruptedTurnBaseline;
+    if (baseline == null) return none;
+    final age = DateTime.now().difference(baseline.at);
+    if (age > _duplicateResponseLookbackWindow) {
+      _log_('DUPLICATE RESPONSE BASELINE: not applied — recorded ${age.inMilliseconds}ms ago, outside the '
+          '${_duplicateResponseLookbackWindow.inSeconds}s window; dropped.');
+      _interruptedTurnBaseline = null;
+      return none;
+    }
+    final heardAt = _lastTechnicianTranscriptAt;
+    if (heardAt != null && heardAt.isAfter(baseline.at)) {
+      _log_('DUPLICATE RESPONSE BASELINE: not applied — the technician spoke again after "${baseline.text}" was '
+          'interrupted, so this turn answers new speech; dropped.');
+      _interruptedTurnBaseline = null;
+      return none;
+    }
+    List<String> wordsOf(String text) => _normalizeForEchoCompare(text).split(' ').where((w) => w.isNotEmpty).toList();
+    var baselineWords = wordsOf(baseline.text);
+    if (baselineWords.isEmpty) return none;
+    if (maxBaselineWords != null && baselineWords.length > maxBaselineWords) {
+      baselineWords = baselineWords.sublist(0, maxBaselineWords);
+    }
+    if (words.length < baselineWords.length) return (verdict: _BaselineVerdict.needMoreWords, overlap: 0.0);
+    // The partial must reappear at the START of this turn (a restart), not
+    // just anywhere in it — compare against this turn's leading window.
+    final leadLen = baselineWords.length + 1 < words.length ? baselineWords.length + 1 : words.length;
+    final overlap = _bestWordOverlapRatio(baselineWords, words.sublist(0, leadLen));
+    if (overlap < _duplicateResponseOverlapThreshold) {
+      _log_('DUPLICATE RESPONSE BASELINE: not applied — this turn ("$soFar") opens differently from the interrupted '
+          '"${baseline.text}" (${(overlap * 100).toStringAsFixed(0)}% < '
+          '${(_duplicateResponseOverlapThreshold * 100).toStringAsFixed(0)}%).');
+      return (verdict: _BaselineVerdict.notDuplicate, overlap: overlap);
+    }
+    if (baselineWords.length < 2) {
+      final scriptWords = wordsOf(_lastVerbatimScriptText);
+      final restartsScript = scriptWords.length >= words.length &&
+          List.generate(words.length, (i) => words[i] == scriptWords[i]).every((same) => same);
+      if (!restartsScript) {
+        _log_('DUPLICATE RESPONSE BASELINE: not applied — the interrupted partial "${baseline.text}" is a single word '
+            'and this turn is not a restart of the current scripted line; too weak to suppress on.');
+        return (verdict: _BaselineVerdict.notDuplicate, overlap: overlap);
+      }
+    }
+    return (verdict: _BaselineVerdict.duplicate, overlap: overlap);
+  }
+
+  void _suppressTurnAsInterruptedDuplicate(String soFar, double overlap) {
+    final baseline = _interruptedTurnBaseline;
+    if (baseline == null) return;
+    final age = DateTime.now().difference(baseline.at);
+    _interruptedTurnBaseline = null;
+    _interruptedBaselineAuditedTurnId = _currentResponseTurnId;
+    _log_(
+      'DUPLICATE RESPONSE SUPPRESSED: current turn ("$soFar") overlaps ${(overlap * 100).toStringAsFixed(0)}% of an '
+      'INTERRUPTED turn spoken ${age.inMilliseconds}ms ago ("${baseline.text}", interrupted-turn baseline, no '
+      'technician speech since) — >= ${(_duplicateResponseOverlapThreshold * 100).toStringAsFixed(0)}% threshold. '
+      'Dropping the remainder of this turn\'s audio so the technician does not hear it start over '
+      '(P0 audio-echo safety net).',
+    );
+    _suppressResponseAudioForDuplicate = true;
+    // Same targeted purge as the completed-turn path above — only THIS
+    // turn's already-queued chunks.
+    final queuedBefore = _pendingPcmChunksAwaitingReinit.length;
+    _pendingPcmChunksAwaitingReinit.removeWhere((c) => c.turnId == _currentResponseTurnId);
+    final purged = queuedBefore - _pendingPcmChunksAwaitingReinit.length;
+    if (purged > 0) {
+      _log_(
+        'DUPLICATE RESPONSE SUPPRESSED: also purged $purged already-queued chunk(s) tagged turn '
+        '$_currentResponseTurnId from the reinit-pending queue (interrupted-turn baseline).',
+      );
+    }
+  }
+
   /// Executes every `functionCalls` entry in a `toolCall` message via
   /// [dispatchGeminiFunctionCall] — the routing-only dispatcher in
   /// `lib/services/gemini_function_dispatcher.dart` — then sends Gemini a
@@ -5178,6 +5895,27 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           _log_('toolCall: "$name" (id=$id) job_id overridden to real job $jobId (Gemini supplied: $original)');
         }
         args = {...args, 'job_id': jobId};
+      }
+
+      // awaitingPhotoDescription — Gemini hears the same audio and may act
+      // on a spoken photo note itself. While the flow owns this utterance
+      // nothing Gemini calls for it runs; while the flow is merely waiting,
+      // Gemini's own note/question tools are held back (the flow decides
+      // what that speech is). Checked BEFORE the debounce claims below: a
+      // held-back call must not stamp a trigger's `lastActivityAt`, or the
+      // flow's own break-out replay of a real command (see
+      // [_photoNoteBreakOutToRealCommand]) would be debounced as "Gemini
+      // already handling this" and never actually run.
+      if (_photoNote != null &&
+          (_photoNoteOwnsCurrentUtterance || name == 'site_condition' || name == 'get_kb_answer')) {
+        _log_('toolCall: "$name" (id=$id) SUPPRESSED — awaitingPhotoDescription owns this speech (photo note flow).');
+        _photoNoteLog('state', 'suppressed Gemini toolCall "$name" — speech belongs to the photo-note flow');
+        functionResponses.add({
+          'id': id,
+          'name': name,
+          'response': {'status': 'already_handled', 'job_id': args['job_id']},
+        });
+        continue;
       }
 
       if (name == 'capture_photo') {
@@ -5265,6 +6003,18 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           'response': {'status': 'already_handled', 'job_id': args['job_id']},
         });
         continue;
+      }
+      // awaitingPhotoDescription (see the held-back check above, before the
+      // debounce claims): any other genuine Gemini command ends the flow.
+      if (_photoNote != null) {
+        // Not Gemini's own late duplicate of the keep/retake that STARTED
+        // this flow, nor of a break-out command the app itself already ran
+        // for this utterance (both handled by the duplicate check below).
+        if (name != 'confirm_photo_upload' &&
+            name != 'retake_photo' &&
+            !_alreadyResolvedByAppTriggerThisUtterance(name)) {
+          _exitPhotoNote('Gemini called "$name" — treated as a new command', outcome: 'interrupted_by_command');
+        }
       }
       if (_alreadyResolvedByAppTriggerThisUtterance(name)) {
         _log_(
@@ -5506,7 +6256,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // TECHNICIAN'S actual request the best chance of being the one that
     // wins, rather than whichever trigger happens to be checked first.)
     textChunk = _stripTrailingEchoContamination(textChunk);
+    // Before anything reads this utterance's state — see
+    // [_attributeTranscriptChunkToUtterance].
+    if (textChunk.trim().isNotEmpty) _attributeTranscriptChunkToUtterance(textChunk);
     _log_('inputTranscription chunk: "$textChunk"');
+    // Real technician words (past the echo backstop) — see
+    // [_lastTechnicianTranscriptAt].
+    // Stamped with when that speech STARTED, so a late trailing chunk of the
+    // utterance that caused the interruption doesn't read as new speech.
+    if (textChunk.trim().isNotEmpty) _lastTechnicianTranscriptAt = _currentUtteranceStartedAt ?? DateTime.now();
     // Real technician words arrived — any "Thinking..." wait ends, and if
     // they arrived after this utterance was already finalized, its
     // end-of-utterance routing re-runs on them (see
@@ -5583,6 +6341,19 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // active right now.
     _resetInactivityTimer(reason: 'technician transcription chunk received');
 
+    // awaitingPhotoDescription — see [_routeTranscriptToPhotoNote]: while a
+    // just-kept photo is waiting on an optional note, speech goes there
+    // BEFORE any normal trigger; only an interrupting command comes back
+    // out (as the whole utterance so far) to be matched normally below. A
+    // flow that just timed out is reopened first if this is a late answer
+    // to it (see [_maybeReopenPhotoNoteForLateAnswer]).
+    _maybeReopenPhotoNoteForLateAnswer();
+    if (_photoNote != null) {
+      final routed = _routeTranscriptToPhotoNote(textChunk);
+      if (routed == null) return;
+      textChunk = routed;
+    }
+
     // P0 FIX (CONFIRMED twice in real sessions: view_estimate +
     // view_job_history + open_camera off one utterance, then go_back +
     // view_invoice off another). ONE trigger per utterance, enforced HERE in
@@ -5604,6 +6375,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       }
       evaluate();
     }
+    if (!committedBefore && _anyTriggerCommittedThisUtterance) _utteranceCommittedAt ??= DateTime.now();
     _pipelineLog(
       'matcher_result',
       committedBefore
@@ -5739,6 +6511,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           // already resolved it this chunk, stay silent; otherwise re-ask the
           // pending question instead of the live-preview "say ready" line.
           if (_screenTask == _ScreenTask.cameraCaptured) {
+            // An already-kept photo on screen during the note question —
+            // nothing is waiting for keep/retake; the note flow owns replies.
+            if (_keptPhotoPreviewFile != null) {
+              _log_('OPEN_CAMERA GUARD: kept photo showing during the note question — no keep/retake re-ask');
+              return;
+            }
             if (_photoDecisionResolvedForCurrentUtterance) {
               _log_('OPEN_CAMERA GUARD: photo decision already handled this utterance — no reply');
               return;
@@ -5863,6 +6641,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       'utterance_end',
       'final text="${_deterministicTriggers['get_kb_answer']!.buffer.trim()}" ($_utteranceStateSummary)',
     );
+    // awaitingPhotoDescription owns this utterance: none of the routing
+    // below (KB, site_condition, intent layer, catch-all — the last of which
+    // would also silently lift the preemptive mute) applies to a photo note.
+    if (_photoNote != null && _photoNoteOwnsCurrentUtterance) {
+      _finalizedCurrentUtterance = true;
+      _onPhotoNoteUtteranceEnd();
+      return;
+    }
     _maybeTriggerDeterministic(
       _deterministicTriggers['get_kb_answer']!,
       '',
@@ -6113,6 +6899,34 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final decision = classifyCommandIntent(transcript);
     _log_(decision.describe(transcript));
     _pipelineLog('intent_layer', '${decision.kind.name}${decision.best == null ? '' : ' best=${decision.best!.trigger}'}');
+
+    // Live camera only: a bare photo noun ("Tika shot" — ASR's "take a
+    // shot") is FUZZY WEAK in general, but with the preview up and armed the
+    // context makes it a shutter command — see [liveCameraShotNoun]. Never
+    // applied in any other state (the camera not open, a photo awaiting
+    // keep/retake, the note question), and never over a confident match to
+    // something other than the camera.
+    final otherConfidentTrigger = decision.kind == IntentDecisionKind.confident && decision.best!.trigger != 'open_camera';
+    final liveNoun = _screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed && !otherConfidentTrigger
+        ? liveCameraShotNoun(transcript)
+        : null;
+    if (liveNoun != null) {
+      _log_(
+        'FUZZY LIVE-CAMERA MATCH: "$liveNoun" in "$transcript" with the camera live and armed — firing capture_photo '
+        '(${decision.kind.name} in the general matcher)',
+      );
+      _pipelineLog('intent_layer', 'live_camera_capture noun=$liveNoun');
+      _forcedIntentTrigger = 'capture_photo';
+      try {
+        _buildTriggerEvaluators('')['capture_photo']!();
+      } finally {
+        _forcedIntentTrigger = null;
+      }
+      if (_anyTriggerCommittedThisUtterance) return;
+      // Guard/debounce said no after all — the normal handling below
+      // (including the context-aware "I didn't catch that" reply) applies.
+    }
+
     switch (decision.kind) {
       case IntentDecisionKind.none:
         return;
@@ -6481,6 +7295,37 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final scriptWords = script.toSet();
     final ratio = words.where(scriptWords.contains).length / words.length;
     if (ratio >= _scriptIdentityMatchRatio) {
+      // CONFIRMED via flutter_run_log 6038bc76: a scripted line interrupted
+      // mid-playback was restarted, and releasing the restart the moment
+      // it matched the script ("Yes, I") let "Yes, I can hear" play before
+      // the duplicate check could run. With an interrupted-turn baseline
+      // active, keep HOLDING (the same hold as above) until the duplicate
+      // check can decide; a restart is dropped unplayed, anything else is
+      // released. No baseline — the normal case — releases immediately,
+      // exactly as before.
+      if (_interruptedTurnBaseline != null) {
+        final candidate = _scriptIdentityCandidateText;
+        final result = _evaluateInterruptedTurnBaseline(words, candidate, maxBaselineWords: _baselineHoldCompareWords);
+        switch (result.verdict) {
+          case _BaselineVerdict.needMoreWords:
+            _log_(
+              'TURN IDENTITY: "$candidate" matches the script, but an interrupted-turn baseline '
+              '("${_interruptedTurnBaseline?.text}") is active — still HOLDING ${_heldUnidentifiedTurnChunks.length} '
+              'chunk(s) until the duplicate check can run',
+            );
+            return;
+          case _BaselineVerdict.duplicate:
+            _suppressTurnAsInterruptedDuplicate(candidate, result.overlap);
+            _resolveScriptedTurn(
+              play: false,
+              reason: 'transcript "$candidate" restarts an interrupted turn — duplicate, dropped before any audio played',
+            );
+            return;
+          case _BaselineVerdict.notDuplicate:
+          case _BaselineVerdict.noBaseline:
+            break;
+        }
+      }
       _resolveScriptedTurn(play: true, reason: 'transcript "$_scriptIdentityCandidateText" matches the script');
       return;
     }
@@ -6685,11 +7530,22 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (last == null || now.difference(last) > _unclearInputStreakWindow) _unclearInputStreak = 0;
     _lastUnclearInputAt = now;
     _unclearInputStreak++;
+    // Context first — see [_activeFlowUnclearReply]. Same 1st / short 2nd /
+    // quiet 3rd+ escalation either way.
+    final flowReply = _unclearInputStreak <= 2 ? _activeFlowUnclearReply(repeat: _unclearInputStreak == 2) : null;
+    if (flowReply != null) {
+      _log_(
+        '${reason == 'transcript_never_arrived' ? 'TRANSCRIPT TIMEOUT' : 'UNCLEAR INPUT'}: context-aware fallback fired '
+        '— activeFlow=${flowReply.flow} (miss #$_unclearInputStreak, reason=$reason)',
+      );
+    } else if (_unclearInputStreak <= 2 && reason == 'transcript_never_arrived') {
+      _log_('TRANSCRIPT TIMEOUT: generic idle-state fallback fired — no active flow (miss #$_unclearInputStreak)');
+    }
     if (_unclearInputStreak == 1) {
-      _informGeminiToSpeakVerbatim(_unrecognizedReplyForCurrentState(), reason: reason);
+      _informGeminiToSpeakVerbatim(flowReply?.text ?? _unrecognizedReplyForCurrentState(), reason: reason);
     } else if (_unclearInputStreak == 2) {
       _log_('UNCLEAR INPUT: 2nd in a row — short reply instead of repeating the full line ($reason)');
-      _informGeminiToSpeakVerbatim(_unclearInputShortReply, reason: reason);
+      _informGeminiToSpeakVerbatim(flowReply?.text ?? _unclearInputShortReply, reason: reason);
     } else {
       _log_('UNCLEAR INPUT: $_unclearInputStreak in a row — staying quiet ($reason)');
       _interruptGeminiForDeterministicTrigger('unclear_input_quiet');
@@ -6802,6 +7658,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // method runs) closes the race unconditionally, at the exact moment a
     // real resolution is known to exist.
     _utteranceAlreadyResolvedByTrigger = true;
+    // See [_attributeTranscriptChunkToUtterance].
+    _utteranceCommittedAt = DateTime.now();
     // A real resolution ends any unclear-input streak — see [_respondToUnclearInput].
     if (endsUnclearInputStreak) _unclearInputStreak = 0;
     if (_preemptiveDefaultMuteActive) {
@@ -7504,9 +8362,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
             ? "Got it — I've taken the photo. Keep it, or retake it?"
             : ((result['message'] as String?) ?? "I couldn't take that photo — please try again.");
       case 'confirm_photo_upload':
-        return result['status'] == 'queued_offline'
-            ? "I've saved that photo — it'll upload once you're back online."
-            : "I've uploaded the photo.";
+        // "Keep" only — nothing is uploaded until the one-time photo-note
+        // ask (appended when that flow was just entered) is answered, so
+        // this must not claim an upload (see [_startPhotoNoteUpload]).
+        return 'Got it — keeping that photo.${_photoNotePromptSuffix()}';
       case 'retake_photo':
         return "I've discarded that photo — go ahead and take another one when you're ready.";
       case 'get_last_photo':
@@ -7841,6 +8700,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// [_currentViewScreenName] itself (see that field's doc comment for why
   /// one small addition was still needed).
   String _describeCurrentScreen() {
+    if (_screenTask == _ScreenTask.cameraCaptured && _keptPhotoPreviewFile != null) {
+      return "You're looking at the photo you're keeping — I'm asking whether you want to add a note to it.";
+    }
     if (_screenTask == _ScreenTask.cameraCaptured) {
       return "You're looking at the photo you just took, waiting for you to say keep it or retake it.";
     }
@@ -8017,6 +8879,48 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     'Okay. Say the word if you want the estimate, the change orders, or a photo.',
   ];
 
+  /// The unclear-input / transcript-timeout reply for whatever multi-turn
+  /// flow is open right now, or `null` when none is (then the existing
+  /// generic replies apply, unchanged). CONFIRMED need (logcat 09-28,
+  /// field_events.id=192): with a photo note pending, a missed transcript
+  /// answered with the generic "…show the estimate, change orders, or take
+  /// a photo?" menu — unrelated to the question just asked.
+  ///
+  /// Photo note: asks about the note in that phase's own terms, and COUNTS
+  /// as that phase's one re-prompt, so the flow's own re-prompt never fires
+  /// on top of it. Camera: already state-aware and never the generic menu,
+  /// so its texts are returned EXACTLY as before (the existing first-miss
+  /// line from [_unrecognizedReplyForCurrentState], the existing short
+  /// line on a repeat) — named here only so the log shows the flow.
+  ({String flow, String text})? _activeFlowUnclearReply({required bool repeat}) {
+    final note = _photoNote;
+    if (note != null) {
+      if (note.phase == _PhotoNotePhase.awaitingConfirmation) {
+        note.confirmReprompted = true;
+        return (
+          flow: 'photo_note.awaitingConfirmation',
+          text: repeat
+              ? 'Sorry, still didn\'t catch that — save the note, yes or no?'
+              : 'Sorry, didn\'t catch that — should I save that note? Yes or no?',
+        );
+      }
+      note.descriptionReprompted = true;
+      return (
+        flow: 'photo_note.awaitingPhotoDescription',
+        text: repeat
+            ? 'Sorry, still didn\'t catch that — add a note, or skip?'
+            : 'Sorry, didn\'t catch that — want to add a note about the photo, or skip it?',
+      );
+    }
+    final cameraFlow = switch (_screenTask) {
+      _ScreenTask.cameraCaptured => 'camera.keepOrRetake',
+      _ScreenTask.cameraLive => 'camera.live',
+      _ => null,
+    };
+    if (cameraFlow == null) return null;
+    return (flow: cameraFlow, text: repeat ? _unclearInputShortReply : _unrecognizedReplyForCurrentState());
+  }
+
   String _unrecognizedReplyForCurrentState() {
     if (_screenTask == _ScreenTask.cameraCaptured) {
       // BUG 5 FIX (CONFIRMED via flutter_run_log_new.txt, build #56): a
@@ -8082,6 +8986,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // comment.
     if (_utteranceAlreadyResolvedByTrigger) return;
     if (_screenTask != _ScreenTask.cameraCaptured || _photoDecisionResolvedForCurrentUtterance) return;
+    // The Review Photo surface also stays up for an already-KEPT photo
+    // during the note question ([_keptPhotoPreviewFile]) — there's no
+    // keep/retake decision pending then; "yes, save that" is a note answer.
+    if (_keptPhotoPreviewFile != null) return;
     _photoDecisionDetectionBuffer = '$_photoDecisionDetectionBuffer $textChunk'.trim();
 
     // P0 FIX — see [_photoDecisionAmbiguousStreakDecay]'s doc comment: an
@@ -8182,7 +9090,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // BUG 5 FIX — see [_photoDecisionDispatchInFlight]'s doc comment.
     _photoDecisionDispatchInFlight = true;
     _photoDecisionDispatchAcknowledgedUnresolved = false;
-    if (action == 'confirm_photo_upload' && mounted) setState(() => _photoUploadInFlight = true);
+    // No "Uploading…" overlay here any more: confirm_photo_upload only marks
+    // the photo kept — the upload runs after the photo-note question (see
+    // [_startPhotoNoteUpload]).
     try {
       // P2 FIX (CONFIRMED via flutter_run_log_new.txt, build #59): this
       // used to call [dispatchGeminiFunctionCall] DIRECTLY — bypassing
@@ -8238,6 +9148,794 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // instant it starts streaming back.
     if (action == 'confirm_photo_upload') _beginProtectedConfirmation();
     _informGeminiToSpeakVerbatim(text, reason: 'deterministic $action');
+  }
+
+  // ===========================================================================
+  // VOICE PHOTO DESCRIPTION ("awaitingPhotoDescription")
+  //
+  // Entered the moment a photo is genuinely KEPT (confirm_photo_upload
+  // succeeded, from either the deterministic path or a Gemini toolCall — see
+  // [_updateScreenTaskForToolCall]), carrying that exact photo's own
+  // field_events id. The keep confirmation line itself asks once ("Want to
+  // add a note about this photo?" — see [_photoNotePromptSuffix]); while
+  // active, the technician's speech is routed HERE before the normal trigger
+  // matchers (see [_routeTranscriptToPhotoNote]):
+  //  - a clear decline ends it, nothing saved;
+  //  - an unmistakable command ("take another photo") ends it and runs
+  //    through the normal trigger path untouched;
+  //  - anything else is the note, read back for confirmation — the same
+  //    interrupt + speak-verbatim + bounded-re-ask shape the photo_decision
+  //    ambiguous clarification uses — and only saved once confirmed;
+  //  - ~5s of quiet ends it silently, nothing saved.
+  // Every step logs a greppable `PHOTO NOTE [stage]:` line.
+  // ===========================================================================
+
+  _PhotoNoteFlow? _photoNote;
+  Timer? _photoNoteTicker;
+  Timer? _photoNoteSettleTimer;
+
+  /// Total quiet window for the technician's FIRST answer to "Want to add a
+  /// note…?" — CONFIRMED too short at 5s with no retry (logcat 09-28
+  /// 16:45:24-16:46:47, field_events.id=192). Same shape as the
+  /// confirmation window: after [_photoNoteDescriptionRepromptAfter] of
+  /// quiet it asks ONCE more ([_photoNoteDescriptionRepromptText]), then
+  /// the rest of the window runs from when that re-prompt finished; only
+  /// then, with no speech at all, does the flow skip silently. Any speech
+  /// (even one whose transcript is still on its way) keeps it open.
+  static const Duration _photoNoteDescriptionWindow = Duration(seconds: 15);
+  static const Duration _photoNoteDescriptionRepromptAfter = Duration(milliseconds: 7500);
+  static const String _photoNoteDescriptionRepromptText = 'Still there? Want to add a note, or should I skip it?';
+
+  /// A late transcript for speech that BEGAN while the flow was open, but
+  /// only arrived after it timed out (Gemini transcripts have been
+  /// CONFIRMED 17.5s late), reopens it this long after the timeout — see
+  /// [_maybeReopenPhotoNoteForLateAnswer].
+  static const Duration _photoNoteLateAnswerGrace = Duration(seconds: 20);
+  ({_PhotoNoteFlow flow, DateTime exitedAt})? _timedOutPhotoNote;
+
+  /// Quiet window after the read-back ("…Should I save that?"). Much longer
+  /// than [_photoNoteQuietTimeout] (CONFIRMED via flutter_run_log 3fd07e31:
+  /// a correctly heard note was discarded after 5247ms while the technician
+  /// was still handling equipment) — a note has already been dictated here,
+  /// so waiting costs nothing and silence loses real work. Its own
+  /// constant, deliberately unrelated to the session inactivity watchdog.
+  static const Duration _photoNoteConfirmQuietTimeout = Duration(seconds: 15);
+
+  /// The one re-prompt after the first confirmation timeout or an unclear
+  /// answer — see [_repromptPhotoNoteConfirmation].
+  static const String _photoNoteConfirmRepromptText = 'Save that note — yes or no?';
+
+  /// Hard ceiling on any ONE step of the flow (restarted every time the
+  /// flow speaks), whatever the quiet tracking thinks — a stuck "busy"
+  /// signal must never leave later speech being swallowed as a note.
+  static const Duration _photoNoteMaxStepDuration = Duration(seconds: 45);
+
+  /// After the utterance ends (or a late chunk arrives), wait this long for
+  /// more before acting — a natural mid-sentence pause must not cut a
+  /// description in half.
+  static const Duration _photoNoteSettleDelay = Duration(milliseconds: 1200);
+
+  /// Bounded re-asks after a read-back — same idea as
+  /// [_photoDecisionAmbiguousEscalationThreshold]: never loop forever.
+  static const int _photoNoteMaxReasks = 2;
+
+  static const String _photoNotePromptText = 'Want to add a note about this photo?';
+
+  void _photoNoteLog(String stage, String detail) {
+    _log_('PHOTO NOTE [$stage]: $detail at ${DateTime.now()}');
+  }
+
+  bool get _photoNoteOwnsCurrentUtterance => _photoNote?.ownedUtteranceSeq == _utteranceSeq;
+
+  /// Called on every genuine confirm_photo_upload ("keep") success — BEFORE
+  /// anything is compressed or uploaded: the kept photo waits in
+  /// [_cameraSession] for this flow's answer (see [_startPhotoNoteUpload]).
+  void _enterPhotoNote({required int? keptId, required String? jobId}) {
+    _exitPhotoNote('replaced by a newly kept photo', outcome: 'superseded');
+    if (keptId == null || jobId == null) {
+      _photoNoteLog('state', 'NOT entered — keep result carried no kept_id/job_id (kept_id=$keptId, job_id=$jobId)');
+      return;
+    }
+    final flow = _PhotoNoteFlow(keptId, jobId, DateTime.now());
+    _photoNote = flow;
+    _timedOutPhotoNote = null;
+    // The photo preview stays up (camera held) for the whole note question
+    // — see [_finishKeptPhotoPreview].
+    _keptPhotoPreviewFile = _cameraSession.keptFile(keptId);
+    _photoNoteLog('state', 'entered awaitingPhotoDescription for ${flow.describePhoto()}');
+    _photoNoteTicker = Timer.periodic(const Duration(milliseconds: 250), (_) => _photoNoteTick());
+  }
+
+  /// Appended to the keep confirmation line — the ONE time the flow asks.
+  String _photoNotePromptSuffix() {
+    final flow = _photoNote;
+    if (flow == null || flow.prompted) return '';
+    flow.prompted = true;
+    _photoNoteLog('prompt', 'asking once: "$_photoNotePromptText" (${flow.describePhoto()})');
+    return ' $_photoNotePromptText';
+  }
+
+  /// Outcomes after which the no-note upload is spoken about (with its
+  /// pending-call filler, like any upload the technician is waiting on).
+  /// Every other no-note exit (a command took over, a new photo, the
+  /// session ending) uploads silently in the background, so it never talks
+  /// or hard-pauses audio over whatever is happening instead.
+  static const Set<String> _photoNoteAudibleUploadOutcomes = {
+    'timed_out',
+    'declined_by_technician',
+    'declined',
+    'cancelled',
+  };
+
+  /// [uploadLeadIn]: the flow's own closing line for this exit ("Okay — no
+  /// note.") — spoken together with the upload's result once the upload
+  /// finishes, not before it (the upload hard-pauses audio).
+  void _exitPhotoNote(String reason, {required String outcome, String? uploadLeadIn}) {
+    final flow = _photoNote;
+    if (flow == null) return;
+    _photoNote = null;
+    // Only a silence timeout can be undone by a late answer — every other
+    // exit was a decision (see [_maybeReopenPhotoNoteForLateAnswer]).
+    _timedOutPhotoNote = outcome == 'timed_out' ? (flow: flow, exitedAt: DateTime.now()) : null;
+    _photoNoteTicker?.cancel();
+    _photoNoteTicker = null;
+    _photoNoteSettleTimer?.cancel();
+    _photoNoteSettleTimer = null;
+    _photoNoteLog(
+      'state',
+      'exited — outcome=$outcome ($reason); ${outcome == 'saved' ? 'note saved' : 'no note saved'} for '
+          '${flow.describePhoto()}',
+    );
+    // Declined, skipped, timed out, or anything else that isn't a saved
+    // note: the kept photo is uploaded now, without a note.
+    if (flow.upload != null) {
+      _finishKeptPhotoPreview('note flow ended ($outcome)');
+      if (uploadLeadIn != null) _speakPhotoNoteLine(uploadLeadIn, reason: 'photo_note_exit');
+      return;
+    }
+    final audible = _photoNoteAudibleUploadOutcomes.contains(outcome);
+    _photoNoteLog(
+      'upload',
+      'no note ($outcome) — compressing + uploading ${flow.describePhoto()} now without a note '
+          '(${audible ? 'spoken, with the pending-call filler' : 'silently in the background'})',
+    );
+    final upload = _startPhotoNoteUpload(flow, note: null, audible: audible);
+    _finishKeptPhotoPreview('no-note upload started ($outcome)');
+    if (!audible) return;
+    unawaited(upload.then((result) {
+      if (!mounted) return;
+      final line = _keptPhotoUploadSpokenText(result);
+      _speakPhotoNoteLine(uploadLeadIn == null ? line : '$uploadLeadIn $line', reason: 'photo_upload_no_note');
+    }));
+  }
+
+  /// The kept photo shown on the Review Photo surface while the note
+  /// question is asked (the camera stays held behind it) — `null` when no
+  /// kept photo is being shown.
+  XFile? _keptPhotoPreviewFile;
+
+  /// "Keep" used to end the camera flow on the spot (dismiss the photo
+  /// view, release the camera). With the note asked BEFORE the upload, that
+  /// happens here instead, once the note flow is genuinely finished: the
+  /// note was saved (photo + note written together), or the flow ended
+  /// without one and the no-note upload has started.
+  void _finishKeptPhotoPreview(String why) {
+    if (_keptPhotoPreviewFile == null) return;
+    _keptPhotoPreviewFile = null;
+    // Something else already moved the screen on (a command, a new camera
+    // action, the session ending) — leave it where it is.
+    if (_screenTask != _ScreenTask.cameraCaptured || _cameraSession.capturedFile != null) return;
+    _log_(
+      'PHOTO CONFIRM: navigated to job details ($why; photo view dismissed -> ${_ScreenTask.none}; the ambient '
+      'overlay returns to the conversation over the job screen) — releasing camera',
+    );
+    if (mounted) setState(() => _screenTask = _ScreenTask.none);
+    _pausedVoiceService?.setScreenTaskActive(false);
+    _scheduleCameraReleaseWhenIdle();
+  }
+
+  /// Starts [flow]'s deferred upload — at most once per flow (a second call
+  /// returns the first one's future). [note] goes in the same
+  /// `field_events` write as the photo. [audible]: through
+  /// [_dispatchWithOpenCameraSafeguards], i.e. the same audio hard pause and
+  /// "Still uploading, one more second." pending-call filler the upload had
+  /// when it ran inside confirm_photo_upload; otherwise silent (see
+  /// [_photoNoteAudibleUploadOutcomes]). Resolves to the dispatcher's result
+  /// (`kept_photo_ref` names the row), or `null` if the upload threw.
+  Future<Map<String, dynamic>?> _startPhotoNoteUpload(_PhotoNoteFlow flow, {required String? note, required bool audible}) {
+    final existing = flow.upload;
+    if (existing != null) return existing;
+    final upload = audible
+        ? _runAudibleKeptPhotoUpload(flow, note: note)
+        : _uploadKeptPhotoSilently(flow.keptId, why: flow.describePhoto());
+    flow.upload = upload;
+    return upload;
+  }
+
+  Future<Map<String, dynamic>?> _runAudibleKeptPhotoUpload(_PhotoNoteFlow flow, {required String? note}) async {
+    final args = <String, dynamic>{'job_id': flow.jobId, 'kept_id': flow.keptId, 'note': ?note};
+    _beginFunctionCallInFlight('photo upload (kept_id=${flow.keptId})');
+    // The "Uploading…" overlay on the still-showing photo preview.
+    if (mounted) setState(() => _photoUploadInFlight = true);
+    try {
+      final result = await _pipelineDispatch(
+        name: uploadKeptPhotoFunctionName,
+        source: 'photo_note',
+        call: () => _dispatchWithOpenCameraSafeguards(name: uploadKeptPhotoFunctionName, args: args),
+      );
+      _recordKeptPhotoUploaded(flow.keptId, result);
+      return result;
+    } catch (e, stackTrace) {
+      debugPrint('PHOTO NOTE ERROR (upload): $e\n$stackTrace');
+      _photoNoteLog('upload', 'FAILED for kept photo #${flow.keptId}: $e');
+      return null;
+    } finally {
+      _endFunctionCallInFlight('photo upload (kept_id=${flow.keptId})');
+      if (_photoUploadInFlight && mounted) setState(() => _photoUploadInFlight = false);
+    }
+  }
+
+  /// No audio hard pause, no filler, no in-flight/inactivity bookkeeping,
+  /// no `ref` — safe to run while another command is being answered, and
+  /// after this screen is torn down (a session ending mid-question still
+  /// uploads the photo).
+  Future<Map<String, dynamic>?> _uploadKeptPhotoSilently(int keptId, {required String why}) async {
+    try {
+      final outcome = await _cameraSession.uploadKept(keptId);
+      final result = <String, dynamic>{
+        'status': outcome.result == PhotoUploadResult.queuedOffline ? 'queued_offline' : 'uploaded',
+        'kept_photo_ref': outcome.ref,
+      };
+      _recordKeptPhotoUploaded(keptId, result);
+      return result;
+    } catch (e, stackTrace) {
+      debugPrint('PHOTO NOTE ERROR (background upload, $why): $e\n$stackTrace');
+      _log_('PHOTO NOTE [upload]: background upload FAILED for kept photo #$keptId ($why): $e at ${DateTime.now()}');
+      return null;
+    }
+  }
+
+  void _recordKeptPhotoUploaded(int keptId, Map<String, dynamic> result) {
+    final photo = result['kept_photo_ref'] as KeptPhotoRef?;
+    _log_(
+      'PHOTO NOTE [upload]: kept photo #$keptId ${result['status']}${result.containsKey('note_status') ? ' '
+          '(note ${result['note_status']})' : ' (no note)'} — ${photo?.describe() ?? 'no row reference'} at ${DateTime.now()}',
+    );
+    // P0 TRUST FIX — completed-upload phrasing is licensed by the REAL
+    // upload finishing, not by "keep" (see [_updateScreenTaskForToolCall]).
+    if (mounted && photo != null) _recordPhotoActionSuccess('confirm_photo_upload');
+  }
+
+  /// The spoken result of a no-note upload.
+  String _keptPhotoUploadSpokenText(Map<String, dynamic>? result) {
+    if (result == null || result['kept_photo_ref'] == null) return "Sorry — I couldn't upload that photo.";
+    return result['status'] == 'queued_offline'
+        ? "I've saved that photo — it'll upload once you're back online."
+        : "I've uploaded the photo.";
+  }
+
+  /// Anything that means the conversation isn't quiet yet: the technician
+  /// talking, our own line still playing/pending, a transcript still
+  /// expected, or a note waiting to settle/save.
+  bool get _photoNoteBusy =>
+      _isSpeaking ||
+      !_turnComplete ||
+      _pcmRemainingFrames > 0 ||
+      _scriptedResponsePending ||
+      _awaitingScriptedTurnWords != null ||
+      _awaitingLateTranscript ||
+      _inFlightFunctionCalls > 0 ||
+      (_photoNoteSettleTimer?.isActive ?? false) ||
+      (_photoNote?.saving ?? false);
+
+  void _photoNoteTick() {
+    final flow = _photoNote;
+    if (flow == null) return;
+    final now = DateTime.now();
+    if (now.difference(flow.stepStartedAt) > _photoNoteMaxStepDuration && !flow.saving) {
+      _exitPhotoNote(
+        'hard ceiling of ${_photoNoteMaxStepDuration.inSeconds}s reached while ${flow.phase.name}'
+            '${flow.candidate != null ? ' (unconfirmed candidate "${flow.candidate}" discarded)' : ''}',
+        outcome: 'timed_out',
+      );
+      return;
+    }
+    if (_photoNoteBusy) {
+      flow.quietSince = now;
+      return;
+    }
+    final quietFor = now.difference(flow.quietSince);
+    if (flow.resumePending) {
+      // A break-out command was just answered (see
+      // [_photoNoteBreakOutToRealCommand]) — once that answer has finished,
+      // come back to the pending note ONE time; its timeout then discards.
+      if (quietFor < _photoNoteResumeDelay) return;
+      flow.resumePending = false;
+      flow.confirmReprompted = true;
+      final spoken = (flow.candidate ?? '').replaceFirst(RegExp(r'[.!\s]+$'), '');
+      _photoNoteLog(
+        'prompt',
+        'resuming after the break-out command — asking once more about candidate "${flow.candidate}" '
+            '(window ${_photoNoteConfirmQuietTimeout.inSeconds}s, no further re-prompt)',
+      );
+      _speakPhotoNoteLine('Back to the photo note — save "$spoken"? Yes or no?', reason: 'photo_note_resume');
+      return;
+    }
+    final confirming = flow.phase == _PhotoNotePhase.awaitingConfirmation;
+    if (!confirming) {
+      // awaitingDescription — see [_photoNoteDescriptionWindow].
+      if (!flow.descriptionReprompted) {
+        if (quietFor < _photoNoteDescriptionRepromptAfter) return;
+        _repromptPhotoNoteDescription(flow, why: 'nothing heard for ${quietFor.inMilliseconds}ms');
+        return;
+      }
+      final rest = _photoNoteDescriptionWindow - _photoNoteDescriptionRepromptAfter;
+      if (quietFor < rest) return;
+      _exitPhotoNote(
+        'no speech at all for the full ${_photoNoteDescriptionWindow.inSeconds}s window while awaitingDescription '
+            '(${_photoNoteDescriptionRepromptAfter.inMilliseconds}ms, one re-prompt, then ${quietFor.inMilliseconds}ms)',
+        outcome: 'timed_out',
+      );
+      return;
+    }
+    if (quietFor < _photoNoteConfirmQuietTimeout) return;
+    if (!flow.confirmReprompted) {
+      _repromptPhotoNoteConfirmation(flow, why: 'nothing heard for ${quietFor.inMilliseconds}ms after the read-back');
+      return;
+    }
+    _exitPhotoNote(
+      'nothing heard for ${quietFor.inMilliseconds}ms while ${flow.phase.name} '
+          '(window ${_photoNoteConfirmQuietTimeout.inSeconds}s, after the one re-prompt)'
+          '${flow.candidate != null ? ' (unconfirmed candidate "${flow.candidate}" discarded)' : ''}',
+      outcome: 'timed_out',
+    );
+  }
+
+  /// The ONE re-prompt for the first answer to "Want to add a note…?" —
+  /// see [_photoNoteDescriptionWindow].
+  void _repromptPhotoNoteDescription(_PhotoNoteFlow flow, {required String why}) {
+    flow.descriptionReprompted = true;
+    final rest = _photoNoteDescriptionWindow - _photoNoteDescriptionRepromptAfter;
+    _photoNoteLog(
+      'prompt',
+      're-prompting once while awaitingDescription ($why): "$_photoNoteDescriptionRepromptText" — '
+          '${rest.inMilliseconds}ms more of quiet after it before skipping',
+    );
+    _speakPhotoNoteLine(_photoNoteDescriptionRepromptText, reason: 'photo_note_description_reprompt');
+  }
+
+  /// See [_photoNoteLateAnswerGrace]. Called for every transcript chunk
+  /// while no flow is open: if the flow timed out only moments ago and THIS
+  /// speech began while it was still open, the answer is late, not new —
+  /// the flow is restored as it was (phase, candidate, re-prompt state) and
+  /// the chunk is routed to it like any other.
+  void _maybeReopenPhotoNoteForLateAnswer() {
+    final recent = _timedOutPhotoNote;
+    if (_photoNote != null || recent == null) return;
+    final now = DateTime.now();
+    if (now.difference(recent.exitedAt) > _photoNoteLateAnswerGrace) {
+      _timedOutPhotoNote = null;
+      return;
+    }
+    final started = _currentUtteranceStartedAt;
+    if (started == null || !started.isBefore(recent.exitedAt) || started.isBefore(recent.flow.enteredAt)) return;
+    _timedOutPhotoNote = null;
+    final flow = recent.flow;
+    flow.buffer = '';
+    flow.quietSince = now;
+    flow.stepStartedAt = now;
+    _photoNote = flow;
+    _photoNoteTicker?.cancel();
+    _photoNoteTicker = Timer.periodic(const Duration(milliseconds: 250), (_) => _photoNoteTick());
+    _photoNoteLog(
+      'state',
+      're-opened (${flow.phase.name}) for ${flow.describePhoto()} — a late transcript arrived for speech that began '
+          'at $started, while the flow was still open (it timed out at ${recent.exitedAt}); processing it normally',
+    );
+  }
+
+  /// The ONE confirmation re-prompt — after the first quiet timeout or an
+  /// unclear answer, whichever comes first. The candidate and phase are
+  /// kept; the confirmation window starts over.
+  void _repromptPhotoNoteConfirmation(_PhotoNoteFlow flow, {required String why}) {
+    flow.confirmReprompted = true;
+    _photoNoteLog(
+      'prompt',
+      're-prompting once ($why): "$_photoNoteConfirmRepromptText" — candidate "${flow.candidate}" still pending, '
+          'window ${_photoNoteConfirmQuietTimeout.inSeconds}s again',
+    );
+    _speakPhotoNoteLine(_photoNoteConfirmRepromptText, reason: 'photo_note_confirm_reprompt');
+  }
+
+  /// Routes one transcript chunk while the flow is active. Returns `null`
+  /// when the flow consumed it (no normal trigger sees it), or the text the
+  /// normal trigger path should evaluate instead — the whole utterance so
+  /// far, not just this chunk, when an interrupting command ended the flow
+  /// (its first words were consumed here before the command was complete).
+  String? _routeTranscriptToPhotoNote(String textChunk) {
+    final flow = _photoNote!;
+    // A late trailing chunk of the "keep it" utterance that STARTED this
+    // flow is not a note — it goes through the normal path exactly as it
+    // did before this flow existed.
+    final utteranceStartedAt = _currentUtteranceStartedAt;
+    if (utteranceStartedAt != null && utteranceStartedAt.isBefore(flow.enteredAt)) {
+      _pipelineLog('photo_note', 'chunk "$textChunk" belongs to an utterance from before the photo was kept — not a note');
+      return textChunk;
+    }
+    // Deliberately NOT reset per utterance: until the settle timer acts on
+    // it, a description that resumes after a pause is the same note.
+    flow.buffer = '${flow.buffer} $textChunk'.trim();
+    flow.lastHeardAt = DateTime.now();
+
+    // Same command set in BOTH phases, whatever candidate is pending — see
+    // [photoNoteInterruptCommand] for why "No, go back." used to fail.
+    final command = photoNoteInterruptCommand(flow.buffer);
+    if (command != null) {
+      final utterance = flow.buffer;
+      _pipelineLog('photo_note', 'interrupting command "$command" (heard "$utterance") — handing to the normal trigger path');
+      _exitPhotoNote(
+        'interrupting command "$command" (heard "$utterance", phase ${flow.phase.name}) — routed to the normal '
+            'trigger path${flow.candidate != null ? ' (unconfirmed candidate "${flow.candidate}" discarded)' : ''}',
+        outcome: 'interrupted_by_command',
+      );
+      // Consumed chunks of this same utterance marked it resolved — undo
+      // that so the evaluator loop actually runs on the command. The
+      // command is handed over WITHOUT its "No," lead-in, which the normal
+      // matchers would otherwise read as negating it.
+      _utteranceAlreadyResolvedByTrigger = false;
+      return command;
+    }
+
+    flow.ownedUtteranceSeq = _utteranceSeq;
+    // Claims the utterance: the evaluator loop, the preemptive-mute safety
+    // timer, the KB catch-all and the intent layer all stand down, and the
+    // preemptive mute armed on this utterance's first chunk stays on until
+    // our own reply — Gemini's free-text answer to a photo note is never
+    // heard.
+    _utteranceAlreadyResolvedByTrigger = true;
+    _pipelineLog('photo_note', 'consumed by awaitingPhotoDescription (${flow.phase.name}): "${flow.buffer}"');
+    _armPhotoNoteSettleTimer();
+    return null;
+  }
+
+  void _armPhotoNoteSettleTimer() {
+    _photoNoteSettleTimer?.cancel();
+    _photoNoteSettleTimer = Timer(_photoNoteSettleDelay, () {
+      _photoNoteSettleTimer = null;
+      final flow = _photoNote;
+      if (flow == null) return;
+      final lastHeard = flow.lastHeardAt;
+      if (_isSpeaking || (lastHeard != null && DateTime.now().difference(lastHeard) < _photoNoteSettleDelay)) {
+        _armPhotoNoteSettleTimer();
+        return;
+      }
+      _processPhotoNoteUtterance();
+    });
+  }
+
+  /// End-of-utterance hook from [_finalizeUtteranceEndDeterministicTriggers]
+  /// — only for an utterance this flow already owns.
+  void _onPhotoNoteUtteranceEnd() {
+    _pipelineLog('photo_note', 'utterance end — owned by awaitingPhotoDescription, normal end-of-utterance routing skipped');
+    _armPhotoNoteSettleTimer();
+  }
+
+  void _processPhotoNoteUtterance() {
+    final flow = _photoNote;
+    if (flow == null) return;
+    final heard = flow.buffer.trim();
+    flow.buffer = '';
+    if (heard.isEmpty) return;
+    // Any new speech supersedes a pending "back to the photo note" prompt.
+    flow.resumePending = false;
+
+    // Our own prompt/read-back leaking back in past the echo backstop must
+    // never become the note. Only for replies of the echo backstop's own
+    // minimum length: CONFIRMED via flutter_run_log 6038bc76, a genuine
+    // "No" was discarded here because the read-back ("…No, I don't want to
+    // add notes…") contained the word "no" — a 1-2 word answer is always
+    // inside SOME earlier line and is never evidence of echo.
+    final normalizedHeard = _normalizeForEchoCompare(heard);
+    final heardWordCount = normalizedHeard.split(' ').where((w) => w.isNotEmpty).length;
+    if (heardWordCount >= _echoBackstopMinWords &&
+        normalizedHeard.length >= _echoBackstopMinChars &&
+        _normalizeForEchoCompare(_lastVerbatimScriptText).contains(normalizedHeard)) {
+      _photoNoteLog('candidate', 'ignored "$heard" — it is our own last spoken line echoing back');
+      _clearPreemptiveDefaultMuteSilently('photo note: echo of our own line ignored');
+      return;
+    }
+
+    if (flow.phase == _PhotoNotePhase.awaitingDescription) {
+      final reply = classifyPhotoNoteReply(heard);
+      switch (reply.kind) {
+        case PhotoNoteReplyKind.interruptCommand:
+          // Caught per chunk in [_routeTranscriptToPhotoNote]; unreachable.
+          return;
+        case PhotoNoteReplyKind.decline:
+          _photoNoteLog('decision', 'DECLINED — "$heard" matched a decline/skip/cancel pattern; nothing read back');
+          _exitPhotoNote('technician declined ("$heard")', outcome: 'declined_by_technician', uploadLeadIn: 'Okay — no note.');
+          return;
+        case PhotoNoteReplyKind.affirmOnly:
+          _photoNoteLog('decision', 'affirmed without a note yet ("$heard") — waiting for the description');
+          flow.descriptionReprompted = false;
+          _speakPhotoNoteLine('Go ahead.', reason: 'photo_note_go_ahead');
+          return;
+        case PhotoNoteReplyKind.redo:
+          _photoNoteLog('decision', 'REDO requested ("$heard") — still listening for a fresh description');
+          flow.descriptionReprompted = false;
+          _speakPhotoNoteLine('Go ahead — what should the note say?', reason: 'photo_note_redo');
+          return;
+        case PhotoNoteReplyKind.description:
+          // A real command/question is answered, never saved as a note.
+          if (_photoNoteBreakOutToRealCommand(flow, heard)) return;
+          _photoNoteLog('candidate', 'description candidate received: "${reply.text}" (heard "$heard")');
+          _readBackPhotoNote(flow, reply.text);
+          return;
+      }
+    }
+
+    final candidate = flow.candidate ?? '';
+    final confirmation = classifyPhotoNoteConfirmation(heard);
+    switch (confirmation.kind) {
+      case PhotoNoteConfirmationKind.interruptCommand:
+        return; // see above — handled per chunk
+      case PhotoNoteConfirmationKind.unclear:
+        if (!flow.confirmReprompted) {
+          _repromptPhotoNoteConfirmation(flow, why: 'unclear answer "$heard"');
+          return;
+        }
+        _photoNoteLog('decision', 'still unclear after the one re-prompt ("$heard") — candidate "$candidate" discarded');
+        _exitPhotoNote(
+          'unclear answer after the re-prompt ("$heard")',
+          outcome: 'declined',
+          uploadLeadIn: "Okay, I won't save a note.",
+        );
+        return;
+      case PhotoNoteConfirmationKind.confirm:
+        _photoNoteLog('decision', 'CONFIRMED "$candidate" ("$heard")');
+        unawaited(_savePhotoNote(flow, candidate));
+        return;
+      case PhotoNoteConfirmationKind.discard:
+        _photoNoteLog('decision', 'CANCELLED at confirmation — "$heard" matched a cancel phrase; candidate "$candidate" discarded');
+        _exitPhotoNote(
+          'technician cancelled the note ("$heard")',
+          outcome: 'cancelled',
+          uploadLeadIn: "Okay, I won't save a note.",
+        );
+        return;
+      case PhotoNoteConfirmationKind.reask:
+        flow.reasks++;
+        if (flow.reasks > _photoNoteMaxReasks) {
+          _photoNoteLog('decision', 'still not confirmed after ${flow.reasks - 1} re-asks ("$heard") — giving up, nothing saved');
+          _exitPhotoNote(
+            'too many re-asks',
+            outcome: 'declined',
+            uploadLeadIn: "Okay, I'll leave the photo without a note.",
+          );
+          return;
+        }
+        _photoNoteLog('decision', 'rejected read-back ("$heard") — re-asking (${flow.reasks}/$_photoNoteMaxReasks)');
+        flow.phase = _PhotoNotePhase.awaitingDescription;
+        flow.descriptionReprompted = false;
+        flow.candidate = null;
+        _speakPhotoNoteLine(
+          flow.reasks == 1 ? "Okay — what should the note say? Or say 'skip'." : "Tell me the note once more, or say 'skip'.",
+          reason: 'photo_note_reask',
+        );
+        return;
+      case PhotoNoteConfirmationKind.redo:
+        _photoNoteLog('decision', 'REDO requested ("$heard") — candidate "$candidate" dropped, listening for a fresh description');
+        flow.phase = _PhotoNotePhase.awaitingDescription;
+        flow.candidate = null;
+        flow.descriptionReprompted = false;
+        _speakPhotoNoteLine('Okay — go ahead and say the note again.', reason: 'photo_note_redo');
+        return;
+      case PhotoNoteConfirmationKind.correction:
+        // Only text that is NOT a real command/question is a correction.
+        if (_photoNoteBreakOutToRealCommand(flow, heard)) return;
+        _photoNoteLog('candidate', 'CORRECTION received: "${confirmation.text}" (was "$candidate", heard "$heard")');
+        _readBackPhotoNote(flow, confirmation.text);
+        return;
+      case PhotoNoteConfirmationKind.addition:
+        if (_photoNoteBreakOutToRealCommand(flow, heard)) return;
+        final extended = '${candidate.replaceFirst(RegExp(r'[.!\s]+$'), '')}. ${confirmation.text}';
+        _photoNoteLog('candidate', 'ADDITION received: "${confirmation.text}" -> "$extended" (heard "$heard")');
+        _readBackPhotoNote(flow, extended);
+        return;
+    }
+  }
+
+  /// Per-chunk evaluators NOT used for the break-out check: the camera/photo
+  /// decision ones (a note mentioning "the photo shows…" must not re-open
+  /// the camera via open_camera's loose noun+action matcher — the explicit
+  /// capture phrasings already break out per chunk, see
+  /// [classifyPhotoNoteReply]'s interruptCommand).
+  static const Set<String> _photoNoteBreakOutExcludedTriggers = {'open_camera', 'capture_photo', 'photo_decision'};
+
+  /// How long quiet must last after a break-out command's own answer
+  /// before the one "back to the photo note" prompt.
+  static const Duration _photoNoteResumeDelay = Duration(milliseconds: 1500);
+
+  /// CONFIRMED via flutter_run_log 97579c46: "Can you tell me which screen
+  /// we are" (three times), "Go back." and more were each read back as a
+  /// photo-note CORRECTION until the session itself closed. Before any
+  /// speech is accepted as a note or correction, it is run through the
+  /// REAL routing — the same per-chunk evaluators [_onInputTranscription]
+  /// uses, then the fuzzy intent layer, confident matches only — not a
+  /// copy of their phrase lists. If one of them commits, that trigger
+  /// answers/navigates exactly as it normally would, and this returns true.
+  ///
+  /// Then the flow decides whether to stay open: with a read-back still
+  /// pending it stays open ONCE and re-asks after the answer (see
+  /// [_photoNoteTick]); otherwise (no candidate yet, or a second break-out)
+  /// it closes, nothing saved.
+  bool _photoNoteBreakOutToRealCommand(_PhotoNoteFlow flow, String heard) {
+    // Only a request/question can be a break-out — a declarative note that
+    // merely contains a command's words stays a note (see
+    // [looksLikeRequestOrQuestion]).
+    if (!looksLikeRequestOrQuestion(heard)) return false;
+    // Release the utterance so the real triggers are allowed to commit.
+    final previousOwner = flow.ownedUtteranceSeq;
+    flow.ownedUtteranceSeq = null;
+    _utteranceAlreadyResolvedByTrigger = false;
+    _pendingGuardFailedReply = null;
+
+    String? routedTo;
+    for (final entry in _buildTriggerEvaluators(heard).entries) {
+      if (_photoNoteBreakOutExcludedTriggers.contains(entry.key)) continue;
+      entry.value();
+      if (_anyTriggerCommittedThisUtterance) {
+        routedTo = entry.key;
+        break;
+      }
+    }
+    if (routedTo == null) {
+      final decision = classifyCommandIntent(heard);
+      final best = decision.best?.trigger;
+      if (decision.kind == IntentDecisionKind.confident &&
+          best != null &&
+          !_photoNoteBreakOutExcludedTriggers.contains(best)) {
+        final kbTrigger = _deterministicTriggers['get_kb_answer']!;
+        kbTrigger.buffer = heard;
+        _maybeResolveByIntent();
+        kbTrigger.buffer = '';
+        if (_anyTriggerCommittedThisUtterance) routedTo = 'intent layer -> $best';
+      }
+    }
+    // A queued guard-failed clarification only belongs to a normal utterance.
+    _pendingGuardFailedReply = null;
+
+    if (routedTo == null) {
+      // Not a command — the flow keeps the utterance; it's note text.
+      flow.ownedUtteranceSeq = previousOwner;
+      _utteranceAlreadyResolvedByTrigger = true;
+      return false;
+    }
+
+    _pipelineLog('photo_note', 'break-out: "$heard" is a real command ($routedTo) — routed normally, not note text');
+    final candidate = flow.candidate;
+    if (flow.phase == _PhotoNotePhase.awaitingConfirmation && candidate != null && !flow.resumedAfterCommand) {
+      flow.resumedAfterCommand = true;
+      flow.resumePending = true;
+      flow.stepStartedAt = DateTime.now();
+      flow.quietSince = DateTime.now();
+      _photoNoteLog(
+        'state',
+        'BREAK-OUT: "$heard" matched real command ($routedTo) — answered through normal routing, NOT saved as a '
+            'correction; flow kept open for candidate "$candidate", will re-ask once after the answer',
+      );
+    } else {
+      _exitPhotoNote(
+        'BREAK-OUT: "$heard" matched real command ($routedTo) — answered through normal routing, NOT saved as note '
+            'text${candidate != null ? ' (unconfirmed candidate "$candidate" discarded — already re-asked once after a command)' : ''}',
+        outcome: 'interrupted_by_command',
+      );
+    }
+    return true;
+  }
+
+  void _readBackPhotoNote(_PhotoNoteFlow flow, String candidate) {
+    flow.candidate = candidate;
+    flow.phase = _PhotoNotePhase.awaitingConfirmation;
+    flow.confirmReprompted = false;
+    _photoNoteLog(
+      'prompt',
+      'reading back "$candidate" — confirmation window ${_photoNoteConfirmQuietTimeout.inSeconds}s, one re-prompt allowed',
+    );
+    final spoken = candidate.replaceFirst(RegExp(r'[.!\s]+$'), '');
+    _speakPhotoNoteLine('Got it — noted: $spoken. Should I save that?', reason: 'photo_note_readback');
+  }
+
+  /// Every flow reply goes out the same way a deterministic trigger's does:
+  /// buffers cleared as resolved (which also ends the preemptive mute
+  /// cleanly), then a constrained verbatim line that interrupts whatever
+  /// Gemini was saying on its own.
+  void _speakPhotoNoteLine(String text, {required String reason}) {
+    _clearAllTriggerBuffersAfterSuccess(reason);
+    final flow = _photoNote;
+    if (flow != null) {
+      flow.quietSince = DateTime.now();
+      flow.stepStartedAt = DateTime.now();
+    }
+    _informGeminiToSpeakVerbatim(text, reason: reason);
+  }
+
+  /// The confirmed note. Normally the photo is still waiting — it's
+  /// compressed and uploaded NOW, with the note in the same `field_events`
+  /// write. Only a flow re-opened by a late answer after its timeout had
+  /// already started the no-note upload writes the note separately, onto
+  /// the row that upload created.
+  Future<void> _savePhotoNote(_PhotoNoteFlow flow, String note) async {
+    flow.saving = true;
+    if (flow.upload == null) {
+      _photoNoteLog('save', 'uploading ${flow.describePhoto()} together with its note "$note" — one field_events write');
+      final result = await _startPhotoNoteUpload(flow, note: note, audible: true);
+      final photo = result?['kept_photo_ref'] as KeptPhotoRef?;
+      final noteStatus = result?['note_status'] as String?;
+      if (photo == null) {
+        _photoNoteLog('save', 'FAILURE — the photo upload itself failed; note "$note" not saved');
+        if (identical(_photoNote, flow)) _exitPhotoNote('photo upload failed', outcome: 'save_failed');
+        _speakPhotoNoteLine("Sorry — I couldn't upload that photo or its note.", reason: 'photo_note_save_failed');
+        return;
+      }
+      final photoQueued = result!['status'] == 'queued_offline';
+      _photoNoteLog(
+        'save',
+        switch (noteStatus) {
+          'written' => 'SUCCESS — photo and note written together in one field_events write for ${photo.describe()} '
+              '(transcript="$note")',
+          'queued' => 'QUEUED OFFLINE — note will be written for ${photo.describe()} on reconnect (transcript="$note")',
+          _ => 'FAILURE — photo uploaded but its note was not saved for ${photo.describe()}',
+        },
+      );
+      final saved = noteStatus == 'written' || noteStatus == 'queued';
+      if (identical(_photoNote, flow)) {
+        _exitPhotoNote(saved ? 'note confirmed' : 'note write failed', outcome: saved ? 'saved' : 'save_failed');
+      }
+      _speakPhotoNoteLine(
+        !saved
+            ? "I've uploaded the photo, but I couldn't save the note."
+            : photoQueued
+                ? "Photo and note saved — they'll upload once you're back online."
+                : noteStatus == 'queued'
+                    ? "I've uploaded the photo — the note will sync once you're back online."
+                    : "I've uploaded the photo with your note.",
+        reason: 'photo_note_saved',
+      );
+      return;
+    }
+
+    final uploaded = await flow.upload;
+    final photo = uploaded?['kept_photo_ref'] as KeptPhotoRef?;
+    if (photo == null) {
+      _photoNoteLog('save', 'FAILURE — the earlier no-note upload failed; note "$note" has no row to go on');
+      if (identical(_photoNote, flow)) _exitPhotoNote('photo upload failed', outcome: 'save_failed');
+      _speakPhotoNoteLine("Sorry — I couldn't save that note.", reason: 'photo_note_save_failed');
+      return;
+    }
+    _photoNoteLog('save', 'photo already uploaded (late answer) — writing transcript to ${photo.describe()} — "$note"');
+    try {
+      final wroteNow = await ref.read(offlineUploadQueueProvider.notifier).savePhotoNote(photo, note);
+      ref.read(jobPhotosProvider(photo.jobId).notifier).applyPhotoNote(photo, note);
+      _photoNoteLog(
+        'save',
+        wroteNow
+            ? 'SUCCESS — field_events.transcript UPDATE reached and matched the row for ${photo.describe()} '
+                  '(transcript="$note")'
+            : 'QUEUED OFFLINE — field_events.transcript UPDATE NOT reached yet; will be written for '
+                  '${photo.describe()} on reconnect (transcript="$note")',
+      );
+      if (identical(_photoNote, flow)) _exitPhotoNote('note confirmed', outcome: 'saved');
+      _speakPhotoNoteLine(
+        wroteNow ? 'Note saved.' : "Note saved — it'll sync once you're back online.",
+        reason: 'photo_note_saved',
+      );
+    } catch (e, stackTrace) {
+      debugPrint('PHOTO NOTE ERROR (save): $e\n$stackTrace');
+      _photoNoteLog('save', 'FAILURE for ${photo.describe()}: $e');
+      if (identical(_photoNote, flow)) _exitPhotoNote('save failed: $e', outcome: 'save_failed');
+      _speakPhotoNoteLine("Sorry — I couldn't save that note.", reason: 'photo_note_save_failed');
+    }
   }
 
   /// The camera flow is the only tool group with real, function-call-
@@ -8346,25 +10044,42 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
 
-    final nextTask = switch (name) {
-      'open_camera' || 'retake_photo' => _ScreenTask.cameraLive,
-      'capture_photo' => _ScreenTask.cameraCaptured,
-      _ => _ScreenTask.none, // confirm_photo_upload — task done, back to pure conversation.
-    };
-
     // P0 FIX — see [_photoDecisionAmbiguousStreak]'s doc comment: a fresh
     // capture starts a brand new keep/retake decision cycle, so any
     // escalation earned by a PREVIOUS photo's ambiguous loop must not carry
     // over and immediately put this new one into strict bare-word mode.
     if (name == 'capture_photo') _photoDecisionAmbiguousStreak = 0;
 
-    // P0 TRUST FIX — the ONE place a genuine photo-action success is
-    // recorded for [_auditGeminiCompletionClaim]. Reached from both the
-    // deterministic trigger path ([_executeDeterministic]) and a genuine
-    // server-sent toolCall ([_handleToolCall]), and only past every
+    // awaitingPhotoDescription: entered on a genuine keep, carrying THAT
+    // photo's kept id — the photo is uploaded only once the note question
+    // is answered; any other camera action means the technician has moved
+    // on (which uploads a still-waiting kept photo, no note).
+    if (name == 'confirm_photo_upload') {
+      _enterPhotoNote(keptId: responsePayload['kept_id'] as int?, jobId: responsePayload['job_id'] as String?);
+    } else {
+      _exitPhotoNote('"$name" succeeded — technician moved on', outcome: 'superseded');
+    }
+
+    final nextTask = switch (name) {
+      'open_camera' || 'retake_photo' => _ScreenTask.cameraLive,
+      'capture_photo' => _ScreenTask.cameraCaptured,
+      // confirm_photo_upload ("keep"): the photo preview stays up, camera
+      // held, for the whole note question — [_finishKeptPhotoPreview] moves
+      // on once it's done. Straight back to pure conversation only if the
+      // note flow couldn't start.
+      _ => _keptPhotoPreviewFile != null ? _ScreenTask.cameraCaptured : _ScreenTask.none,
+    };
+
+    // P0 TRUST FIX — where a genuine photo-action success is recorded for
+    // [_auditGeminiCompletionClaim]. Reached from both the deterministic
+    // trigger path ([_executeDeterministic]) and a genuine server-sent
+    // toolCall ([_handleToolCall]), and only past every
     // rejected_overlap/timeout/error early-return above it — so "we got
-    // here" is exactly "this function really did what it says".
-    _recordPhotoActionSuccess(name);
+    // here" is exactly "this function really did what it says". Except
+    // confirm_photo_upload: "keep" uploads nothing yet, so completed-upload
+    // phrasing is licensed only when the real upload finishes (see
+    // [_recordKeptPhotoUploaded]).
+    if (name != 'confirm_photo_upload') _recordPhotoActionSuccess(name);
 
     // P2 — the ACTION gate (see [_cameraOpenConfirmed]). Only a genuine
     // open_camera/retake_photo SUCCESS arms capture; confirm_photo_upload
@@ -8380,12 +10095,17 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _log_('screen task: "$name" succeeded -> $nextTask');
     if (mounted) setState(() => _screenTask = nextTask);
     _pausedVoiceService?.setScreenTaskActive(nextTask != _ScreenTask.none);
-    if (name == 'confirm_photo_upload') {
-      // Photo saved: the flow is done and the technician is back on the job
-      // (screen task -> none). Release the camera hardware too — confirm used
-      // to leave it open behind the conversation view, holding the camera
-      // (the next open_camera reopens it cleanly; retake, by contrast, keeps
-      // it open on purpose).
+    if (name == 'confirm_photo_upload' && nextTask == _ScreenTask.cameraCaptured) {
+      _log_(
+        'PHOTO CONFIRM: keep — staying on the photo preview with the camera held until the photo-note question '
+        'is finished (see _finishKeptPhotoPreview)',
+      );
+    } else if (name == 'confirm_photo_upload') {
+      // The note flow couldn't start: back on the job (screen task -> none).
+      // Release the camera hardware too — confirm used to leave it open
+      // behind the conversation view, holding the camera (the next
+      // open_camera reopens it cleanly; retake, by contrast, keeps it open on
+      // purpose).
       _log_(
         'PHOTO CONFIRM: navigated to job details (photo view dismissed -> $_screenTask; the ambient overlay '
         'returns to the conversation over the job screen) — releasing camera',
@@ -9526,6 +11246,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// never silently eat the one turn that should have played, which is
   /// what [_currentResponseTurnId]'s per-chunk tagging now guarantees.
   void _informGeminiToSpeakVerbatim(String text, {required String reason, bool isFiller = false}) {
+    if (_sessionClosing) {
+      _pipelineLog('reply_requested', 'reason=$reason — NOT SENT: session is closing (left job scope) text="$text"');
+      return;
+    }
     final channel = _channel;
     _pipelineLog(
       'reply_requested',
@@ -10116,6 +11840,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     });
     _screenTask = _ScreenTask.none;
     _cameraOpenConfirmed = false;
+    _exitPhotoNote('voice session ended', outcome: 'session_ended');
+    // The exit above already started its own photo's upload; anything else
+    // still kept-but-not-uploaded is never lost to the session ending.
+    for (final keptId in _cameraSession.keptPhotoIdsAwaitingUpload) {
+      unawaited(_uploadKeptPhotoSilently(keptId, why: 'voice session ended'));
+    }
+    _stopOutgoingAudioSummary();
+    unawaited(VoiceSessionPower.stopForegroundSession());
     _silenceTimer?.cancel();
     _silenceTimer = null;
     _speechStuckWatchdogTimer?.cancel();
@@ -10445,12 +12177,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// [_ScreenTask.cameraCaptured] — the exact same `Scaffold` shape this
   /// screen used for ALL of ambient mode before this fix, now scoped to
   /// only the moments there's real content that needs a solid background.
-  /// The close button is the tap-fallback for "Loop Off"/"FieldLoop stop",
-  /// matching this app's voice+tap parity convention everywhere else.
+  /// No close button: technicians kept hitting it by accident while using
+  /// the camera, ending the whole voice session. A session ends by voice
+  /// ("Loop Off"/"FieldLoop stop"), end_session, or the inactivity timeout.
   Widget _buildAmbientScreenTaskUi(BuildContext context) {
-    final canEnd = _phase == _TestPhase.connecting ||
-        _phase == _TestPhase.connected ||
-        _phase == _TestPhase.requestingToken;
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
@@ -10467,11 +12197,6 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           // screen (Photo Capture, Photo Preview, ...) already uses for the
           // same purpose.
           const Padding(padding: EdgeInsets.only(right: 14), child: Center(child: VoicePhaseIndicator())),
-          IconButton(
-            icon: const Icon(Icons.close_rounded),
-            tooltip: 'End session',
-            onPressed: canEnd ? _stopTest : null,
-          ),
         ],
       ),
       body: SafeArea(child: _buildCameraTaskBody()),
@@ -10491,7 +12216,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// whatever screen was open when the wake word was heard for the ENTIRE
   /// conversation). Now paints ONLY a small corner status cluster — the
   /// same [VoicePhaseIndicator] pill every other job-scoped screen's AppBar
-  /// already uses, plus the "End session" tap-fallback next to it — and
+  /// already uses (the "End session" X that sat next to it is gone — see
+  /// [_buildAmbientScreenTaskUi]) — and
   /// leaves every other point on screen unpainted, so hit-testing falls
   /// straight through to whatever's genuinely underneath (this screen is
   /// inserted via a raw `OverlayEntry`, not a `Navigator` route — see
@@ -10510,9 +12236,6 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// this is simpler to reason about alongside the explicit `Positioned`
   /// placement below.
   Widget _buildAmbientPureConversationUi(BuildContext context) {
-    final canEnd = _phase == _TestPhase.connecting ||
-        _phase == _TestPhase.connected ||
-        _phase == _TestPhase.requestingToken;
     final topInset = MediaQuery.of(context).padding.top;
 
     return Stack(
@@ -10535,13 +12258,6 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   const Padding(padding: EdgeInsets.symmetric(horizontal: 4), child: VoicePhaseIndicator()),
-                  IconButton(
-                    icon: const Icon(Icons.close_rounded, size: 18),
-                    tooltip: 'End session',
-                    onPressed: canEnd ? _stopTest : null,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                  ),
                 ],
               ),
             ),
@@ -10636,7 +12352,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return _buildCameraStatusSurface(caption: 'Closing the camera…', spinnerColor: AppColors.amber);
     }
     if (_screenTask == _ScreenTask.cameraCaptured) {
-      final capturedFile = _cameraSession.capturedFile;
+      // A kept photo stays on screen through the photo-note question — see
+      // [_keptPhotoPreviewFile].
+      final capturedFile = _cameraSession.capturedFile ?? _keptPhotoPreviewFile;
       if (capturedFile == null) {
         // Defensive only â€” _screenTask is only ever set to cameraCaptured
         // right after a successful capture_photo, which always leaves a

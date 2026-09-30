@@ -144,6 +144,13 @@ class _TimelineTile extends StatelessWidget {
                   ),
                   const SizedBox(height: 2),
                   Text(_formatTime(entry.timestamp), style: AppText.bodyMuted.copyWith(fontSize: 12.5)),
+                  if (photo?.hasNote ?? false) ...[
+                    const SizedBox(height: AppSpacing.xxs),
+                    Text(
+                      '“${photo!.transcript!.trim()}”',
+                      style: AppText.body.copyWith(fontSize: 13, fontStyle: FontStyle.italic),
+                    ),
+                  ],
                   if (entry.isVoided) ...[
                     const SizedBox(height: AppSpacing.xxs),
                     Text(

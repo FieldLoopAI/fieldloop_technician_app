@@ -41,6 +41,13 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // Same shrinking the Flutter Gradle plugin applies to release by
+            // default — made explicit so the keep rules in
+            // proguard-rules.pro are visibly part of the release config
+            // (they protect the audio/camera plugins; see that file).
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 }
