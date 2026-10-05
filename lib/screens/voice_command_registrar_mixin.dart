@@ -36,6 +36,14 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
   /// before the screen was covered.
   List<VoiceCommand> buildVoiceCommands();
 
+  /// Whether an utterance nothing else matched may fall back to the
+  /// knowledge base while this screen is active. Registered alongside this
+  /// screen's command set (see [VoiceCommandRegistry.setActiveScreen]).
+  /// `false` by default — only Job Detail overrides it to `true`; every
+  /// other screen (camera, photo preview, invoice, change orders, estimate,
+  /// job history, ...) gets a clarification question instead.
+  bool get kbFallbackEnabled => false;
+
   @override
   void initState() {
     super.initState();
@@ -93,6 +101,7 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
       safeWrite(() {
         debugPrint('VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: $T register APPLYING [${ids.join(', ')}]');
         _registeredCommandIds = ids;
+        _voiceRegistry.setActiveScreen('$T', kbFallbackEnabled: kbFallbackEnabled);
         _voiceRegistry.registerAll(commands);
       });
     });
@@ -101,6 +110,10 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
   void _unregisterCommands() {
     debugPrint('VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: $T unregister TRIGGERED (didPushNext/didPop/dispose)');
     _registrationGeneration++;
+    // Before the empty-ids early return: a screen whose command list is
+    // empty (e.g. Job Detail for a completed job) still recorded itself as
+    // the active screen when it registered.
+    _voiceRegistry.clearActiveScreen('$T');
     if (_registeredCommandIds.isEmpty) return;
     final ids = _registeredCommandIds;
     _registeredCommandIds = const [];

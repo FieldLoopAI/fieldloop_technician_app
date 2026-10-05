@@ -88,6 +88,33 @@ class VoiceCommandRegistry extends StateNotifier<Map<String, VoiceCommand>> {
     }
   }
 
+  /// Per-screen voice policy, registered alongside each screen's command
+  /// set by `VoiceCommandRegistrarMixin` (see its `kbFallbackEnabled`):
+  /// which registrar screen is currently the active one, and whether an
+  /// utterance nothing else matched may fall back to the knowledge base
+  /// there (Job Detail only) or must get a clarification question instead.
+  /// Plain fields, not part of [state] — a policy change never needs to
+  /// rebuild anything; the Gemini session reads it at routing time.
+  String? _activeScreen;
+  bool _activeScreenKbFallbackEnabled = false;
+
+  String? get activeScreen => _activeScreen;
+  bool get activeScreenKbFallbackEnabled => _activeScreenKbFallbackEnabled;
+
+  void setActiveScreen(String screen, {required bool kbFallbackEnabled}) {
+    _activeScreen = screen;
+    _activeScreenKbFallbackEnabled = kbFallbackEnabled;
+  }
+
+  /// Only clears if [screen] is still the one recorded — a newer screen's
+  /// registration that already landed must not be wiped by an older
+  /// screen's late unregister.
+  void clearActiveScreen(String screen) {
+    if (_activeScreen != screen) return;
+    _activeScreen = null;
+    _activeScreenKbFallbackEnabled = false;
+  }
+
   void registerAll(Iterable<VoiceCommand> commands) {
     if (!mounted) return;
     final next = Map<String, VoiceCommand>.of(state);

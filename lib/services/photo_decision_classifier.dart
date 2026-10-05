@@ -1,4 +1,4 @@
-import 'trigger_phrase_matcher.dart' show matchTriggerPhrase;
+import 'trigger_phrase_matcher.dart' show clauseBoundariesBefore, matchTriggerPhrase;
 
 /// Classifies a technician's utterance, while a captured photo awaits a
 /// keep/retake decision, as [confirm], [retake], [ambiguous], or [none] —
@@ -260,8 +260,16 @@ PhotoDecision classifyPhotoDecision(String text) {
   if (_takeItKeepUtterances.contains(whole)) return PhotoDecision.confirm;
   if (_takeItAmbiguousUtterances.contains(whole)) return PhotoDecision.ambiguous;
 
+  // Negation doesn't reach across punctuation: "No, keep it." answers a
+  // "retake?" with "no" and then says keep — it is NOT "no keep it" (which
+  // inverts to retake). Without this the comma was invisible and that
+  // answer scored as RETAKE, discarding the photo the technician wanted.
+  // The bare "No" still counts as retake evidence on its own, so that
+  // phrasing now comes out ambiguous and is asked about, never guessed.
+  final boundaries = clauseBoundariesBefore(text);
   bool negatedBefore(int index) {
     for (var back = 1; back <= 2 && index - back >= 0; back++) {
+      if (index - back + 1 < boundaries.length && boundaries[index - back + 1]) return false;
       final w = words[index - back];
       if (_photoDecisionNegationWords.contains(w)) return true;
       if (w == 't' && index - back - 1 >= 0 && _negationStems.contains(words[index - back - 1])) return true;

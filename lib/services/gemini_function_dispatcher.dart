@@ -1339,9 +1339,15 @@ Future<Map<String, dynamic>> _getKbAnswer({required String question, String? job
   // whether any dispatch-side delay exists above the network call itself,
   // as distinct from the network/Lambda-side span that function times.
   debugPrint('KB TIMING [get_kb_answer]: dispatcher_entry at ${DateTime.now()} question="$question"');
-  final answer = await fetchTroubleshootingAnswer(question: question, jobId: jobId);
+  final answer = await fetchTroubleshootingAnswer(question: question, jobId: jobId, timeout: kbAnswerRequestTimeout);
   return {'answer': answer};
 }
+
+/// Bound on the voice `get_kb_answer` HTTP call — a real connectivity
+/// failure (a7d30b48 log: `Failed host lookup` after 20s of silence) now
+/// surfaces as a `TimeoutException` within this, and the voice layer
+/// speaks an explicit "couldn't reach the knowledge base" line.
+const Duration kbAnswerRequestTimeout = Duration(seconds: 8);
 
 /// `get_last_photo` — fetches this job's photos via the SAME `/photos/
 /// for-job` request `JobPhotosController._fetchUploaded` already makes
@@ -1443,7 +1449,15 @@ bool _pushUnlessAlreadyOnTop(GeminiNavigationSession session, String name, Widge
 /// ever counts pushes THIS class itself made via [push], so `go_back`
 /// reliably unwinds exactly what Gemini's own navigation put on the stack.
 class GeminiNavigationSession {
-  GeminiNavigationSession({this.onActiveChanged});
+  GeminiNavigationSession({this.onActiveChanged, this.isCameraFlowActive});
+
+  /// While this returns `true`, the camera is the foreground screen (its
+  /// own host route sits on top of every screen [push] tracked), so
+  /// [goBack] leaves the navigator alone and reports "nothing to pop" — the
+  /// caller's camera close-out is what going back means then. Popping here
+  /// used to remove the screen UNDER the camera (e.g. Invoice) and leave the
+  /// camera running on top of whatever was left.
+  final bool Function()? isCameraFlowActive;
 
   /// Fires on the 0->1 and 1->0 edges of [_pushed]'s length (never for
   /// e.g. a second push while one is already active) — `true` means "a
@@ -1529,11 +1543,37 @@ class GeminiNavigationSession {
   /// remains on top) — the caller decides what, if anything, to tell them.
   bool goBack() {
     if (_pushed.isEmpty) return false;
+    if (isCameraFlowActive?.call() ?? false) return false;
     final navigator = rootNavigatorKey.currentState;
     if (navigator == null || !navigator.canPop()) return false;
     navigator.pop();
     _remove(_pushed.last);
     return true;
+  }
+
+  /// "Go to Job Details" — unlike [goBack] (one screen back, whatever that
+  /// is), always ends on Job Details: pops every route above
+  /// [jobDetailRoute] with the same standard `Navigator` pop the back arrow
+  /// uses, whether those screens were opened by voice or by tapping (each
+  /// voice-pushed entry still leaves [_pushed] through its own `.then`).
+  /// Without a recorded Job Detail route, falls back to repeating [goBack]
+  /// until nothing this session pushed is left. [goBack] itself is
+  /// untouched. Returns `navigated_to_job_details`, `already_at_job_details`,
+  /// `camera_active` (the caller closes the camera first) or `no_navigator`.
+  String goToJobDetails({ModalRoute<Object?>? jobDetailRoute}) {
+    if (isCameraFlowActive?.call() ?? false) return 'camera_active';
+    final navigator = rootNavigatorKey.currentState;
+    if (navigator == null) return 'no_navigator';
+    if (jobDetailRoute != null && jobDetailRoute.isActive) {
+      if (jobDetailRoute.isCurrent) return 'already_at_job_details';
+      navigator.popUntil((route) => identical(route, jobDetailRoute));
+      return 'navigated_to_job_details';
+    }
+    var popped = false;
+    while (goBack()) {
+      popped = true;
+    }
+    return popped ? 'navigated_to_job_details' : 'already_at_job_details';
   }
 }
 

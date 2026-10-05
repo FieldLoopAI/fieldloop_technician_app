@@ -155,8 +155,28 @@ const double weakThreshold = 0.5;
 const double ambiguityMargin = 0.15;
 
 /// Lowercased, letters-only, filler-free word list.
-List<String> normalizeCommandWords(String text) =>
-    tokenizeTriggerText(text).where((w) => !commandFillerWords.contains(w)).toList();
+List<String> normalizeCommandWords(String text) => normalizeCommandWordsWithBoundaries(text).words;
+
+/// [normalizeCommandWords] plus, for each kept word, whether a clause
+/// boundary (punctuation — see `clauseBoundariesBefore`) separates it from
+/// the kept word before it. A dropped filler's boundary carries over to the
+/// next kept word, so "No, um, show the invoice" still has its comma
+/// between "no" and "show".
+({List<String> words, List<bool> boundaries}) normalizeCommandWordsWithBoundaries(String text) {
+  final tokens = tokenizeTriggerText(text);
+  final tokenBoundaries = clauseBoundariesBefore(text);
+  final words = <String>[];
+  final boundaries = <bool>[];
+  var pendingBoundary = false;
+  for (var i = 0; i < tokens.length; i++) {
+    pendingBoundary = pendingBoundary || (i < tokenBoundaries.length && tokenBoundaries[i]);
+    if (commandFillerWords.contains(tokens[i])) continue;
+    words.add(tokens[i]);
+    boundaries.add(words.length > 1 && pendingBoundary);
+    pendingBoundary = false;
+  }
+  return (words: words, boundaries: boundaries);
+}
 
 /// Sound-alike key: stem, then fold spellings that sound the same ("ph"/"f",
 /// "ck"/"k") and doubled letters, so "foto" and "photos" share a key.
@@ -209,12 +229,25 @@ int _findObject(List<String> words, List<String> object) {
   return -1;
 }
 
-bool _negatedBefore(List<String> words, int index) {
+/// Whether a negation word within three words before [index] negates it.
+/// With [boundaries] (see [normalizeCommandWordsWithBoundaries]) the look-back
+/// stops at a clause boundary: negation doesn't reach across punctuation, so
+/// "No, I want the invoice" and "Don't worry, show me the estimate" are
+/// requests — while "No, don't open the camera" still finds its "don't"
+/// inside the clause. 9948b4d log: the same leading-"No," veto the phrase
+/// matcher had (see `clauseBoundariesBefore`) existed here too, wider.
+bool _negatedBefore(List<String> words, int index, [List<bool>? boundaries]) {
   for (var i = index - 1; i >= 0 && i >= index - 3; i--) {
+    if (boundaries != null && i + 1 < boundaries.length && boundaries[i + 1]) return false;
     if (_negationWords.contains(words[i])) return true;
   }
   return false;
 }
+
+/// Whether [boundaries] cut a negation word off from [index] that the
+/// boundary-blind look-back would have read as negating it — for the log.
+bool _negationCutOffByBoundary(List<String> words, int index, List<bool> boundaries) =>
+    _negatedBefore(words, index) && !_negatedBefore(words, index, boundaries);
 
 /// Whether the utterance reads as a question — those only act on strong
 /// matches, so "what's the history of this unit" still goes to the KB.
@@ -236,8 +269,9 @@ class IntentScore {
   String get trigger => intent.trigger;
 }
 
-/// Scores one intent against already-normalized [words].
-IntentScore? scoreIntent(CommandIntent intent, List<String> words) {
+/// Scores one intent against already-normalized [words]. [boundaries] (see
+/// [normalizeCommandWordsWithBoundaries]) keeps negation inside its clause.
+IntentScore? scoreIntent(CommandIntent intent, List<String> words, {List<bool>? boundaries}) {
   if (words.any((w) => intent.vetoWords.any((v) => _sameWord(w, v)))) return null;
 
   int objectAt = -1;
@@ -251,7 +285,8 @@ IntentScore? scoreIntent(CommandIntent intent, List<String> words) {
     }
   }
   if (object == null) return null;
-  if (_negatedBefore(words, objectAt)) return null;
+  if (_negatedBefore(words, objectAt, boundaries)) return null;
+  var cutOff = boundaries != null && _negationCutOffByBoundary(words, objectAt, boundaries);
 
   final heardObject = words.sublist(objectAt, objectAt + object.length).join(' ');
   final objectNote = heardObject == object.join(' ') ? '"$heardObject"' : '"$heardObject"~"${object.join(' ')}"';
@@ -260,8 +295,14 @@ IntentScore? scoreIntent(CommandIntent intent, List<String> words) {
     if (i >= objectAt && i < objectAt + object.length) continue;
     final action = intent.actions.where((a) => _sameWord(words[i], a)).firstOrNull;
     if (action == null) continue;
-    if (_negatedBefore(words, i)) return null;
-    return IntentScore(intent, _actionPlusObject, 'action "${words[i]}" + object $objectNote');
+    if (_negatedBefore(words, i, boundaries)) return null;
+    cutOff = cutOff || (boundaries != null && _negationCutOffByBoundary(words, i, boundaries));
+    return IntentScore(
+      intent,
+      _actionPlusObject,
+      'action "${words[i]}" + object $objectNote'
+      '${cutOff ? '; NEGATION PREFIX IGNORED — the negation word before it is in an earlier clause' : ''}',
+    );
   }
 
   final content = [
@@ -355,11 +396,12 @@ class IntentDecision {
 
 /// Decides what [transcript] most likely means among [intents].
 IntentDecision classifyCommandIntent(String transcript, {List<CommandIntent> intents = defaultCommandIntents}) {
-  final words = normalizeCommandWords(transcript);
+  final normalized = normalizeCommandWordsWithBoundaries(transcript);
+  final words = normalized.words;
   if (words.isEmpty) return const IntentDecision(IntentDecisionKind.none);
 
   final scores = [
-    for (final intent in intents) ?scoreIntent(intent, words),
+    for (final intent in intents) ?scoreIntent(intent, words, boundaries: normalized.boundaries),
   ]..sort((a, b) => b.confidence.compareTo(a.confidence));
   if (scores.isEmpty) return const IntentDecision(IntentDecisionKind.none);
 

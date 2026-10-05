@@ -653,7 +653,12 @@ Future<void> _handleTroubleshoot(WidgetRef ref, String jobId, String question) a
 /// generic search — every existing caller (this file) always sends it, but
 /// it's optional here since the Lambda itself falls back to
 /// 'general_contractor' when it's omitted.
-Future<String> fetchTroubleshootingAnswer({required String question, String? jobId}) async {
+///
+/// [timeout], when given, bounds the HTTP round trip — a `TimeoutException`
+/// is thrown past it (the Gemini `get_kb_answer` path passes one; a DNS
+/// failure otherwise took ~20s to surface — a7d30b48 log). `null` keeps the
+/// original unbounded behavior for the other caller.
+Future<String> fetchTroubleshootingAnswer({required String question, String? jobId, Duration? timeout}) async {
   // ISSUE 3(a) (CRITICAL, CONFIRMED via f5a8bd8b-flutter_run_log.txt: this
   // round trip took 17.7s end to end for "who is the president of India?",
   // and has been "flagged as slow before" without ever being root-caused).
@@ -676,11 +681,12 @@ Future<String> fetchTroubleshootingAnswer({required String question, String? job
     'KB TIMING [get_kb_answer]: request_sent at ${DateTime.now()} (${callStopwatch.elapsedMilliseconds}ms since '
     'fetchTroubleshootingAnswer entry) -> POST $apiBaseUrl/voice/troubleshoot',
   );
-  final response = await http.post(
+  final request = http.post(
     Uri.parse('$apiBaseUrl/voice/troubleshoot'),
     headers: {'Authorization': 'Bearer $accessToken', 'Content-Type': 'application/json'},
     body: jsonEncode({'question': question, 'jobId': jobId}),
   );
+  final response = timeout == null ? await request : await request.timeout(timeout);
   debugPrint(
     'KB TIMING [get_kb_answer]: response_received at ${DateTime.now()} — network round trip took '
     '${callStopwatch.elapsedMilliseconds}ms (status=${response.statusCode}); this span is network + Lambda '

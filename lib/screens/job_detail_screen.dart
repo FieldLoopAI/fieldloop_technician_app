@@ -30,6 +30,7 @@ import '../providers/visit_provider.dart';
 import '../providers/visit_tracking_service.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
+import '../routing/job_detail_route.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../theme/design_tokens.dart';
@@ -270,8 +271,23 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
     });
   }
 
+  /// This screen's own route, recorded for the voice "go to Job Details"
+  /// command (see `job_detail_route.dart`).
+  ModalRoute<Object?>? _jobDetailRoute;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route != null && !identical(route, _jobDetailRoute)) {
+      _jobDetailRoute = route;
+      setActiveJobDetailRoute(route);
+    }
+  }
+
   @override
   void dispose() {
+    clearActiveJobDetailRoute(_jobDetailRoute);
     _disposed = true;
     _ticker?.cancel();
     _positionSub?.cancel();
@@ -315,6 +331,11 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen>
   /// active/visible screen (handled by `VoiceCommandRegistrarMixin`) AND
   /// the job is still in an active status — see [_voiceEligible]. A job
   /// pulled up from History registers nothing here.
+  /// Job Detail is the only screen where an unmatched utterance may fall
+  /// back to the knowledge base — see `VoiceCommandRegistrarMixin.kbFallbackEnabled`.
+  @override
+  bool get kbFallbackEnabled => true;
+
   @override
   List<VoiceCommand> buildVoiceCommands() {
     if (!_voiceEligible) return const [];

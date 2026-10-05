@@ -135,23 +135,51 @@ class GeminiTokenCache {
     _startFetch();
   }
 
-  Future<String> take() async {
+  /// [wakeAt] (the wake word that started this session, if any) is only
+  /// logged: one `GEMINI TOKEN: wakeAt=… takenAt=… gapMs=… source=…` line
+  /// per take, plus a `readyAt` line when the token had to be waited for.
+  Future<String> take({DateTime? wakeAt}) async {
+    final takenAt = _now();
     final spare = _spare;
     _spare = null;
     _refreshTimer?.cancel();
     _refreshTimer = null;
     if (_isUsable(spare)) {
       debugPrint('GEMINI TOKEN: using pre-fetched token (${_secondsLeft(spare!)}s of start window left)');
+      _logTake(wakeAt, takenAt, 'spare');
       return spare.value;
     }
     final inFlight = _inFlight;
     if (inFlight != null && !_inFlightClaimed) {
       debugPrint('GEMINI TOKEN: no usable spare — joining the fetch already in flight');
       _inFlightClaimed = true;
-      return (await inFlight).value;
+      _logTake(wakeAt, takenAt, 'inflight');
+      final token = await inFlight;
+      _logReady(wakeAt, 'inflight');
+      return token.value;
     }
     debugPrint('GEMINI TOKEN: no usable spare — fetching on demand');
-    return (await _fetch()).value;
+    _logTake(wakeAt, takenAt, 'fetch');
+    final token = await _fetch();
+    _logReady(wakeAt, 'fetch');
+    return token.value;
+  }
+
+  static String _ts(DateTime t) => t.toIso8601String().substring(11, 23);
+
+  void _logTake(DateTime? wakeAt, DateTime takenAt, String source) {
+    debugPrint(
+      'GEMINI TOKEN: wakeAt=${wakeAt == null ? 'n/a' : _ts(wakeAt)} takenAt=${_ts(takenAt)} '
+      'gapMs=${wakeAt == null ? 'n/a' : takenAt.difference(wakeAt).inMilliseconds} source=$source',
+    );
+  }
+
+  void _logReady(DateTime? wakeAt, String source) {
+    final readyAt = _now();
+    debugPrint(
+      'GEMINI TOKEN: source=$source readyAt=${_ts(readyAt)} '
+      'wakeToReadyMs=${wakeAt == null ? 'n/a' : readyAt.difference(wakeAt).inMilliseconds}',
+    );
   }
 
   void _startFetch() {

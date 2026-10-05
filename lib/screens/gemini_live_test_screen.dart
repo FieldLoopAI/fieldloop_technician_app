@@ -20,21 +20,29 @@ import '../models/kept_photo_ref.dart';
 import '../providers/global_voice_service_provider.dart';
 import '../providers/job_photos_provider.dart';
 import '../providers/offline_upload_queue_provider.dart';
+import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
+import '../routing/app_navigator_key.dart';
+import '../routing/job_detail_route.dart';
 import '../services/command_intent_matcher.dart';
 import '../services/completion_claim_detector.dart';
+import '../services/continuation_answer.dart';
 import '../services/conversational_utterance.dart';
 import '../services/echo_override_policy.dart';
 import '../services/echo_sequence_matcher.dart';
 import '../services/gemini_function_dispatcher.dart';
+import '../services/navigation_destination.dart';
 import '../services/pending_call_fillers.dart';
 import '../services/photo_decision_classifier.dart';
 import '../services/photo_note_classifier.dart';
+import '../services/question_announcement.dart';
 import '../services/transliterated_greeting.dart';
 import '../services/voice_session_power.dart';
 import '../services/trigger_phrase_matcher.dart';
+import '../services/wake_greeting_clip.dart';
 import '../theme/app_theme.dart';
 import '../widgets/voice_phase_indicator.dart';
+import 'voice_command_registrar_mixin.dart';
 
 /// STANDALONE Day-1 connectivity proof for the Gemini Live API. Deliberately
 /// self-contained — its own `FlutterSoundRecorder`/`WebSocketChannel`/
@@ -92,8 +100,22 @@ class GeminiLiveTestScreen extends ConsumerStatefulWidget {
     this.ambient = false,
     this.onAmbientSessionEnded,
     this.tokenFuture,
+    this.wakeDetectedAt,
+    this.wakeGreeting,
     this.endRequest,
   });
+
+  /// When the wake word that started this session was recognized — the
+  /// reference point for the `VOICE LATENCY: wake-to-session-live` and
+  /// `WAKE GREETING` log lines. Null for the manual entry points.
+  final DateTime? wakeDetectedAt;
+
+  /// The saved greeting clip [GlobalVoiceService._triggerGeminiSession]
+  /// started playing the instant the wake word was heard (see
+  /// `wake_greeting_clip.dart`). While it's in play, mic audio passes
+  /// through [_GeminiLiveTestScreenState._greetingMicGate]. Null when no
+  /// clip was started — the session then greets exactly as before.
+  final WakeGreetingPlayback? wakeGreeting;
 
   /// Set (to a reason) by `GlobalVoiceService` when this session must end
   /// from OUTSIDE the conversation — the technician left the job (see
@@ -255,6 +277,16 @@ const int _outputSampleRateHz = 24000;
 /// re-evaluated before Day 2's function-calling work begins.
 const String _geminiModel = 'gemini-3.1-flash-live-preview';
 
+/// Server-side context sliding window (setup's `contextWindowCompression`):
+/// once the session context reaches [_contextCompressionTriggerTokens], the
+/// server drops the oldest turns back down to about
+/// [_contextCompressionTargetTokens]; the system instruction and tools are
+/// never trimmed. Production values since the earlier compression test —
+/// tune here. Every turn's size against these is logged as `CONTEXT
+/// REFRESH` (see `_GeminiLiveTestScreenState._logContextSize`).
+const int _contextCompressionTriggerTokens = 6000;
+const int _contextCompressionTargetTokens = 3000;
+
 /// PART F item 1: the prebuilt Live voice to request via `speechConfig`
 /// in the setup message (see `_startTest`) — swap this one constant to
 /// try 'Kore'/'Leda' as alternates if 'Aoede' doesn't sound right on a
@@ -326,7 +358,9 @@ const String _systemInstruction =
     'hears them: opening the camera ("take a photo", "open the camera"), capturing ("take it", "ready", '
     '"capture it"), keeping or retaking a photo ("keep it", "save it", "retake", "try again"), answering the '
     'photo-note question (adding, confirming, or declining a note — "yes", "no", "skip", "save that", or the '
-    'note\'s own words), and navigation such as "go back", "take me back", or "go home". For any of these, do '
+    'note\'s own words), navigation such as "go back", "take me back", or "go home", opening or showing a '
+    'screen (the estimate, change orders, invoice, job history, job details, the last photo), and "which screen '
+    'am I on". For any of these, do '
     'NOT produce a conversational answer of your own — no acknowledgment, no follow-up question, no "anything '
     'else?", no explanation of what you can or cannot do. You may still call the matching function, but say '
     'nothing. The app speaks the result itself and then tells you the outcome in a message afterward; only '
@@ -417,7 +451,8 @@ const String _systemInstructionReminder =
     // CHANGE 2 — see the APP-HANDLED COMMANDS paragraph in
     // [_systemInstruction]; restated here, the true LAST text Gemini reads,
     // for the same reason as every other rule in this const.
-    'And for camera, photo, photo-note, and "go back" commands, never speak a reply of your own at all - the '
+    'And for camera, photo, photo-note, "go back", and open-or-show-a-screen commands, never speak a reply of your '
+    'own at all - the '
     'app handles those and tells you the outcome afterward (this overrides the check-in suggestion above for '
     'those commands). '
     'Never greet or announce yourself on your own - the app speaks the opening greeting itself.';
@@ -503,6 +538,10 @@ const String _systemInstructionReminder =
 /// own doc comment flags as having a known function-calling freeze bug —
 /// this tool set is exactly the Day 2 function-calling work that comment
 /// warned to re-evaluate the model choice before starting. Watch for it.
+/// GEMINI INTENT CHECK's classification function — see
+/// `_GeminiLiveTestScreenState._maybeStartGeminiIntentCheck`.
+const String _geminiIntentCheckFunctionName = 'classify_camera_intent';
+
 const List<Map<String, dynamic>> _geminiToolFunctionDeclarations = [
   {
     'name': 'open_camera',
@@ -762,6 +801,30 @@ const List<Map<String, dynamic>> _geminiToolFunctionDeclarations = [
       'required': ['job_id'],
     },
   },
+  // GEMINI INTENT CHECK — see
+  // [_GeminiLiveTestScreenState._maybeStartGeminiIntentCheck]. Local state only
+  // (answered in [_GeminiLiveTestScreenState._handleToolCall], never
+  // dispatched), and only ever called when the app explicitly asks.
+  {
+    'name': _geminiIntentCheckFunctionName,
+    'description':
+        'Classification step. ONLY call this when a message explicitly asks you to classify what the technician '
+        'said — never on your own. Reports whether it means they want the camera opened, a photo taken right '
+        'now, or neither.',
+    'behavior': 'NON_BLOCKING',
+    'parameters': {
+      'type': 'OBJECT',
+      'properties': {
+        'intent': {
+          'type': 'STRING',
+          'enum': ['open_camera', 'capture_photo', 'none'],
+          'description': 'open_camera, capture_photo, or none.',
+        },
+        'confidence': {'type': 'NUMBER', 'description': 'How sure you are, from 0.0 to 1.0.'},
+      },
+      'required': ['intent', 'confidence'],
+    },
+  },
   {
     'name': 'end_session',
     'description': 'Ends the current voice session — call this when the technician says "stop", "loop off", '
@@ -914,6 +977,19 @@ const Duration _getCurrentScreenDebounce = Duration(seconds: 5);
 /// predate this and are left exactly as proven-working rather than migrated
 /// here).
 ///
+/// `NEGATION PREFIX IGNORED` — a phrase matched although a "No,"/"Nope,"
+/// sits right in front of it, because punctuation marks that word as a
+/// reaction rather than a negation (see `clauseBoundariesBefore` in
+/// `trigger_phrase_matcher.dart`).
+void _logIgnoredNegationPrefix(String trigger, TriggerPhraseMatch match, String text) {
+  final prefix = match.ignoredNegationPrefix;
+  if (prefix == null) return;
+  debugPrint(
+    'NEGATION PREFIX IGNORED [$trigger]: leading "$prefix" is set off by punctuation — a reaction, not a negation '
+    'of "${match.phrase}" — matched in "$text"',
+  );
+}
+
 /// One instance per backstopped function, held in
 /// [_GeminiLiveTestScreenState._deterministicTriggers] and reset each
 /// silence->speech edge in [_GeminiLiveTestScreenState._trackSpeechLevel]
@@ -985,6 +1061,7 @@ class _TranscriptTrigger {
       if (!phraseMatch.exact) {
         debugPrint('FUZZY TRIGGER MATCH [$name]: ${phraseMatch.describe()} matched in "$text"');
       }
+      _logIgnoredNegationPrefix(name, phraseMatch, text);
       return true;
     }
     return extraMatcher?.call(stemmedPaddedTriggerText(text)) ?? false;
@@ -1131,6 +1208,21 @@ const List<String> _cameraActionIntentWords = [
 /// `' tak a pictur '` and must still find noun="picture" + action="take".
 /// The `excludeIfContains` veto gets the same treatment, so "the last
 /// pictures" still vetoes on `last` exactly as before.
+/// Statement-of-fact wording that turns a bare "`<noun>` screen" mention into
+/// a remark about where the technician already is ("we're still on the
+/// invoice screen", "no, this is the estimate page") rather than a request
+/// to go there. Only consulted when NO request verb matched.
+const List<String> _declarativeScreenMarkers = [
+  'we are', 'we re', 'i am', 'i m', 'it is', 'it s', 'this is', 'that is', 'that s', 'they are', 'you are',
+  'you re', 'still', 'already', 'no', 'not',
+];
+
+/// The most recent bare screen mention [_looksLikeNounPlusActionIntent]
+/// rejected as declarative — lets the CLARIFY FALLBACK ask about that
+/// specific screen instead of a plain "say that again". Top-level because
+/// that matcher is.
+({String trigger, String paddedText, DateTime at})? lastLooseNavRejection;
+
 bool _looksLikeNounPlusActionIntent(
   String paddedText, {
   required List<String> nouns,
@@ -1162,6 +1254,25 @@ bool _looksLikeNounPlusActionIntent(
   // would silently stop matching now that [paddedText] arrives stemmed.
   if (paddedText.contains(' ${stemTriggerPhrase('screen')} ') ||
       paddedText.contains(' ${stemTriggerPhrase('page')} ')) {
+    // 367d62af log: "No, we are still on invoice screen" — a correction,
+    // not a request — navigated here on the bare screen reference alone.
+    // Naming a screen with no request verb only counts when the sentence
+    // isn't a statement about where they are; otherwise it's left to the
+    // clarification fallback (see [lastLooseNavRejection]).
+    final declarative = _declarativeScreenMarkers.firstWhere(
+      (marker) => paddedText.contains(' ${stemTriggerPhrase(marker)} '),
+      orElse: () => '',
+    );
+    if (declarative.isNotEmpty) {
+      debugPrint(
+        'LOOSE NAV REJECTED: trigger=${logLabel ?? '?'} reason=declarative_not_request text="${paddedText.trim()}" '
+        '(noun="$matchedNoun" + screen/page reference, but "$declarative" and no request verb)',
+      );
+      if (logLabel != null) {
+        lastLooseNavRejection = (trigger: logLabel, paddedText: paddedText, at: DateTime.now());
+      }
+      return false;
+    }
     debugPrint(
       'LOOSE NAV MATCH$label: noun="$matchedNoun" + bare screen/page reference matched in "$paddedText"',
     );
@@ -1483,8 +1594,13 @@ const List<String> _nonInformationalFillerPhrases = [
 /// for an utterance that never matched ANY known pattern at all — closer
 /// to genuinely off-topic ("who is the president of India") than to a
 /// real, on-topic trade question the KB just doesn't happen to cover.
-const String _kbCatchAllBoundaryDeclineText =
-    "I'm sorry, I can only help with things related to this job — I can't answer that.";
+///
+/// Replaced (KB GATE change): the KB fallback now only runs on Job Detail,
+/// and a true KB miss there — from the catch-all, the early phrase match,
+/// or a Gemini-initiated call alike — says plainly that the knowledge base
+/// has no answer, instead of the scope/boundary wording or the backend's
+/// own raw decline. Found answers are unaffected.
+const String _kbNoAnswerText = "I don't have an answer for that in the knowledge base.";
 
 /// P0 TRUST FIX (CONFIRMED, twice in ONE real session): Gemini's free-text
 /// response path narrated photo outcomes that never happened — "It's
@@ -1531,7 +1647,7 @@ const String _photoCompletionClaimCorrectionText =
 /// not something pattern-matching can fix). Spoken ONLY by
 /// [_GeminiLiveTestScreenState._maybeArmPreemptiveMuteSafetyTimeout]'s own
 /// safety-net timeout — deliberately DIFFERENT from
-/// [_kbCatchAllBoundaryDeclineText] (spoken when the KB catch-all genuinely
+/// [_kbNoAnswerText] (spoken when the KB catch-all genuinely
 /// ran and had nothing to say, e.g. a real off-topic question like "who is
 /// the president of India"): THIS case is "I couldn't even tell what you
 /// said," not "I understood you and it's out of scope," so it invites a
@@ -1632,7 +1748,7 @@ bool _isNonLatinScriptRune(int rune) {
 /// from "no match" without changing that shared, multi-caller function.
 /// FRAGILE, deliberately, not silently assumed robust: if either backend
 /// string ever changes, this stops recognizing a no-match and speaks the
-/// KB's own raw decline instead of [_kbCatchAllBoundaryDeclineText] — a
+/// KB's own raw decline instead of [_kbNoAnswerText] — a
 /// wording regression, not a crash.
 const List<String> _kbNoMatchLiteralAnswers = [
   'Sorry, that information is not available in the Knowledge Base.',
@@ -1793,7 +1909,7 @@ String _nextAcknowledgePresenceResponse() =>
 
 /// Natural-sounding replacement for a single fixed "didn't catch that" line —
 /// used ONLY when nothing could be routed (garbled/drifted transcription).
-/// Off-topic refusal ([_kbCatchAllBoundaryDeclineText]) is unchanged.
+/// Off-topic refusal ([_kbNoAnswerText]) is unchanged.
 const List<String> _unrecognizedUtteranceReplies = [
   "I heard you say something, but I'm not sure what you need — want me to show the estimate, change orders, or take a photo?",
   "Sorry, that didn't come through clearly. Could you say it again? I can show the estimate, change orders, or take a photo.",
@@ -2104,13 +2220,32 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// Silent by design — see [_cameraSpeculativelyPrewarming]'s doc
   /// comment: nothing about this should be visible to the technician
   /// unless/until they actually ask for the camera.
+  /// Measurement only — when the speculative controller.initialize() began
+  /// and settled, so every wake-greeting barge-in decision can say whether
+  /// the camera was initializing at that moment (see
+  /// [_cameraPrewarmStateAt]).
+  DateTime? _cameraPrewarmStartedAt;
+  DateTime? _cameraPrewarmSettledAt;
+
+  String _cameraPrewarmStateAt(DateTime at) {
+    final started = _cameraPrewarmStartedAt;
+    if (started == null || at.isBefore(started)) return 'camera prewarm not started';
+    final settled = _cameraPrewarmSettledAt;
+    if (settled == null || at.isBefore(settled)) {
+      return 'camera prewarm INITIALIZING (${at.difference(started).inMilliseconds}ms in)';
+    }
+    return 'camera prewarm settled ${at.difference(settled).inMilliseconds}ms earlier';
+  }
+
   void _maybePrewarmCameraController() {
     final jobId = widget.jobId;
     if (jobId == null) return; // Standalone mode has no job to attach a photo to.
     _cameraSpeculativelyPrewarming = true;
+    _cameraPrewarmStartedAt = DateTime.now();
     _log_('CAMERA PREWARM: starting the real controller.initialize() speculatively at session start (job $jobId) — silent until a real request arrives.');
     unawaited(
       _cameraSession.open(ref, jobId).then((_) {
+        _cameraPrewarmSettledAt = DateTime.now();
         if (!mounted || !_cameraSpeculativelyPrewarming) return;
         _log_(
           'CAMERA PREWARM: complete and sitting ready, unused — will auto-release in '
@@ -2128,6 +2263,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         // Already logged in detail by GeminiCameraSession's own open()
         // path and by [GeminiCameraSession.onOpenSettled] above — a failed
         // prewarm is harmless, a real request later just opens normally.
+        _cameraPrewarmSettledAt = DateTime.now();
         _log_('CAMERA PREWARM: failed ($e) — harmless, a real open_camera request will simply open it itself.');
       }),
     );
@@ -2191,6 +2327,22 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   bool _getCurrentScreenDetectionResolvedForCurrentUtterance = false;
   DateTime? _lastGetCurrentScreenActivityAt;
 
+  /// The "go to Job Details" destination trigger — see
+  /// [_maybeTriggerJobDetailsDestination]. The buffer deliberately survives
+  /// a generic go_back firing earlier in the same utterance ("Take me back"
+  /// | "to the job screen." in two chunks), so the destination can still be
+  /// read once the rest arrives; it resets per utterance.
+  String _jobDetailsDestinationBuffer = '';
+  bool _jobDetailsDestinationResolvedForCurrentUtterance = false;
+
+  /// At most one destination firing per utterance (reset only by a new
+  /// utterance, never by a success's buffer clear).
+  bool _jobDetailsDestinationFiredThisUtterance = false;
+
+  /// Whether the generic go_back fired for the current utterance — the one
+  /// commitment the destination trigger may still override.
+  bool _goBackFiredThisUtterance = false;
+
   /// PART A item 3: same accumulate/resolve/debounce shape as
   /// [_getCurrentScreenDetectionBuffer]/
   /// [_getCurrentScreenDetectionResolvedForCurrentUtterance]/
@@ -2249,7 +2401,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// resolution attempt, which can take up to ~13s) — so this 2s window
   /// only ever applies to the case NOTHING, not even the KB catch-all,
   /// found anything to do with the utterance at all. Speaks
-  /// [_unrecognizedUtteranceRetryText], not [_kbCatchAllBoundaryDeclineText]
+  /// [_unrecognizedUtteranceRetryText], not [_kbNoAnswerText]
   /// — see that constant's doc comment for why the two cases need different
   /// wording.
   Timer? _preemptiveDefaultMuteSafetyTimer;
@@ -2519,6 +2671,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // fire BOTH the canned greeting response AND a real (nonsensical)
       // KB lookup for the same utterance.
       _acknowledgePresenceResolvedForCurrentUtterance ||
+      _jobDetailsDestinationResolvedForCurrentUtterance ||
       _goBackTriggerResolvedForCurrentUtterance ||
       _photoDecisionResolvedForCurrentUtterance ||
       (_deterministicTriggers['view_change_orders']?.resolvedForCurrentUtterance ?? false) ||
@@ -2565,7 +2718,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       case 'get_job_details':
         return _getJobDetailsDetectionResolvedForCurrentUtterance;
       case 'go_back':
-        return _goBackTriggerResolvedForCurrentUtterance;
+        // A Gemini go_back for "take me to Job Details" is redundant with the
+        // destination trigger that already took them there.
+        return _goBackTriggerResolvedForCurrentUtterance || _jobDetailsDestinationFiredThisUtterance;
       case 'confirm_photo_upload':
       case 'retake_photo':
         return _photoDecisionResolvedForCurrentUtterance;
@@ -2924,7 +3079,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   @override
   void initState() {
     super.initState();
+    final wakeGreeting = widget.wakeGreeting;
+    if (wakeGreeting != null) unawaited(wakeGreeting.done.then(_onWakeGreetingDone));
     _navigationSession = GeminiNavigationSession(
+      isCameraFlowActive: () => _screenTask != _ScreenTask.none,
       onActiveChanged: (active) {
         if (!mounted) return;
         setState(() {
@@ -3573,8 +3731,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           // like the pre-compression baseline did (Test 4: 5039-6499 over
           // 12 turns, uncompressed).
           'contextWindowCompression': {
-            'triggerTokens': '6000',
-            'slidingWindow': {'targetTokens': '3000'},
+            'triggerTokens': '$_contextCompressionTriggerTokens',
+            'slidingWindow': {'targetTokens': '$_contextCompressionTargetTokens'},
           },
         },
       });
@@ -3611,7 +3769,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         'inputAudioTranscription.languageCodes=[en-US], inputAudioTranscription.customVocabulary.count='
         '${((jsonDecode(setupMessage) as Map<String, dynamic>)['setup']['inputAudioTranscription']?['customVocabulary'] as List?)?.length ?? 0}, '
         'outputAudioTranscription=enabled, '
-        'contextWindowCompression=trigger 6000/target 3000 tokens, '
+        'contextWindowCompression=trigger $_contextCompressionTriggerTokens/target $_contextCompressionTargetTokens tokens, '
         'systemInstruction.length=${_effectiveSystemInstruction.length} chars — see '
         '"GEMINI FULL SYSTEM INSTRUCTION BEING SENT" just above for the full text)',
       );
@@ -3799,6 +3957,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _startOutgoingAudioSummary();
     _flushPreSetupAudio();
 
+    // Module A measurement — one figure per wake word: from the wake word
+    // to this session taking live mic audio. Same "VOICE LATENCY: wake-to-"
+    // format as GlobalVoiceService._logLatency.
+    final wakeAt = widget.wakeDetectedAt;
+    if (wakeAt != null && !_wakeToSessionLiveLogged) {
+      _wakeToSessionLiveLogged = true;
+      debugPrint('VOICE LATENCY: wake-to-session-live: ${DateTime.now().difference(wakeAt).inMilliseconds}ms');
+    }
+
     // See [_speechMaxContinuousDuration]'s doc comment — armed for the whole
     // mic-streaming lifetime, cancelled in [_teardown] alongside [_silenceTimer].
     _speechStuckWatchdogTimer?.cancel();
@@ -3823,15 +3990,68 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// whose own greeting racing an app-triggered one is the double-greeting
   /// bug this codebase already had once (see [_interruptedTurnBaseline]).
   /// The system instruction tells Gemini never to greet on its own.
-  static const String _sessionGreetingText = "Hey, I'm here to help — what do you need?";
+  ///
+  /// Normally no longer spoken here at all: [GeminiLiveTestScreen.
+  /// wakeGreeting] already played Gemini's saved rendition of it the instant
+  /// the wake word was heard. Gemini is only asked for it when no clip
+  /// exists yet (or it failed to play), and that rendition is then saved as
+  /// the clip — see [_captureGreetingChunk].
+  static const String _sessionGreetingText = kWakeGreetingText;
 
   /// At most once per session: this screen (and so this flag) is created
   /// fresh for each wake-word session, and `setupComplete` — the only
   /// caller — arrives once per connection.
   bool _sessionGreetingHandled = false;
 
+  /// See [_startMicStreaming] — logged once per session.
+  bool _wakeToSessionLiveLogged = false;
+
+  // --- First-transcript timing (measurement only) ----------------------
+  //
+  // 1b059096 log: the session's FIRST turn spent 5059ms between speech end
+  // and its transcript, against ~0.7-3s for later turns. Whether that is
+  // the pre-setup audio burst (everything said before setupComplete is sent
+  // in one go — see [_flushPreSetupAudio]) or something else can't be told
+  // from the existing lines; this one line per session can.
+  DateTime? _setupCompleteAt;
+  int? _preSetupAudioFlushedMs;
+  bool _firstTranscriptTimingLogged = false;
+
+  void _maybeLogFirstTranscriptTiming() {
+    if (_firstTranscriptTimingLogged) return;
+    _firstTranscriptTimingLogged = true;
+    final now = DateTime.now();
+    final setupAt = _setupCompleteAt;
+    final wakeAt = widget.wakeDetectedAt;
+    final speechEnd = _latencySpeechEndAt ?? _speechStoppedAt;
+    _log_(
+      'FIRST TRANSCRIPT TIMING: ${setupAt == null ? 'setupComplete not seen' : '${now.difference(setupAt).inMilliseconds}ms after setupComplete'}, '
+      '${wakeAt == null ? '' : '${now.difference(wakeAt).inMilliseconds}ms after the wake word, '}'
+      'pre-setup audio flushed at setupComplete: ${_preSetupAudioFlushedMs ?? 0}ms, '
+      'speech end -> this transcript: ${speechEnd == null ? 'n/a (speech end not detected yet)' : '${now.difference(speechEnd).inMilliseconds}ms'}, '
+      'wake greeting: ${widget.wakeGreeting?.outcome?.name ?? (widget.wakeGreeting == null ? 'none' : 'still playing')}',
+    );
+  }
+
   void _maybeSpeakSessionGreeting() {
     if (!widget.ambient || _sessionGreetingHandled) return;
+    final clip = widget.wakeGreeting;
+    if (clip != null) {
+      if (clip.isActive && clip.startedAt == null) {
+        // Still loading — [_onWakeGreetingDone] calls back here if it turns
+        // out there's nothing to play.
+        _log_('SESSION GREETING: wake-word session ready — waiting on the local greeting clip');
+        return;
+      }
+      if (clip.replacesGeminiGreeting) {
+        _sessionGreetingHandled = true;
+        _log_(
+          'SESSION GREETING: wake-word session ready — the greeting was already handled locally at the wake word '
+          '(clip ${clip.outcome?.name ?? 'still playing'}) — not asking Gemini for it',
+        );
+        return;
+      }
+    }
     _sessionGreetingHandled = true;
     // "FieldLoop, take a photo" in one breath: the command is already
     // captured (and on its way to Gemini) — greeting over it would be a
@@ -3842,11 +4062,234 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
     _log_('SESSION GREETING: wake-word session ready — speaking the opening line');
     _informGeminiToSpeakVerbatim(_sessionGreetingText, reason: 'session_greeting');
+    if (_channel != null) {
+      // Recorded so the next wake word can play it instantly.
+      _greetingCapture = BytesBuilder(copy: false);
+      _greetingCaptureTurnId = _currentResponseTurnId;
+    }
+  }
+
+  /// Listens to [GeminiLiveTestScreen.wakeGreeting] — attached once in
+  /// [_startTest]. With no clip to play (none saved yet, or the player
+  /// failed) the session greets the old way, through Gemini, as soon as it
+  /// is ready; if it already is, that happens now.
+  void _onWakeGreetingDone(WakeGreetingOutcome outcome) {
+    if (!mounted || _sessionClosing) return;
+    if (outcome != WakeGreetingOutcome.unavailable && outcome != WakeGreetingOutcome.failed) return;
+    if (_setupComplete) _maybeSpeakSessionGreeting();
+  }
+
+  // --- Saving Gemini's greeting as the local clip ----------------------
+
+  /// Audio of the greeting turn as it actually played — non-null only while
+  /// Gemini is speaking the greeting because no clip was saved yet.
+  BytesBuilder? _greetingCapture;
+
+  /// [_currentResponseTurnId] when the greeting was requested — any later
+  /// interrupt bumps it, and the capture is abandoned.
+  int? _greetingCaptureTurnId;
+
+  /// Called with every response chunk right before it's queued for
+  /// playback — every mute/drop gate has already passed, so this is exactly
+  /// what the technician hears.
+  void _captureGreetingChunk(Uint8List pcmBytes) {
+    final capture = _greetingCapture;
+    if (capture == null) return;
+    if (_currentResponseTurnId != _greetingCaptureTurnId) {
+      _abandonGreetingCapture('a newer response superseded it');
+      return;
+    }
+    if (capture.isEmpty) {
+      final wakeAt = widget.wakeDetectedAt;
+      final spokenAt = DateTime.now();
+      if (wakeAt != null) {
+        debugPrint(
+          'WAKE GREETING: detectedAt=${wakeGreetingTs(wakeAt)} spokenAt=${wakeGreetingTs(spokenAt)} '
+          'elapsedMs=${spokenAt.difference(wakeAt).inMilliseconds} source=gemini (no saved clip yet — '
+          'recording this one)',
+        );
+      }
+    }
+    capture.add(pcmBytes);
+  }
+
+  /// At `turnComplete`, before the turn's text is reset: saves the captured
+  /// audio only if the turn's played transcript is exactly the greeting.
+  void _finishGreetingCapture() {
+    final capture = _greetingCapture;
+    if (capture == null || capture.isEmpty) return;
+    final transcript = _currentTurnAudiblyPlayedText;
+    final pcm = capture.takeBytes();
+    _greetingCapture = null;
+    _greetingCaptureTurnId = null;
+    if (!isCleanGreetingTranscript(transcript, greeting: _sessionGreetingText)) {
+      _log_('WAKE GREETING: not saving this turn as the clip — it played "$transcript", not the exact greeting');
+      return;
+    }
+    unawaited(wakeGreetingClips.save(_sessionGreetingText, pcm));
+  }
+
+  void _abandonGreetingCapture(String reason) {
+    if (_greetingCapture == null) return;
+    _greetingCapture = null;
+    _greetingCaptureTurnId = null;
+    _log_('WAKE GREETING: not saving the greeting as the clip ($reason)');
+  }
+
+  // --- Mic gate while the greeting clip is in play ---------------------
+
+  /// See [WakeGreetingMicGate]. Created on the first mic chunk of a session
+  /// started with a greeting clip; closed for good once the clip is over.
+  WakeGreetingMicGate? _greetingMicGate;
+  bool _greetingMicGateClosed = false;
+
+  /// Returns true when the gate took [chunk] (it's then held, dropped as the
+  /// clip's echo, or forwarded later in order); false once there's no
+  /// greeting clip in play and chunks go straight on.
+  bool _passThroughGreetingMicGate(Uint8List chunk) {
+    final greeting = widget.wakeGreeting;
+    if (greeting == null || _greetingMicGateClosed) return false;
+    final gate = _greetingMicGate ??= WakeGreetingMicGate();
+    final now = DateTime.now();
+    final outcome = greeting.outcome;
+
+    if (outcome != null && outcome != WakeGreetingOutcome.played) {
+      // Never played (or stopped for something other than speech, which the
+      // gate itself would have caught): everything held is the technician's.
+      gate.resolveUnused();
+      _closeGreetingMicGate('greeting clip ${outcome.name} — forwarding all held mic audio');
+      _routeMicChunk(chunk);
+      return true;
+    }
+    // A loud run still open when the clip ends is followed to its verdict:
+    // someone who talked over the greeting is still talking after it, and
+    // that is exactly what confirms them.
+    if (outcome == WakeGreetingOutcome.played &&
+        !gate.withinEchoTail(endedAt: greeting.endedAt!, at: now) &&
+        !gate.runInProgress) {
+      final held = gate.heldChunks;
+      gate.resolvePlayed(startedAt: greeting.startedAt);
+      _closeGreetingMicGate(
+        'greeting clip finished — dropped its echo from $held held chunk(s) '
+        '(mic during playback: peakRms=${gate.peakRms.toStringAsFixed(0)} avgRms=${gate.averageRms.toStringAsFixed(0)}, '
+        'barge-in level ${gate.bargeInRms.toStringAsFixed(0)})',
+      );
+      _routeMicChunk(chunk);
+      return true;
+    }
+
+    final clipAudible = greeting.clipAudibleAt(now);
+    final action = gate.add(chunk, now, Duration(milliseconds: _pcmBytesToMs(chunk.length)), clipAudible: clipAudible);
+    if (action == WakeGreetingMicAction.rejectedLoudRun) {
+      final run = gate.lastRejectedRun!;
+      final why = run.outsideEcho < gate.speechEvidence
+          ? 'only ${run.outsideEcho.inMilliseconds}ms of it fell outside the clip\'s own echo window (needs '
+                '${gate.speechEvidence.inMilliseconds}ms) — the clip\'s echo, not the technician'
+          : 'too short (${run.loud.inMilliseconds}ms loud, needs ${gate.bargeInSustain.inMilliseconds}ms) — a transient';
+      _log_(
+        'BARGE-IN REQUIRES SUSTAINED SPEECH: ignored a loud run from ${wakeGreetingTs(run.startedAt)} '
+        '(${run.loud.inMilliseconds}ms loud, peakRms=${run.peakRms.toStringAsFixed(0)}) — $why; greeting keeps playing '
+        '(${_cameraPrewarmStateAt(run.startedAt)})',
+      );
+    }
+    if (action == WakeGreetingMicAction.bargeIn) {
+      final onset = gate.bargeInOnset;
+      final interruptedMidClip = greeting.isActive;
+      greeting.stop(WakeGreetingOutcome.interrupted, 'technician speaking');
+      gate.resolveBargeIn(startedAt: greeting.startedAt);
+      _log_(
+        'WAKE GREETING INTERRUPT: technician still speaking (speech began ${onset == null ? '?' : wakeGreetingTs(onset)}, '
+        'mic peakRms=${gate.peakRms.toStringAsFixed(0)}, sustained and outside the clip\'s echo window; '
+        '${onset == null ? '' : _cameraPrewarmStateAt(onset)}) — '
+        '${interruptedMidClip ? 'greeting clip stopped' : 'greeting had already finished'}, their speech goes on to the '
+        'normal command pipeline',
+      );
+      if (interruptedMidClip) _armGreetingReplayCheck();
+      _closeGreetingMicGate('barge-in');
+    }
+    return true;
+  }
+
+  // --- Greeting replay safety net --------------------------------------
+  //
+  // ec736a7a log: a barge-in that wasn't speech left an empty utterance
+  // (final text=""), ~7s of "Thinking...", then Gemini's own unrequested
+  // "Hello!". If a barge-in's utterance turns out to have no words, the
+  // greeting is spoken again (through Gemini's voice — the mic is live by
+  // then, and that path pauses it during playback) instead of leaving the
+  // technician in dead air.
+
+  /// Armed by a mid-clip barge-in; disarmed by the first real transcript.
+  bool _greetingReplayArmed = false;
+  Timer? _greetingReplayTimer;
+
+  /// After the barge-in's utterance ends with no words, how long to still
+  /// wait for a late transcript before replaying. The norm in ec736a7a was
+  /// 1.3-1.8s from speech end to transcript.
+  static const Duration _greetingReplayWait = Duration(milliseconds: 2500);
+
+  void _armGreetingReplayCheck() {
+    _greetingReplayArmed = true;
+  }
+
+  /// Any real (non-echo) transcript chunk: the barge-in was the technician.
+  void _disarmGreetingReplay(String reason) {
+    if (!_greetingReplayArmed) return;
+    _greetingReplayArmed = false;
+    _greetingReplayTimer?.cancel();
+    _greetingReplayTimer = null;
+    _log_('GREETING REPLAY: not needed — $reason');
+  }
+
+  /// At an utterance end: if the barge-in's utterance produced no words,
+  /// start the short wait before replaying.
+  void _maybeScheduleGreetingReplay(String finalText) {
+    if (!_greetingReplayArmed || _greetingReplayTimer != null) return;
+    if (finalText.trim().isNotEmpty) {
+      _disarmGreetingReplay('the barge-in utterance had words ("$finalText")');
+      return;
+    }
+    _greetingReplayTimer = Timer(_greetingReplayWait, () {
+      _greetingReplayTimer = null;
+      if (!_greetingReplayArmed || !mounted || _sessionClosing) return;
+      _greetingReplayArmed = false;
+      if (_anyTriggerCommittedThisUtterance || _guardFailedReplySpokenThisUtterance || _inFlightFunctionCalls > 0) {
+        _log_('GREETING REPLAY: skipped — something already answered this utterance');
+        return;
+      }
+      _log_(
+        'GREETING REPLAY: the barge-in that stopped the greeting produced no words (empty transcript after '
+        '${_greetingReplayWait.inMilliseconds}ms) — it was not the technician; speaking the greeting again',
+      );
+      _stopAwaitingLateTranscript('greeting replay (barge-in was not speech)');
+      _sessionGreetingHandled = true;
+      _informGeminiToSpeakVerbatim(_sessionGreetingText, reason: 'session_greeting_replay');
+    });
+  }
+
+  /// Forwards whatever the gate released, oldest first, and lets every
+  /// later chunk go straight through.
+  void _closeGreetingMicGate(String reason) {
+    final gate = _greetingMicGate;
+    _greetingMicGateClosed = true;
+    if (gate == null) return;
+    final released = gate.takeReleased();
+    final releasedMs = released.fold<int>(0, (ms, c) => ms + _pcmBytesToMs(c.length));
+    _log_('WAKE GREETING: mic gate closed ($reason) — forwarding ${released.length} chunk(s) / ${releasedMs}ms');
+    for (final chunk in released) {
+      _routeMicChunk(chunk);
+    }
   }
 
   /// Every recorder chunk lands here: held in [_preSetupAudio] until the
-  /// session is ready, then passed straight to [_onMicChunk].
+  /// session is ready, then passed straight to [_onMicChunk] — after the
+  /// wake-greeting gate, while a greeting clip is in play.
   void _onRawMicChunk(Uint8List chunk) {
+    if (_passThroughGreetingMicGate(chunk)) return;
+    _routeMicChunk(chunk);
+  }
+
+  void _routeMicChunk(Uint8List chunk) {
     if (!_bufferingPreSetupAudio) {
       _onMicChunk(chunk);
       return;
@@ -3874,6 +4317,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
     _preSetupAudioBytes = 0;
     _bufferingPreSetupAudio = false;
+    _preSetupAudioFlushedMs ??= _pcmBytesToMs(bytes);
     _log_(
       'pre-setup mic audio sent: $chunks chunks / ${_pcmBytesToMs(bytes)}ms captured before the session was ready'
       '${_preSetupAudioDroppedBytes > 0 ? ' (oldest ${_pcmBytesToMs(_preSetupAudioDroppedBytes)}ms dropped over the 8s cap)' : ''}'
@@ -3910,6 +4354,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         debugPrint('MIC SEND [t=${DateTime.now().millisecondsSinceEpoch}]: STOPPED (outgoing audio paused) — no more realtimeInput sent to Gemini until resumed');
       }
       _outgoingHeldChunks++;
+      _diagChunksHeld++;
       return;
     }
     if (_micSendCurrentlyPaused) {
@@ -3924,6 +4369,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     });
     channel.sink.add(message);
     _audioChunksSent++;
+    _diagChunksSent++;
+    _diagBytesSent += chunk.length;
+    _diagRmsSum += _lastMicChunkRms;
+    _diagLastChunkBytes = chunk.length;
     if (_audioChunksSent == 1) {
       _log_('first audio chunk sent (${chunk.length} bytes)');
     }
@@ -4061,6 +4510,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _acknowledgePresenceResolvedForCurrentUtterance = false;
     _photoDecisionDetectionBuffer = '';
     _photoDecisionResolvedForCurrentUtterance = false;
+    _jobDetailsDestinationBuffer = '';
+    _jobDetailsDestinationResolvedForCurrentUtterance = false;
+    _jobDetailsDestinationFiredThisUtterance = false;
+    _goBackFiredThisUtterance = false;
     for (final trigger in _deterministicTriggers.values) {
       trigger.resetForNewUtterance();
     }
@@ -4706,6 +5159,21 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
               debugPrint('PHOTO TIMING [$name]: follow-up filler threshold (${followUp.delay.inSeconds}s) reached — still pending');
               _speakPendingCallFiller(name, followUp.text);
             });
+      // get_kb_answer — same filler config, but no hard-pause to pass
+      // through (the preemptive mute just yields to this scripted line, as
+      // to any other), so it's spoken directly rather than via
+      // [_speakPendingCallFiller]'s camera-only passthrough.
+      final kbFiller = name == 'get_kb_answer' ? pendingCallFillers['get_kb_answer'] : null;
+      if (name == 'get_kb_answer') _kbCallStartedAt = DateTime.now();
+      final kbFillerTimer = kbFiller == null
+          ? null
+          : Timer(kbFiller.delay, () {
+              debugPrint(
+                'PENDING CALL FILLER [get_kb_answer]: speaking "${kbFiller.text}" at ${DateTime.now()} '
+                '[${kbFiller.delay.inMilliseconds}ms threshold] — KB lookup still pending',
+              );
+              _informGeminiToSpeakVerbatim(kbFiller.text, reason: 'pending_call_filler[get_kb_answer]', isFiller: true);
+            });
       try {
         final passthroughResult = await dispatchGeminiFunctionCall(
           ref: ref,
@@ -4719,6 +5187,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       } finally {
         fillerTimer?.cancel();
         followUpTimer?.cancel();
+        kbFillerTimer?.cancel();
         if (needsAudioHardPause) {
           _cameraNativeCallInProgress = false;
           _syncVoicePhase();
@@ -4846,9 +5315,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     try {
       final text = raw is String ? raw : utf8.decode(raw as List<int>);
       final decoded = jsonDecode(text) as Map<String, dynamic>;
+      _noteServerMessageForDiagnostics(decoded);
 
       if (decoded.containsKey('setupComplete')) {
         _setupComplete = true;
+        _setupCompleteAt ??= DateTime.now();
         // Raw payload, not a fixed string — `setupComplete` is documented as
         // an otherwise-empty ack (BidiGenerateContentSetupComplete has no
         // fields), so an empty `{}` here is the EXPECTED confirmation the
@@ -4879,6 +5350,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         _log_('usageMetadata (informational, harmless — token usage for the turn): ${decoded['usageMetadata']}');
         final usageMetadata = decoded['usageMetadata'] as Map<String, dynamic>;
         debugPrint('TOKEN COUNT this turn: ${usageMetadata['totalTokenCount']}');
+        final promptTokens = (usageMetadata['promptTokenCount'] as num?)?.toInt();
+        if (promptTokens != null) _logContextSize(promptTokens);
       }
       if (decoded.containsKey('sessionResumptionUpdate')) {
         // P1 FIX — see [_logNoState]'s doc comment: fires roughly once a
@@ -4997,6 +5470,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         // can produce words no function call ever justified, so the only
         // reliable place to catch it is the output itself.
         _auditGeminiCompletionClaim(outputTranscriptionText);
+        // After the audit above, which accumulates [_currentTurnGeminiText].
+        _maybeResolveIntentCheckFromSpokenCall();
         // P0 FIX — see [_auditGeminiForLeakedInstructionWrapper]'s doc
         // comment. Placed right after the completion-claim audit, once
         // [_currentTurnGeminiText] has already been updated with this
@@ -5035,6 +5510,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
       if (serverContent['turnComplete'] == true) {
         _log_('model turn complete');
+        _dropRestOfSpokenIntentCheckTurn = false;
         _noteAudibleModelTurnEnded();
         _turnComplete = true;
         _flushPcmPrebuffer('turnComplete');
@@ -5043,10 +5519,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         _onTurnBoundaryWhileAwaitingScript(interrupted: false);
         _scriptedResponsePending = false;
         if (_fillerAudioStarted) _endFillerPassthrough('filler turn turnComplete');
+        _finishGreetingCapture();
         _logAndResetTurnShape('turnComplete');
       }
       if (serverContent['interrupted'] == true) {
         _log_('model turn interrupted');
+        _dropRestOfSpokenIntentCheckTurn = false;
         _noteAudibleModelTurnEnded();
         // Must run before [_logAndResetTurnShape] below clears this turn's
         // text — see [_recordInterruptedTurnBaseline].
@@ -5057,6 +5535,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         _clearDeterministicAudioSuppression('interrupted received');
         _onTurnBoundaryWhileAwaitingScript(interrupted: true);
         if (_fillerAudioStarted) _endFillerPassthrough('filler turn interrupted');
+        if (_greetingCapture?.isNotEmpty ?? false) _abandonGreetingCapture('the greeting turn was interrupted');
         _logAndResetTurnShape('interrupted');
       }
     } catch (e, stackTrace) {
@@ -5686,8 +6165,27 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   ({String text, DateTime at, int utteranceSeq, String script})? _interruptedTurnBaseline;
 
   void _recordInterruptedTurnBaseline() {
-    final partial = _currentTurnAudiblyPlayedText.trim();
-    if (partial.isEmpty) return;
+    final audible = _currentTurnAudiblyPlayedText.trim();
+    if (audible.isEmpty) return;
+    // a7d30b48 log: only the tail "that?" of an interrupted readback was
+    // audible, so the restart ("Got it — noted: …") scored 0% against it
+    // and played in full. When the audible part is not how the turn opened,
+    // compare against the turn's FULL transcript (muted head included) —
+    // a restart opens like that. Turns heard from their start keep using
+    // the audible partial exactly as before.
+    final full = _currentTurnGeminiText.trim();
+    List<String> wordsOf(String text) => _normalizeForEchoCompare(text).split(' ').where((w) => w.isNotEmpty).toList();
+    final audibleWords = wordsOf(audible);
+    final fullWords = wordsOf(full);
+    final audibleIsOpening = fullWords.length < audibleWords.length ||
+        List.generate(audibleWords.length, (i) => fullWords[i] == audibleWords[i]).every((same) => same);
+    final partial = audibleIsOpening ? audible : full;
+    if (!audibleIsOpening) {
+      _log_(
+        'DUPLICATE RESPONSE BASELINE: audible part "$audible" is a mid-turn tail — using the interrupted turn\'s full '
+        'transcript as the baseline instead.',
+      );
+    }
     _interruptedTurnBaseline = (
       text: partial,
       at: DateTime.now(),
@@ -5915,6 +6413,41 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           'name': name,
           'response': {'status': 'already_handled', 'job_id': args['job_id']},
         });
+        continue;
+      }
+
+      // KB GATE — Gemini deciding on its own to call get_kb_answer is held
+      // to the same per-screen rule as the app's own KB routing: never
+      // called off Job Detail. Nothing is spoken here; the app's own
+      // end-of-utterance routing for this same speech asks for
+      // clarification (see [_maybeFallBackToKbAnswerCatchAll]).
+      if (name == 'get_kb_answer' && !_kbGateAllows('gemini_toolcall')) {
+        _log_('toolCall: "get_kb_answer" (id=$id) SUPPRESSED — KB fallback is disabled on this screen.');
+        functionResponses.add({
+          'id': id,
+          'name': name,
+          'response': {'status': 'already_handled', 'job_id': args['job_id']},
+        });
+        continue;
+      }
+
+      // GEMINI INTENT CHECK — the classification this app asked for (see
+      // [_maybeStartGeminiIntentCheck]); local state only, never dispatched.
+      if (name == _geminiIntentCheckFunctionName) {
+        final intent = args['intent'] as String?;
+        final confidence = (args['confidence'] as num?)?.toDouble();
+        _log_('toolCall: "$name" (id=$id) — intent=$intent confidence=$confidence');
+        functionResponses.add({
+          'id': id,
+          'name': name,
+          'response': {'status': 'ok', 'scheduling': 'SILENT'},
+        });
+        _resolveGeminiIntentCheck(
+          checkId: args['check_id'] as String?,
+          intent: intent,
+          confidence: confidence,
+          source: 'toolCall',
+        );
         continue;
       }
 
@@ -6194,6 +6727,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   ///     without hand-rolling eight more near-identical detectors.
   void _onInputTranscription(String textChunk) {
     _pipelineLog('transcript_received', '"$textChunk" ($_utteranceStateSummary)');
+    _maybeLogFirstTranscriptTiming();
     // BUG 2 backstop (step 3): checked BEFORE the "inputTranscription
     // chunk:" log line and BEFORE any trigger sees this text at all — see
     // [_looksLikeGeminiEcho]'s doc comment for the thresholds and why they
@@ -6366,14 +6900,20 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // (and for every trigger evaluated later in the same chunk) a second
     // trigger could still fire.
     _pipelineLog('transcript_to_matchers', '"$textChunk"');
+    if (textChunk.trim().isNotEmpty) _disarmGreetingReplay('a transcript arrived ("${textChunk.trim()}")');
     final evaluators = _buildTriggerEvaluators(textChunk);
     final committedBefore = _anyTriggerCommittedThisUtterance;
-    for (final evaluate in evaluators.values) {
-      if (_anyTriggerCommittedThisUtterance) {
+    for (final entry in evaluators.entries) {
+      // The one exception to one-trigger-per-utterance: a generic go_back
+      // fired on an earlier chunk ("Take me back") may still be overridden
+      // by the destination the rest of the sentence names ("...to the job
+      // screen") — see [_maybeTriggerJobDetailsDestination].
+      final destinationOverride = entry.key == 'view_job_details' && _goBackFiredThisUtterance;
+      if (_anyTriggerCommittedThisUtterance && !destinationOverride) {
         debugPrint('DETERMINISTIC SKIP: utterance already committed to a trigger — not evaluating the rest');
         break;
       }
-      evaluate();
+      entry.value();
     }
     if (!committedBefore && _anyTriggerCommittedThisUtterance) _utteranceCommittedAt ??= DateTime.now();
     _pipelineLog(
@@ -6425,6 +6965,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// picked it.
   Map<String, void Function()> _buildTriggerEvaluators(String textChunk) {
     return <String, void Function()>{
+      // FIRST, ahead of go_back and get_job_details: an utterance that names
+      // Job Details as its destination ("take me back to the job screen")
+      // must never be absorbed by go_back's "take me back" (one screen back)
+      // or get_job_details' "job details" (read the summary). See
+      // `navigation_destination.dart`.
+      'view_job_details': () => _maybeTriggerJobDetailsDestination(textChunk),
       // PART D items 1-2: checked FIRST — a plain greeting/presence-check
       // ("can you hear me", "hello") resolves instantly via its own canned
       // response, same as it always has.
@@ -6641,12 +7187,22 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       'utterance_end',
       'final text="${_deterministicTriggers['get_kb_answer']!.buffer.trim()}" ($_utteranceStateSummary)',
     );
+    _maybeScheduleGreetingReplay(_deterministicTriggers['get_kb_answer']!.buffer);
     // awaitingPhotoDescription owns this utterance: none of the routing
     // below (KB, site_condition, intent layer, catch-all — the last of which
     // would also silently lift the preemptive mute) applies to a photo note.
     if (_photoNote != null && _photoNoteOwnsCurrentUtterance) {
       _finalizedCurrentUtterance = true;
       _onPhotoNoteUtteranceEnd();
+      return;
+    }
+    // QUESTION ANNOUNCEMENT — before the KB, the intent layer and the
+    // camera-intent check: "I have a question" is never a KB query or a
+    // camera command, so it neither waits on nor reaches any of them.
+    final heardSoFar = _deterministicTriggers['get_kb_answer']!.buffer.trim();
+    if (heardSoFar.isNotEmpty) _consumeQuestionAnnouncement();
+    if (_maybeHandleQuestionAnnouncement(heardSoFar)) {
+      _finalizedCurrentUtterance = true;
       return;
     }
     _maybeTriggerDeterministic(
@@ -6660,7 +7216,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // more specific trigger already owns this utterance instead of
       // double-answering (or wrongly declining a job-specific question the
       // KB was never going to have).
-      guard: () => !_otherSpecificTriggerAlreadyResolvedThisUtterance && !_guardFailedReplySpokenThisUtterance,
+      // KB GATE last, so it only logs once the phrase matched and nothing
+      // else owns the utterance. Blocked here, the utterance carries on to
+      // the intent layer and the catch-all below, which asks for
+      // clarification instead.
+      guard: () =>
+          !_otherSpecificTriggerAlreadyResolvedThisUtterance &&
+          !_guardFailedReplySpokenThisUtterance &&
+          _kbGateAllows('early_match'),
       buildArgs: (transcript, jobId) => {
         'question': transcript,
         'job_id': ?jobId,
@@ -6755,9 +7318,88 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// end-of-utterance routing re-runs on it.
   static const Duration _lateTranscriptSettle = Duration(milliseconds: 700);
 
+  // --- Transcript-wait diagnostics (measurement only) -------------------
+  //
+  // acbd952c (tablet) log: three utterances got NO transcript for the full
+  // 8s while healthy audio kept streaming and other utterances in the same
+  // session transcribed in <20ms. The capture path is identical on every
+  // device (pcm16 / 16kHz / mono / voice_communication, no per-device
+  // branch), so the open question is what the SERVER did with that audio.
+  // These lines answer it: a STALL check partway through and a full snapshot
+  // at the timeout — what was sent, what the server sent back (any model
+  // output? an `interrupted`? any message at all?), and the last
+  // clientContent we sent, so a stall can be correlated with it.
+
+  int _diagChunksSent = 0;
+  int _diagChunksHeld = 0;
+  int _diagBytesSent = 0;
+  double _diagRmsSum = 0;
+  int _diagLastChunkBytes = 0;
+  DateTime? _diagLastServerMessageAt;
+  DateTime? _diagLastModelOutputAt;
+  DateTime? _diagLastServerInterruptedAt;
+  DateTime? _diagLastTurnCompleteAt;
+  DateTime? _diagLastInputTranscriptionAt;
+  DateTime? _diagLastClientContentAt;
+  String _diagLastClientContentKind = 'none';
+
+  ({DateTime at, int sent, int held, int bytes, double rmsSum})? _transcriptWaitStart;
+  Timer? _transcriptStallTimer;
+  static const Duration _transcriptStallCheck = Duration(seconds: 4);
+
+  void _noteServerMessageForDiagnostics(Map<String, dynamic> decoded) {
+    final now = DateTime.now();
+    _diagLastServerMessageAt = now;
+    final content = decoded['serverContent'] as Map<String, dynamic>?;
+    if (content == null) return;
+    if (content['modelTurn'] != null || content['outputTranscription'] != null) _diagLastModelOutputAt = now;
+    if (content['interrupted'] == true) _diagLastServerInterruptedAt = now;
+    if (content['turnComplete'] == true) _diagLastTurnCompleteAt = now;
+    if (content['inputTranscription'] != null) _diagLastInputTranscriptionAt = now;
+  }
+
+  void _noteClientContentSent(String kind) {
+    _diagLastClientContentAt = DateTime.now();
+    _diagLastClientContentKind = kind;
+  }
+
+  String _transcriptWaitDiagnostics() {
+    final now = DateTime.now();
+    final start = _transcriptWaitStart;
+    String ago(DateTime? t) => t == null ? 'never' : '${now.difference(t).inMilliseconds}ms ago';
+    String sinceWait(DateTime? t) =>
+        t == null || start == null ? 'no' : (t.isAfter(start.at) ? 'YES (${now.difference(t).inMilliseconds}ms ago)' : 'no');
+    final sent = start == null ? 0 : _diagChunksSent - start.sent;
+    final held = start == null ? 0 : _diagChunksHeld - start.held;
+    final bytes = start == null ? 0 : _diagBytesSent - start.bytes;
+    final avgRms = sent == 0 || start == null ? 0 : (_diagRmsSum - start.rmsSum) / sent;
+    return 'audio format: pcm16 ${_inputSampleRateHz}Hz mono, audioSource=voice_communication, sent as '
+        'audio/pcm;rate=$_inputSampleRateHz, last chunk ${_diagLastChunkBytes}B (~${_pcmBytesToMs(_diagLastChunkBytes)}ms), '
+        'no format conversion; since speech end: $sent chunk(s) / ${_pcmBytesToMs(bytes)}ms sent (avg RMS '
+        '${avgRms.toStringAsFixed(0)}), $held held (outgoing paused), outgoingPausedNow=$_outgoingAudioPaused; '
+        'server since speech end: model output=${sinceWait(_diagLastModelOutputAt)}, '
+        'interrupted=${sinceWait(_diagLastServerInterruptedAt)}, turnComplete=${sinceWait(_diagLastTurnCompleteAt)}, '
+        'any message ${ago(_diagLastServerMessageAt)}; last transcript ${ago(_diagLastInputTranscriptionAt)}; '
+        'last clientContent we sent: $_diagLastClientContentKind ${ago(_diagLastClientContentAt)}; '
+        'socket=${_channel == null ? 'closed' : 'open'}, device OS: ${Platform.operatingSystemVersion}';
+  }
+
   void _startAwaitingLateTranscript() {
     if (_awaitingLateTranscript) return; // keep the first deadline for this utterance
     _awaitingLateTranscript = true;
+    _transcriptWaitStart = (
+      at: DateTime.now(),
+      sent: _diagChunksSent,
+      held: _diagChunksHeld,
+      bytes: _diagBytesSent,
+      rmsSum: _diagRmsSum,
+    );
+    _transcriptStallTimer?.cancel();
+    _transcriptStallTimer = Timer(_transcriptStallCheck, () {
+      _transcriptStallTimer = null;
+      if (!_awaitingLateTranscript) return;
+      _log_('TRANSCRIPT STALL: ${_transcriptStallCheck.inMilliseconds}ms with no transcript — ${_transcriptWaitDiagnostics()}');
+    });
     _pipelineLog(
       'awaiting_transcript',
       'speech ended and reached Gemini, but no transcript yet — showing "Thinking..." for up to '
@@ -6767,6 +7409,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _lateTranscriptTimeout?.cancel();
     _lateTranscriptTimeout = Timer(_lateTranscriptMaxWait, () {
       if (!_awaitingLateTranscript) return;
+      _log_(
+        'TRANSCRIPT TIMEOUT DIAGNOSTICS: no transcript within ${_lateTranscriptMaxWait.inSeconds}s — '
+        '${_transcriptWaitDiagnostics()}',
+      );
       _stopAwaitingLateTranscript('no transcript within ${_lateTranscriptMaxWait.inSeconds}s');
       if (_anyTriggerCommittedThisUtterance || _guardFailedReplySpokenThisUtterance || _inFlightFunctionCalls > 0) {
         return;
@@ -6782,6 +7428,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   void _stopAwaitingLateTranscript(String reason) {
     _lateTranscriptTimeout?.cancel();
     _lateTranscriptTimeout = null;
+    _transcriptStallTimer?.cancel();
+    _transcriptStallTimer = null;
     if (!_awaitingLateTranscript) return;
     _awaitingLateTranscript = false;
     _pipelineLog('awaiting_transcript_done', reason);
@@ -6811,6 +7459,31 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// shape, so a "correct transcript, no action" reproduction shows exactly
   /// which step was the last to fire. debugPrint only (no setState), since
   /// several of these run per transcript chunk.
+  int? _lastPromptTokenCount;
+  int _contextMeasuredTurns = 0;
+  DateTime? _contextFirstMeasuredAt;
+
+  /// CONTEXT REFRESH (measurement only) — one line per `usageMetadata`:
+  /// how big the session context Gemini re-reads each turn is, against the
+  /// server-side sliding window ([_contextCompressionTriggerTokens]). A
+  /// drop of a quarter or more from the previous turn is the server
+  /// compressing (`action=server_compression`); otherwise `action=none`.
+  /// Paired with the LATENCY BREAKDOWN lines, this shows from a long-session
+  /// log whether latency actually tracks context size.
+  void _logContextSize(int promptTokens) {
+    final now = DateTime.now();
+    _contextFirstMeasuredAt ??= now;
+    _contextMeasuredTurns++;
+    final previous = _lastPromptTokenCount;
+    _lastPromptTokenCount = promptTokens;
+    final compressed = previous != null && promptTokens < previous * 0.75;
+    _logNoState(
+      'CONTEXT REFRESH: promptTokenCount=$promptTokens threshold=$_contextCompressionTriggerTokens '
+      'action=${compressed ? 'server_compression (was $previous)' : 'none'} turn=$_contextMeasuredTurns '
+      'sessionMinutes=${(now.difference(_contextFirstMeasuredAt!).inSeconds / 60).toStringAsFixed(1)}',
+    );
+  }
+
   void _pipelineLog(String stage, String detail) => _logNoState('VOICE PIPELINE [u=$_utteranceSeq] $stage: $detail');
 
   /// Which triggers have claimed the current utterance (fired, debounced,
@@ -6895,6 +7568,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
     final transcript = kbTrigger.buffer.trim();
     if (transcript.isEmpty) return;
+    // Routing re-run for this same utterance (a late transcript) while its
+    // Gemini intent check is still out — that check decides.
+    if (_geminiIntentCheck != null && _geminiIntentCheck!.utteranceSeq == _utteranceSeq) return;
+    // "Yes" to an earlier "Did you mean ...?" — see [_pendingReconfirm].
+    if (_maybeAnswerPendingReconfirm(transcript)) return;
+    // "Yes, take another one" to Gemini's own "want one more?" — see
+    // `continuation_answer.dart`.
+    if (_maybeAnswerPhotoOffer(transcript)) return;
 
     final decision = classifyCommandIntent(transcript);
     _log_(decision.describe(transcript));
@@ -6927,30 +7608,32 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // (including the context-aware "I didn't catch that" reply) applies.
     }
 
+    // The utterance right after "I have a question" IS the question: no
+    // camera-intent check or "not sure what you need" reply — straight on to
+    // the catch-all's normal KB routing (KB GATE unchanged). A confident
+    // command still wins above.
+    if (_expectingQuestionThisUtterance &&
+        (decision.kind == IntentDecisionKind.none || decision.kind == IntentDecisionKind.weak)) {
+      _log_('QUESTION ANNOUNCEMENT: "$transcript" is the announced question — skipping the camera-intent check');
+      _pipelineLog('question_announcement', 'follow-up routed to the KB flow');
+      return;
+    }
+
+    // GEMINI INTENT CHECK — the matcher found nothing confident (NO MATCH
+    // or FUZZY WEAK) where a photo action would make sense: ask Gemini
+    // itself before treating this as unclear. Its result re-enters the
+    // weak / catch-all handling below if it says "none".
+    if ((decision.kind == IntentDecisionKind.none || decision.kind == IntentDecisionKind.weak) &&
+        _maybeStartGeminiIntentCheck(transcript, decision)) {
+      return;
+    }
+
     switch (decision.kind) {
       case IntentDecisionKind.none:
         return;
       case IntentDecisionKind.confident:
         final name = decision.best!.trigger;
-        final evaluate = _buildTriggerEvaluators('')[name];
-        if (evaluate == null) {
-          _log_('FUZZY MATCH: no evaluator registered for "$name" — leaving it to the existing fallback');
-          return;
-        }
-        _forcedIntentTrigger = name;
-        try {
-          evaluate();
-        } finally {
-          _forcedIntentTrigger = null;
-        }
-        // Same post-loop handling [_onInputTranscription] gives a guard
-        // failure (e.g. "the camera's already open").
-        final guardFailedReply = _pendingGuardFailedReply;
-        _pendingGuardFailedReply = null;
-        if (!_anyTriggerCommittedThisUtterance && guardFailedReply != null) {
-          _guardFailedReplySpokenThisUtterance = true;
-          guardFailedReply();
-        }
+        _fireIntentTrigger(name, logLabel: 'FUZZY MATCH');
       case IntentDecisionKind.ambiguous:
         _guardFailedReplySpokenThisUtterance = true;
         _informGeminiToSpeakVerbatim(
@@ -6958,9 +7641,528 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           reason: 'intent_ambiguous',
         );
       case IntentDecisionKind.weak:
-        _guardFailedReplySpokenThisUtterance = true;
-        _respondToUnclearInput(reason: 'intent_weak_match');
+        _respondToWeakIntentMatch(transcript, decision);
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // CONTINUATION ANSWERS — a yes/no reply to the photo offer the technician
+  // just heard (see `continuation_answer.dart`). Runs where the fuzzy layer
+  // does: only for a finished utterance no phrase trigger matched.
+  // ---------------------------------------------------------------------
+
+  /// How recently the offer must have been heard for a bare "yes"/"no" to
+  /// count as answering it.
+  static const Duration _photoOfferAnswerWindow = Duration(seconds: 20);
+
+  static const String _photoOfferDeclinedText = 'Okay — what would you like to do?';
+
+  /// The last turn the technician actually HEARD (audible text only — a
+  /// muted reply never counts) within [_photoOfferAnswerWindow], or null.
+  ({String text, DateTime at})? _recentlyHeardModelTurn() {
+    if (_recentAudibleTurns.isEmpty) return null;
+    final last = _recentAudibleTurns.last;
+    if (DateTime.now().difference(last.at) > _photoOfferAnswerWindow) return null;
+    return last;
+  }
+
+  bool _maybeAnswerPhotoOffer(String transcript) {
+    final heard = _recentlyHeardModelTurn();
+    if (heard == null || !looksLikePhotoOfferQuestion(heard.text)) return false;
+    final answer = classifyContinuationAnswer(transcript);
+    if (answer == ContinuationAnswer.none) return false;
+
+    if (answer == ContinuationAnswer.negative) {
+      _log_('NEGATIVE CONTINUATION MATCHED: heard="$transcript" declines the offer "${heard.text}" — acknowledging, no photo');
+      _pipelineLog('continuation', 'negative -> declined photo offer');
+      _guardFailedReplySpokenThisUtterance = true;
+      _informGeminiToSpeakVerbatim(_photoOfferDeclinedText, reason: 'photo_offer_declined');
+      return true;
+    }
+
+    // Which step "yes" means depends on where the camera is right now. A
+    // captured photo awaiting keep/retake has its own decision flow.
+    final trigger = (_screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed)
+        ? 'capture_photo'
+        : (_screenTask == _ScreenTask.none ? 'open_camera' : null);
+    if (trigger == null) {
+      _log_(
+        'AFFIRMATIVE CONTINUATION: heard="$transcript" answers the offer "${heard.text}" but the camera is mid-step '
+        '(${_screenTask.name}) — leaving it to normal routing',
+      );
+      return false;
+    }
+    _log_('AFFIRMATIVE CONTINUATION MATCHED: heard="$transcript" answers the offer "${heard.text}" -> $trigger');
+    _pipelineLog('continuation', 'affirmative -> $trigger');
+    if (_fireIntentTrigger(trigger, logLabel: 'AFFIRMATIVE CONTINUATION') || _guardFailedReplySpokenThisUtterance) {
+      return true;
+    }
+    _log_('AFFIRMATIVE CONTINUATION: $trigger did not fire (guard/debounce) — falling back to normal routing');
+    return false;
+  }
+
+  // ---------------------------------------------------------------------
+  // QUESTION ANNOUNCEMENT — see `question_announcement.dart`. Job Detail
+  // only, since it's the only screen whose unmatched speech reaches the KB
+  // (KB GATE); elsewhere the utterance is routed exactly as before.
+  // ---------------------------------------------------------------------
+
+  /// When "I have a question" was answered, and in which utterance — the
+  /// NEXT utterance (within [_questionAnnouncementWindow]) is the question.
+  ({int utteranceSeq, DateTime at})? _questionAnnouncement;
+  static const Duration _questionAnnouncementWindow = Duration(seconds: 20);
+
+  /// The utterance that follows an announcement (kept across a late-
+  /// transcript re-run of that same utterance's routing).
+  int? _expectingQuestionForSeq;
+  bool get _expectingQuestionThisUtterance => _expectingQuestionForSeq == _utteranceSeq;
+
+  static const List<String> _questionAnnouncementReplies = [
+    "Sure, what's your question?",
+    'Go ahead, what do you want to know?',
+    'Sure — what would you like to know?',
+  ];
+  int _questionAnnouncementReplyCursor = 0;
+
+  /// Moves a pending announcement onto the current (later) utterance.
+  void _consumeQuestionAnnouncement() {
+    final pending = _questionAnnouncement;
+    if (pending == null || pending.utteranceSeq == _utteranceSeq) return;
+    _questionAnnouncement = null;
+    if (DateTime.now().difference(pending.at) > _questionAnnouncementWindow) return;
+    _expectingQuestionForSeq = _utteranceSeq;
+  }
+
+  bool _maybeHandleQuestionAnnouncement(String transcript) {
+    if (transcript.isEmpty || _anyTriggerCommittedThisUtterance || _guardFailedReplySpokenThisUtterance) return false;
+    if (!isQuestionAnnouncement(transcript)) return false;
+    if (!_kbGateScreen().kbFallbackEnabled) {
+      _log_('QUESTION ANNOUNCEMENT: "$transcript" heard off Job Details — left to the normal routing');
+      return false;
+    }
+    _log_('QUESTION ANNOUNCEMENT DETECTED: heard="$transcript" action=asked_for_question');
+    _pipelineLog('question_announcement', 'asked for the question');
+    // Same "this utterance has its reply" flag every clarification sets —
+    // the KB early match, intent layer and catch-all all stand down on it.
+    _guardFailedReplySpokenThisUtterance = true;
+    _questionAnnouncement = (utteranceSeq: _utteranceSeq, at: DateTime.now());
+    _informGeminiToSpeakVerbatim(
+      _questionAnnouncementReplies[_questionAnnouncementReplyCursor++ % _questionAnnouncementReplies.length],
+      reason: 'question_announcement',
+    );
+    return true;
+  }
+
+  /// FUZZY WEAK — Job Detail keeps its existing "not sure what you need"
+  /// reply; every other screen gets the CLARIFY FALLBACK, reconfirming the
+  /// weak best guess ("Did you mean ...?").
+  void _respondToWeakIntentMatch(String transcript, IntentDecision decision) {
+    _guardFailedReplySpokenThisUtterance = true;
+    if (_kbGateScreen().kbFallbackEnabled) {
+      _respondToUnclearInput(reason: 'intent_weak_match');
+      return;
+    }
+    _respondWithClarification(transcript: transcript, bestGuess: decision.best, reason: 'intent_weak_match');
+  }
+
+  /// Fires trigger [name] through its own evaluator, exactly as a phrase
+  /// match would (guard, debounce, dispatch and reply all unchanged) — the
+  /// fuzzy layer's confident case, a Gemini intent check's answer, and a
+  /// "yes" to a reconfirm question all go through here. Speaks a queued
+  /// guard-failed reply (e.g. "the camera's already open") the same way
+  /// [_onInputTranscription] does. Returns whether a trigger committed.
+  bool _fireIntentTrigger(String name, {required String logLabel}) {
+    final evaluate = _buildTriggerEvaluators('')[name];
+    if (evaluate == null) {
+      _log_('$logLabel: no evaluator registered for "$name" — leaving it to the existing fallback');
+      return false;
+    }
+    _forcedIntentTrigger = name;
+    try {
+      evaluate();
+    } finally {
+      _forcedIntentTrigger = null;
+    }
+    // Same post-loop handling [_onInputTranscription] gives a guard
+    // failure (e.g. "the camera's already open").
+    final guardFailedReply = _pendingGuardFailedReply;
+    _pendingGuardFailedReply = null;
+    if (!_anyTriggerCommittedThisUtterance && guardFailedReply != null) {
+      _guardFailedReplySpokenThisUtterance = true;
+      guardFailedReply();
+    }
+    return _anyTriggerCommittedThisUtterance;
+  }
+
+  // ---------------------------------------------------------------------
+  // CLARIFY FALLBACK — replaces the KB catch-all on every screen except Job
+  // Detail (see [_kbGateScreen]). Built on [_respondToUnclearInput], so the
+  // camera / photo-note context lines and the 1st / 2nd / quiet escalation
+  // are the same ones every other unclear input already gets.
+  // ---------------------------------------------------------------------
+
+  static const List<String> _clarificationReplies = [
+    'Sorry, can you say that again?',
+    "I didn't quite catch that — could you repeat it?",
+    'Sorry, I missed that. What do you need?',
+  ];
+  int _clarificationReplyCursor = 0;
+
+  String _nextClarificationReply() =>
+      _clarificationReplies[_clarificationReplyCursor++ % _clarificationReplies.length];
+
+  int _reconfirmReplyCursor = 0;
+
+  /// Below this, a fuzzy candidate is too far off to name back to the
+  /// technician in a "Did you mean ...?" question.
+  static const double _clarifyBestGuessFloor = 0.4;
+
+  /// The fuzzy matcher's best candidate for [transcript], if it is at least
+  /// a borderline match — including one a question-shaped utterance kept
+  /// below the acting threshold.
+  IntentScore? _clarifyBestGuess(String transcript) {
+    final decision = classifyCommandIntent(transcript);
+    final best = decision.best ?? (decision.scores.isEmpty ? null : decision.scores.first);
+    if (best == null || best.confidence < _clarifyBestGuessFloor) return null;
+    return best;
+  }
+
+  /// A "Did you mean ...?" question that was just asked — a plain "yes"
+  /// within [_pendingReconfirmWindow] fires that trigger; anything else
+  /// clears it and is routed normally.
+  ({String trigger, String label, int utteranceSeq, DateTime askedAt})? _pendingReconfirm;
+  static const Duration _pendingReconfirmWindow = Duration(seconds: 15);
+
+  static const Set<String> _reconfirmYesWords = {
+    'yes', 'yeah', 'yep', 'yup', 'ya', 'sure', 'correct', 'exactly', 'right', 'affirmative', 'si', 'ok', 'okay',
+  };
+  static const Set<String> _reconfirmNoWords = {'no', 'nope', 'nah', 'neither', 'cancel', 'wrong'};
+
+  void _respondWithClarification({required String transcript, required IntentScore? bestGuess, required String reason}) {
+    _log_(
+      'CLARIFY FALLBACK: screen=${_kbGateScreen().screen} heard="$transcript" '
+      'bestGuess=${bestGuess?.trigger ?? 'none'} confidence=${bestGuess?.confidence.toStringAsFixed(2) ?? 'none'}',
+    );
+    _pipelineLog('clarify_fallback', 'bestGuess=${bestGuess?.trigger ?? 'none'} reason=$reason');
+    // A captured photo awaiting keep/retake (or the note question) already
+    // has its own pending question — naming some other action there would
+    // only confuse it, so those keep their context lines.
+    final contextAllowsReconfirm = _screenTask != _ScreenTask.cameraCaptured && _photoNote == null;
+    String? reconfirmText;
+    ({String trigger, String label})? guess;
+    if (contextAllowsReconfirm && bestGuess != null) {
+      final label = bestGuess.intent.label;
+      guess = (trigger: bestGuess.trigger, label: label);
+      reconfirmText = (_reconfirmReplyCursor++).isEven ? 'Did you mean $label?' : 'Sorry — did you want to $label?';
+    } else if (contextAllowsReconfirm) {
+      // A screen named in a statement ("we're still on the invoice screen")
+      // that loose-nav matching declined to act on — ask which it was.
+      final rejected = _looseNavRejectionFor(transcript);
+      if (rejected != null) {
+        guess = rejected;
+        reconfirmText = 'Do you want me to ${rejected.label}, or are you telling me something else?';
+      }
+    }
+    final reconfirmed = _respondToUnclearInput(reason: reason, clarify: true, reconfirmText: reconfirmText);
+    _pendingReconfirm = reconfirmed && guess != null
+        ? (trigger: guess.trigger, label: guess.label, utteranceSeq: _utteranceSeq, askedAt: DateTime.now())
+        : null;
+  }
+
+  /// The trigger/label [lastLooseNavRejection] recorded for THIS transcript
+  /// (recent, and the same words), or `null`.
+  ({String trigger, String label})? _looseNavRejectionFor(String transcript) {
+    final rejection = lastLooseNavRejection;
+    if (rejection == null || DateTime.now().difference(rejection.at) > const Duration(seconds: 15)) return null;
+    final heard = stemmedPaddedTriggerText(transcript).trim();
+    final rejectedText = rejection.paddedText.trim();
+    if (heard.isEmpty || !(heard.contains(rejectedText) || rejectedText.contains(heard))) return null;
+    final intent = defaultCommandIntents.where((i) => i.trigger == rejection.trigger).firstOrNull;
+    if (intent == null) return null;
+    return (trigger: intent.trigger, label: intent.label);
+  }
+
+  /// See [_pendingReconfirm]. Only a short, whole-utterance yes/no counts,
+  /// so "yes, and show me the invoice" is routed normally instead.
+  bool _maybeAnswerPendingReconfirm(String transcript) {
+    final pending = _pendingReconfirm;
+    if (pending == null || pending.utteranceSeq == _utteranceSeq) return false;
+    _pendingReconfirm = null;
+    if (DateTime.now().difference(pending.askedAt) > _pendingReconfirmWindow) return false;
+    final words = tokenizeTriggerText(transcript);
+    if (words.isEmpty || words.length > 4) return false;
+    final meaningful = words.where((w) => !const {'please', 'do', 'it', 'that', 'go', 'ahead', 'i', 'did'}.contains(w));
+    if (meaningful.isEmpty) return false;
+    if (meaningful.every(_reconfirmNoWords.contains)) {
+      _log_('RECONFIRM: "$transcript" declined "${pending.label}" — asking what they need instead');
+      _guardFailedReplySpokenThisUtterance = true;
+      _informGeminiToSpeakVerbatim('Okay — what would you like to do?', reason: 'reconfirm_declined');
+      return true;
+    }
+    if (!meaningful.every(_reconfirmYesWords.contains)) return false;
+    _log_('RECONFIRM: "$transcript" confirmed "${pending.label}" — firing ${pending.trigger}');
+    _pipelineLog('reconfirm', 'confirmed trigger=${pending.trigger}');
+    return _fireIntentTrigger(pending.trigger, logLabel: 'RECONFIRM') || _guardFailedReplySpokenThisUtterance;
+  }
+
+  // ---------------------------------------------------------------------
+  // GEMINI INTENT CHECK — a fallback layer AFTER the deterministic phrase
+  // triggers and the fuzzy matcher (both unchanged and still first). When
+  // neither is confident and a photo action would make sense right now
+  // (live camera armed, or Job Detail with the camera closed), Gemini
+  // itself classifies the utterance — any wording, accent, or language
+  // (non-native and Spanish-speaking technicians) — through a dedicated
+  // function call in the already-open Live session. Its audio is dropped
+  // throughout (see [_onResponseAudioChunk]); "none", low confidence or no
+  // answer in time falls back to the existing weak / catch-all handling.
+  // ---------------------------------------------------------------------
+
+  ({String id, int utteranceSeq, String transcript, IntentDecision decision, DateTime startedAt, Timer timeout})?
+  _geminiIntentCheck;
+  int _geminiIntentCheckCounter = 0;
+
+  /// Checks retired (superseded or timed out) before Gemini answered them.
+  /// With no id in the message any more, answers are matched by order:
+  /// while one of these is outstanding, the next answer is its, not the
+  /// current check's. Fails safe — a retired check Gemini never answers
+  /// costs the next check its answer (it times out into the normal
+  /// fallback) and expires after [_retiredIntentCheckAnswerWindow]; it can
+  /// never fire a photo action for the wrong utterance.
+  final List<DateTime> _retiredUnansweredIntentChecks = [];
+  static const Duration _retiredIntentCheckAnswerWindow = Duration(seconds: 6);
+
+  /// Long enough for a Live text turn plus function call; short enough that
+  /// a missing answer only delays the fallback slightly. Trimmed from 3.5s
+  /// (a7d30b48 log: two unanswered checks each held unclear speech ~3.5s
+  /// before the clarification question, on top of 2-5.6s Live latency).
+  static const Duration _geminiIntentCheckTimeout = Duration(milliseconds: 1800);
+
+  /// Below this, Gemini's photo classification is treated as "none".
+  static const double _geminiIntentMinConfidence = 0.6;
+
+  /// Where the check applies: `capture_photo` with the live camera armed,
+  /// `open_camera` on Job Detail with no camera flow active. `null` in
+  /// every other state (camera still opening, a photo awaiting keep/
+  /// retake, the note question, any other screen).
+  String? _geminiIntentCheckContext() {
+    if (_photoNote != null || widget.jobId == null) return null;
+    if (_screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed) return 'capture_photo';
+    if (_screenTask == _ScreenTask.none && _kbGateScreen().kbFallbackEnabled) return 'open_camera';
+    return null;
+  }
+
+  bool _maybeStartGeminiIntentCheck(String transcript, IntentDecision decision) {
+    final context = _geminiIntentCheckContext();
+    if (context == null) return false;
+    // Filler and small talk have their own replies in the catch-all.
+    if (_looksLikeNonInformationalFiller(transcript) || classifySmallTalk(transcript) != SmallTalkKind.none) {
+      return false;
+    }
+    final channel = _channel;
+    if (channel == null || _sessionClosing) return false;
+    final previous = _geminiIntentCheck;
+    if (previous != null) {
+      previous.timeout.cancel();
+      _geminiIntentCheck = null;
+      _retiredUnansweredIntentChecks.add(DateTime.now());
+      _endFunctionCallInFlight('gemini intent check ${previous.id}');
+      _log_(
+        'GEMINI INTENT CHECK: heard="${previous.transcript}" geminiIntent=none action=discarded_superseded '
+        '(check ${previous.id} replaced by a newer utterance)',
+      );
+    }
+
+    final id = 'ic${++_geminiIntentCheckCounter}';
+    final contextLine = context == 'capture_photo'
+        ? 'Right now the camera is open with a live preview, ready to shoot: if they want a picture taken, in any '
+              'wording, the intent is capture_photo.'
+        : 'Right now the camera is not open: if they want to take a picture, in any wording, the intent is '
+              'open_camera.';
+    final heard = transcript.replaceAll('"', "'");
+    // 9948b4d log (u=9): "Yes, take another one." came back `none` — this
+    // check only ever saw the transcript, never the question it answered.
+    // The last line the technician actually heard (audible only, recent
+    // only) is now part of the check, so a yes/no answer can be read as one.
+    final previousTurn = _recentlyHeardModelTurn();
+    final previousLine = previousTurn == null
+        ? ''
+        : 'Just before that, the assistant said to them: "${previousTurn.text.replaceAll('"', "'")}". If that was a '
+              'question offering a photo, then a yes-type answer ("yes", "yeah", "sure", "go ahead", "yes, take '
+              'another one") means they want the photo, and a no-type answer ("no", "I\'m done", "that\'s fine") '
+              'means "none". ';
+    // 98badd29 log: Gemini SPOKE this message's old opening — "INTENT CHECK"
+    // then " ic2", the local check id — instead of calling the function
+    // (~690ms of generation before it could be muted). Nothing Gemini can
+    // read aloud here carries an internal label or id any more: the check is
+    // matched locally (one pending at a time — see [_resolveGeminiIntentCheck]),
+    // and the message opens with the instruction to answer only by calling.
+    final instruction =
+        'Answer this only by calling $_geminiIntentCheckFunctionName, without saying anything out loud. A field '
+        'technician just said: "$heard". This is automatic speech recognition, so it may be misspelled, cut '
+        'short, heavily accented, informal, or partly in another language such as Spanish. $previousLine'
+        '$contextLine Call $_geminiIntentCheckFunctionName exactly once with intent "open_camera", '
+        '"capture_photo", or "none", and your confidence. Use "none" for questions, remarks, or anything that is '
+        'not asking for a photo. Do not call any other function.';
+    _logNoState(
+      'INTERNAL LABEL LEAK PREVENTED: intent check $id sent to Gemini with no internal label or id in its text '
+      '(the id stays local)',
+    );
+    final timeout = Timer(_geminiIntentCheckTimeout, () {
+      if (_geminiIntentCheck?.id != id) return;
+      _resolveGeminiIntentCheck(checkId: id, intent: null, confidence: null, source: 'timeout');
+    });
+    _geminiIntentCheck = (
+      id: id,
+      utteranceSeq: _utteranceSeq,
+      transcript: transcript,
+      decision: decision,
+      startedAt: DateTime.now(),
+      timeout: timeout,
+    );
+    // Keeps the "nothing resolved" safety timer and inactivity timers
+    // deferring while the check is out, same as any real call.
+    _beginFunctionCallInFlight('gemini intent check $id');
+    channel.sink.add(
+      jsonEncode({
+        'clientContent': {
+          'turns': [
+            {
+              'role': 'user',
+              'parts': [
+                {'text': instruction},
+              ],
+            },
+          ],
+          'turnComplete': true,
+        },
+      }),
+    );
+    _log_(
+      'GEMINI INTENT CHECK: asking Gemini ($id) heard="$transcript" context=$context '
+      '(matcher: ${decision.kind.name}${decision.best == null ? '' : ' best=${decision.best!.trigger}'})'
+      '${previousTurn == null ? '' : ' previousTurn="${previousTurn.text}"'}',
+    );
+    _pipelineLog('intent_check', 'started id=$id context=$context');
+    _noteClientContentSent('intent_check:$id');
+    return true;
+  }
+
+  /// 98284112 log: Gemini answered the check by SPEAKING the call —
+  /// output transcription `classify_camera_intent(check_id="ic1",
+  /// intent="none", confidence=1.0)` ~1s in — instead of sending a
+  /// `toolCall`. Only `toolCall` was handled, and that audio is muted during
+  /// the check, so the real answer was lost and the check sat until its
+  /// timeout ("via timeout, confidence=none"). The spoken form is parsed
+  /// here the moment it's complete and resolves the check exactly as the
+  /// toolCall would.
+  static final RegExp _spokenIntentCheckCall =
+      RegExp(r'classify[\s_]*camera[\s_]*intent\s*\(([^)]*)\)', caseSensitive: false);
+  static final RegExp _spokenCallArg = RegExp(r'''(\w+)\s*[=:]\s*["']?([\w.]+)["']?''');
+
+  /// Set when a check is resolved from its spoken form: the rest of that
+  /// same turn is still call syntax, so it stays muted until the turn's
+  /// boundary (`turnComplete`/`interrupted`), exactly as it was while the
+  /// check was pending.
+  bool _dropRestOfSpokenIntentCheckTurn = false;
+
+  void _maybeResolveIntentCheckFromSpokenCall() {
+    final check = _geminiIntentCheck;
+    if (check == null) return;
+    final match = _spokenIntentCheckCall.firstMatch(_currentTurnGeminiText);
+    if (match == null) return; // not spoken (yet), or still mid-call
+    final args = {
+      for (final arg in _spokenCallArg.allMatches(match.group(1) ?? '')) arg.group(1)!.toLowerCase(): arg.group(2)!,
+    };
+    _log_('GEMINI INTENT CHECK: Gemini spoke the classification instead of calling it — "${match.group(0)}"');
+    _dropRestOfSpokenIntentCheckTurn = true;
+    _resolveGeminiIntentCheck(
+      checkId: args['check_id'],
+      intent: args['intent']?.toLowerCase(),
+      confidence: double.tryParse(args['confidence'] ?? ''),
+      source: 'spoken_function_call',
+    );
+  }
+
+  void _resolveGeminiIntentCheck({
+    required String? checkId,
+    required String? intent,
+    required double? confidence,
+    required String source,
+  }) {
+    if (source == 'timeout') {
+      // Gemini may still answer this one late — that answer must not be
+      // taken for the next check's (see [_retiredUnansweredIntentChecks]).
+      _retiredUnansweredIntentChecks.add(DateTime.now());
+    } else {
+      final cutoff = DateTime.now().subtract(_retiredIntentCheckAnswerWindow);
+      _retiredUnansweredIntentChecks.removeWhere((at) => at.isBefore(cutoff));
+      if (_retiredUnansweredIntentChecks.isNotEmpty) {
+        _retiredUnansweredIntentChecks.removeAt(0);
+        _log_(
+          'GEMINI INTENT CHECK: answer ($source, intent=$intent) belongs to an earlier check that was already '
+          'superseded or timed out — ignored, not applied to the current one',
+        );
+        return;
+      }
+    }
+    final check = _geminiIntentCheck;
+    if (check == null || (checkId != null && checkId != check.id)) {
+      _log_('GEMINI INTENT CHECK: answer ($source, check_id=$checkId intent=$intent) matches no pending check — ignored');
+      return;
+    }
+    _geminiIntentCheck = null;
+    check.timeout.cancel();
+    _endFunctionCallInFlight('gemini intent check ${check.id}');
+    final elapsedMs = DateTime.now().difference(check.startedAt).inMilliseconds;
+    final geminiIntent = intent ?? 'none';
+    if (source != 'timeout') {
+      _log_(
+        'INTENT CHECK RESOLVED EARLY: id=${check.id} elapsedMs=$elapsedMs intent=$geminiIntent '
+        'confidence=${confidence?.toStringAsFixed(2) ?? 'none'} via=$source',
+      );
+    }
+    void logOutcome(String action) {
+      _log_(
+        'GEMINI INTENT CHECK: heard="${check.transcript}" geminiIntent=$geminiIntent action=$action '
+        '(confidence=${confidence?.toStringAsFixed(2) ?? 'none'}, ${elapsedMs}ms, via $source)',
+      );
+      _pipelineLog('intent_check', 'resolved id=${check.id} geminiIntent=$geminiIntent action=$action');
+    }
+
+    if (!mounted || _sessionClosing) return;
+    if (check.utteranceSeq != _utteranceSeq) {
+      logOutcome('discarded_stale (a newer utterance started)');
+      return;
+    }
+    if (_anyTriggerCommittedThisUtterance || _guardFailedReplySpokenThisUtterance) {
+      logOutcome('none_needed (already resolved while waiting)');
+      return;
+    }
+
+    final wantsPhoto = (intent == 'open_camera' || intent == 'capture_photo') &&
+        (confidence ?? 0) >= _geminiIntentMinConfidence;
+    // Either answer means "they want a photo" — the CURRENT state decides
+    // which step that is (the camera may have changed while waiting).
+    final trigger = !wantsPhoto
+        ? null
+        : (_screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed)
+        ? 'capture_photo'
+        : (_screenTask == _ScreenTask.none ? 'open_camera' : null);
+    if (trigger != null) {
+      logOutcome('fired_$trigger');
+      if (_fireIntentTrigger(trigger, logLabel: 'GEMINI INTENT CHECK') || _guardFailedReplySpokenThisUtterance) return;
+      _log_('GEMINI INTENT CHECK: $trigger did not fire (guard/debounce) — falling back');
+    }
+
+    if (check.decision.kind == IntentDecisionKind.weak) {
+      if (trigger == null) logOutcome('fallback_weak_match');
+      _respondToWeakIntentMatch(check.transcript, check.decision);
+      return;
+    }
+    if (trigger == null) logOutcome('fallback_catch_all');
+    // Job Detail -> KB catch-all as before; anywhere else the KB GATE turns
+    // it into a clarification question.
+    _maybeFallBackToKbAnswerCatchAll();
   }
 
   /// PART F item 4 (client-confirmed regression, twice over: "Is today
@@ -7016,6 +8218,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       logDecision('a specific trigger already owns this utterance — nothing to route');
       return;
     }
+    // GEMINI INTENT CHECK pending for this utterance — its result decides
+    // what happens next, and re-enters this catch-all itself if the answer
+    // is "none" (see [_resolveGeminiIntentCheck]).
+    if (_geminiIntentCheck != null && _geminiIntentCheck!.utteranceSeq == _utteranceSeq) {
+      logDecision('a Gemini intent check is pending for this utterance — deferring to its result');
+      return;
+    }
     final transcript = kbTrigger.buffer.trim();
     if (transcript.isEmpty || _looksLikeNonInformationalFiller(transcript)) {
       if (transcript.isNotEmpty) {
@@ -7060,6 +8269,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _respondToUnclearInput(reason: 'non_english_transcription');
       return;
     }
+    // KB GATE — only Job Detail falls back to the knowledge base. Every
+    // other screen gets a clarification question, and get_kb_answer is
+    // never called at all.
+    if (!_kbGateAllows('catch_all')) {
+      logDecision('"$transcript" — KB fallback disabled on this screen, asking for clarification instead');
+      _guardFailedReplySpokenThisUtterance = true;
+      _respondWithClarification(transcript: transcript, bestGuess: _clarifyBestGuess(transcript), reason: 'clarify_fallback');
+      return;
+    }
     kbTrigger.resolvedForCurrentUtterance = true;
     kbTrigger.lastActivityAt = DateTime.now();
     // PART L item 1 — a real resolution attempt is now genuinely in flight
@@ -7100,7 +8318,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     );
   }
 
-  /// PART F item 4 — see [_kbCatchAllBoundaryDeclineText]'s doc comment
+  /// PART F item 4 — see [_kbNoAnswerText]'s doc comment
   /// for why the catch-all substitutes the boundary phrase instead of the
   /// KB's own raw "not available" decline specifically for THIS path
   /// (nothing else matched at all), while [_buildKbAnswerSpokenText] (used
@@ -7110,7 +8328,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   String _buildKbCatchAllSpokenText(Map<String, dynamic> result) {
     final answer = result['answer'] as String?;
     if (answer == null || _kbNoMatchLiteralAnswers.contains(answer)) {
-      return _kbCatchAllBoundaryDeclineText;
+      _log_('KB MISS: get_kb_answer returned no match (catch-all) — speaking the explicit no-answer line');
+      return _kbNoAnswerText;
     }
     return answer;
   }
@@ -7244,19 +8463,76 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
   static const double _scriptIdentityMatchRatio = 0.6;
 
-  void _beginAwaitingScriptedTurn(String text) {
+  /// The reply-injection reason ([_informGeminiToSpeakVerbatim]'s `reason`,
+  /// e.g. `photo_note_readback`) of the scripted line being waited for —
+  /// only for the READBACK TAIL SUPPRESSED log lines.
+  String _awaitingScriptedTurnReason = '';
+
+  void _beginAwaitingScriptedTurn(String text, {required String reason}) {
     _awaitingScriptedTurnWords = _normalizeForEchoCompare(text).split(' ').where((w) => w.isNotEmpty).toList();
-    _currentTurnKnownStale = false;
+    _awaitingScriptedTurnReason = reason;
+    // READBACK TAIL FIX (a7d30b48 log, u=11): a model turn already in
+    // flight at this moment began BEFORE this line was requested, so it can
+    // only ever be a fragment — Gemini freely saying the same readback
+    // (muted until now), whose trailing "…Save that?" matched the script
+    // word-for-word and played out of context before the real line. That
+    // whole turn is dropped until its boundary; only a turn that starts
+    // after this point can be the scripted one. (Muted turns never flip
+    // [_turnComplete], so in-flight is judged by this turn having produced
+    // any audio or text since its last boundary.)
+    _currentTurnKnownStale = _currentTurnHadAudioOrText;
+    if (_currentTurnKnownStale) {
+      _log_(
+        'READBACK TAIL SUPPRESSED: trigger=$reason reason=turn_started_before_resolution — a model turn was already '
+        'in flight when this line was requested; dropping the rest of it and waiting for the next turn.',
+      );
+    }
     _scriptIdentityCandidateText = '';
     _heldUnidentifiedTurnChunks.clear();
     _armScriptIdentityTimer(_scriptIdentityAbandonTimeout);
     _syncVoicePhase();
   }
 
+  /// Whether the identifying transcript [words] OPENS like [script] — the
+  /// script's first word (or second, if the first was swallowed) within
+  /// the first three words heard, which still allows a short preamble
+  /// ("Okay, camera's open…"). `null` while fewer than three words have
+  /// arrived without an opening match. A turn whose words all appear in the
+  /// script but which opens mid-line ("save that") started before the
+  /// scripted turn could have — the old word-ratio check alone let exactly
+  /// that tail play.
+  bool? _transcriptOpensLikeScript(List<String> words, List<String> script) {
+    if (script.isEmpty) return true;
+    final openers = script.take(2).toSet();
+    final lead = words.take(3);
+    if (lead.any(openers.contains)) return true;
+    return words.length < 3 ? null : false;
+  }
+
+  /// Held chunks whose partial transcript does NOT open like the script
+  /// (misaligned, or too short to tell) — never released on a timeout or
+  /// turn boundary, since they could be exactly that mid-line tail.
+  bool get _heldCandidateNotAlignedWithScript {
+    final script = _awaitingScriptedTurnWords;
+    if (script == null || _scriptIdentityCandidateText.isEmpty) return false;
+    final words = _normalizeForEchoCompare(_scriptIdentityCandidateText).split(' ').where((w) => w.isNotEmpty).toList();
+    if (words.isEmpty) return false;
+    return _transcriptOpensLikeScript(words, script) != true;
+  }
+
   void _armScriptIdentityTimer(Duration delay) {
     _scriptIdentityTimer?.cancel();
     _scriptIdentityTimer = Timer(delay, () {
       if (_awaitingScriptedTurnWords == null) return;
+      if (_heldCandidateNotAlignedWithScript) {
+        _log_(
+          'READBACK TAIL SUPPRESSED: trigger=$_awaitingScriptedTurnReason reason=turn_started_before_resolution — '
+          'held turn "$_scriptIdentityCandidateText" does not open like the scripted line; discarding it instead of '
+          'releasing on the ${delay.inMilliseconds}ms timeout.',
+        );
+        _resolveScriptedTurn(play: false, reason: 'held transcript does not open like the script');
+        return;
+      }
       _resolveScriptedTurn(play: true, reason: 'no identifying transcript within ${delay.inMilliseconds}ms');
     });
   }
@@ -7295,6 +8571,20 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final scriptWords = script.toSet();
     final ratio = words.where(scriptWords.contains).length / words.length;
     if (ratio >= _scriptIdentityMatchRatio) {
+      // READBACK TAIL FIX — matching the script's words isn't enough; the
+      // turn must also start where the script starts.
+      final opens = _transcriptOpensLikeScript(words, script);
+      if (opens == null) return; // keep holding until the opening is clear
+      if (!opens) {
+        _currentTurnKnownStale = true;
+        _log_(
+          'READBACK TAIL SUPPRESSED: trigger=$_awaitingScriptedTurnReason reason=turn_started_before_resolution — '
+          '"$_scriptIdentityCandidateText" matches the scripted line\'s words but opens mid-line; discarding '
+          '${_heldUnidentifiedTurnChunks.length} held chunk(s) and dropping the rest of this turn.',
+        );
+        _heldUnidentifiedTurnChunks.clear();
+        return;
+      }
       // CONFIRMED via flutter_run_log 6038bc76: a scripted line interrupted
       // mid-playback was restarted, and releasing the restart the moment
       // it matched the script ("Yes, I") let "Yes, I can hear" play before
@@ -7353,6 +8643,20 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
     if (_heldUnidentifiedTurnChunks.isNotEmpty) {
+      // A partial transcript that doesn't open like the script (e.g. a
+      // two-word tail that ended before it could be judged) is dropped,
+      // and the wait goes on for the real turn.
+      if (_heldCandidateNotAlignedWithScript) {
+        _log_(
+          'READBACK TAIL SUPPRESSED: trigger=$_awaitingScriptedTurnReason reason=turn_started_before_resolution — '
+          'turn "$_scriptIdentityCandidateText" ended without opening like the scripted line; discarding '
+          '${_heldUnidentifiedTurnChunks.length} held chunk(s).',
+        );
+        _heldUnidentifiedTurnChunks.clear();
+        _scriptIdentityCandidateText = '';
+        _armScriptIdentityTimer(_scriptIdentityAbandonTimeout);
+        return;
+      }
       // Completed naturally with no identifying transcript yet — play it
       // rather than risk losing the real confirmation.
       _resolveScriptedTurn(play: true, reason: 'turn completed before its transcript arrived');
@@ -7427,7 +8731,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _awaitingScriptedTurnWords != null ||
       _holdingForUnclassifiedUtterance ||
       _suppressResponseAudioForDeterministic ||
-      _preemptiveDefaultMuteActive;
+      _preemptiveDefaultMuteActive ||
+      _geminiIntentCheck != null ||
+      _dropRestOfSpokenIntentCheckTurn;
 
   bool get _holdingForUnclassifiedUtterance =>
       _awaitingFirstTranscriptOfUtterance &&
@@ -7524,12 +8830,35 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// shorter line, and from the 3rd on nothing is said (the on-screen UI
   /// still shows state) — Gemini's own stale free-text answer is still cut
   /// off, so going quiet never means Gemini fills the silence itself.
-  void _respondToUnclearInput({required String reason}) {
+  ///
+  /// [clarify] / [reconfirmText] — CLARIFY FALLBACK (see
+  /// [_respondWithClarification]): with [reconfirmText] ("Did you mean
+  /// ...?") that line is spoken in place of the flow / generic reply; with
+  /// only [clarify], the camera/photo-note flow lines still win (they are
+  /// already clarification questions), and otherwise the rotating natural
+  /// "say that again" lines replace the generic examples menu. The
+  /// escalation (1st, 2nd, quiet from the 3rd) is the same either way.
+  /// Returns whether [reconfirmText] was actually spoken.
+  bool _respondToUnclearInput({required String reason, bool clarify = false, String? reconfirmText}) {
     final now = DateTime.now();
     final last = _lastUnclearInputAt;
     if (last == null || now.difference(last) > _unclearInputStreakWindow) _unclearInputStreak = 0;
     _lastUnclearInputAt = now;
     _unclearInputStreak++;
+    if (reconfirmText != null && _unclearInputStreak <= 2) {
+      _log_('UNCLEAR INPUT: reconfirming the best guess (miss #$_unclearInputStreak, reason=$reason)');
+      _informGeminiToSpeakVerbatim(reconfirmText, reason: reason);
+      return true;
+    }
+    if (clarify && _unclearInputStreak <= 2) {
+      final flowReply = _activeFlowUnclearReply(repeat: _unclearInputStreak == 2);
+      _log_(
+        'UNCLEAR INPUT: clarification question (miss #$_unclearInputStreak, reason=$reason'
+        '${flowReply == null ? '' : ', activeFlow=${flowReply.flow}'})',
+      );
+      _informGeminiToSpeakVerbatim(flowReply?.text ?? _nextClarificationReply(), reason: reason);
+      return false;
+    }
     // Context first — see [_activeFlowUnclearReply]. Same 1st / short 2nd /
     // quiet 3rd+ escalation either way.
     final flowReply = _unclearInputStreak <= 2 ? _activeFlowUnclearReply(repeat: _unclearInputStreak == 2) : null;
@@ -7550,6 +8879,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _log_('UNCLEAR INPUT: $_unclearInputStreak in a row — staying quiet ($reason)');
       _interruptGeminiForDeterministicTrigger('unclear_input_quiet');
     }
+    return false;
   }
 
   /// See [_preemptiveDefaultMuteActive]'s doc comment — clears it WITHOUT
@@ -7627,6 +8957,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// a function call succeeds, in addition to (not instead of) the
   /// silence-based reset in [_trackSpeechLevel].
   void _clearAllTriggerBuffersAfterSuccess(String reason, {bool endsUnclearInputStreak = true}) {
+    // Kept across a go_back success in the same utterance — see
+    // [_jobDetailsDestinationBuffer].
+    if (!_goBackFiredThisUtterance) _jobDetailsDestinationBuffer = '';
+    _jobDetailsDestinationResolvedForCurrentUtterance = false;
     _goBackIntentDetectionBuffer = '';
     _goBackTriggerResolvedForCurrentUtterance = false;
     _viewEstimateDetectionBuffer = '';
@@ -7662,6 +8996,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _utteranceCommittedAt = DateTime.now();
     // A real resolution ends any unclear-input streak — see [_respondToUnclearInput].
     if (endsUnclearInputStreak) _unclearInputStreak = 0;
+    // ...and any "Did you mean ...?" still waiting for a yes.
+    _pendingReconfirm = null;
     if (_preemptiveDefaultMuteActive) {
       _log_('PREEMPTIVE DEFAULT MUTE: cleared — "$reason" resolved this utterance for real.');
     }
@@ -7972,7 +9308,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   bool _looksLikeGetCurrentScreenRequest(String text) {
     // P0 FIX — see [_TranscriptTrigger.matches]'s doc comment.
     final phraseMatch = matchAnyTriggerPhrase(text, _getCurrentScreenIndicatorPhrases);
-    if (phraseMatch == null) return false;
+    if (phraseMatch == null) {
+      // Any word order — see `looksLikeCurrentScreenQuestion`.
+      if (!looksLikeCurrentScreenQuestion(text)) return false;
+      debugPrint('STRUCTURAL TRIGGER MATCH [get_current_screen]: screen question in "$text"');
+      return true;
+    }
     if (!phraseMatch.exact) {
       debugPrint('FUZZY TRIGGER MATCH [get_current_screen]: ${phraseMatch.describe()} matched in "$text"');
     }
@@ -8015,6 +9356,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _log_(
       'DETERMINISTIC GET CURRENT SCREEN TRIGGER: pattern matched ("$transcript") with no recent '
       'get_current_screen activity — answering directly, not waiting for Gemini: $description',
+    );
+    _log_(
+      'CURRENT SCREEN QUERY ANSWERED: heard="$transcript" screen=${_kbGateScreen().screen} answer="$description" '
+      '(local, no KB / intent check)',
     );
     debugPrint(
       'GEMINI DETERMINISTIC TRIGGER: firing get_current_screen directly (app-side pattern detection, Gemini '
@@ -8250,6 +9595,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       debugPrint('PHOTO TIMING [_executeDeterministic]: EXCEPTION for "${trigger.name}": $e');
       debugPrint('GEMINI DETERMINISTIC TRIGGER ERROR (${trigger.name}): $e\n$stackTrace');
       _log_('DETERMINISTIC ${trigger.name.toUpperCase()} TRIGGER: ${trigger.name} FAILED: $e');
+      // A KB lookup that genuinely failed (network/timeout — not a "no
+      // match") used to end here in silence; say so instead, unless a newer
+      // request already superseded it.
+      if (trigger.name == 'get_kb_answer' &&
+          !_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: trigger.name)) {
+        _informGeminiToSpeakVerbatim(_kbHardErrorSpokenText(e.toString()), reason: 'deterministic get_kb_answer error');
+      }
       return;
     } finally {
       _endFunctionCallInFlight('deterministic ${trigger.name}');
@@ -8331,6 +9683,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// wording for).
   String? _buildSpokenTextForResult({required String name, required Map<String, dynamic> result}) {
     if (result.containsKey('error')) {
+      if (name == 'get_kb_answer') return _kbHardErrorSpokenText('${result['error']}');
       return "Sorry, something went wrong doing that — please try again.";
     }
     if (result['status'] == 'already_on_screen') return _alreadyOnScreenSpokenText(name);
@@ -8387,8 +9740,29 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// `answer` field, spoken exactly as returned via
   /// [_informGeminiToSpeakVerbatim]'s tight verbatim framing, decline
   /// included, unchanged.
+  /// When the current/most recent get_kb_answer dispatch started — only for
+  /// the elapsed time in the KB TIMEOUT/ERROR SPOKEN line.
+  DateTime? _kbCallStartedAt;
+
+  /// A get_kb_answer call that FAILED (network error, or the
+  /// `kbAnswerRequestTimeout` bound) — distinct from a genuine no-match,
+  /// which says [_kbNoAnswerText]. Logs the KB TIMEOUT/ERROR SPOKEN marker.
+  String _kbHardErrorSpokenText(String error) {
+    final startedAt = _kbCallStartedAt;
+    final elapsedMs = startedAt == null ? -1 : DateTime.now().difference(startedAt).inMilliseconds;
+    final outcome = error.contains('TimeoutException') ? 'timeout_reduced' : 'error_spoken';
+    _log_('KB TIMEOUT/ERROR SPOKEN: trigger=get_kb_answer elapsedMs=$elapsedMs outcome=$outcome error=$error');
+    return "Sorry, I couldn't reach the knowledge base right now — try again in a moment.";
+  }
+
   String _buildKbAnswerSpokenText(Map<String, dynamic> result) {
-    return (result['answer'] as String?) ?? "Sorry, I don't have that information — check with your supervisor.";
+    final answer = result['answer'] as String?;
+    // KB miss only — a found answer is spoken exactly as returned, unchanged.
+    if (answer == null || _kbNoMatchLiteralAnswers.contains(answer)) {
+      _log_('KB MISS: get_kb_answer returned no match — speaking the explicit no-answer line');
+      return _kbNoAnswerText;
+    }
+    return answer;
   }
 
   /// See [_buildSpokenTextForResult]'s `view_estimate` case — built from
@@ -8587,6 +9961,86 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     unawaited(_executeDeterministic(trigger, args: buildArgs(transcript, jobId), buildSpokenText: buildSpokenText));
   }
 
+  /// "Go to Job Details" as a named destination — always lands on Job
+  /// Details, whatever the back stack holds (see `navigation_destination.dart`
+  /// for the 1b059096 evidence). Available on every screen, like go_back,
+  /// and never gated by the per-screen registry. Plain destination-less
+  /// "go back" / "previous screen" never match here and keep going through
+  /// [_maybeDetectIntentionalGoBack] exactly as before.
+  ///
+  /// Already on Job Details it stands down entirely, so "show me the job
+  /// details" there still reads the summary (get_job_details) and "go home"
+  /// still gets go_back's own "already there" reply.
+  void _maybeTriggerJobDetailsDestination(String textChunk) {
+    if (_jobDetailsDestinationFiredThisUtterance) return;
+    final overridingGoBack = _goBackFiredThisUtterance;
+    if (_anyTriggerCommittedThisUtterance && !overridingGoBack) return;
+    _jobDetailsDestinationBuffer = '$_jobDetailsDestinationBuffer $textChunk'.trim();
+    final match = matchJobDetailsDestination(_jobDetailsDestinationBuffer);
+    if (match == null) return;
+    final from = _kbGateScreen().screen;
+    if (!overridingGoBack && from.startsWith('JobDetailScreen')) return;
+
+    _jobDetailsDestinationFiredThisUtterance = true;
+    _jobDetailsDestinationResolvedForCurrentUtterance = true;
+    _interruptGeminiForDeterministicTrigger('view_job_details');
+    _log_(
+      'DESTINATION TRIGGER MATCHED: view_job_details — "$_jobDetailsDestinationBuffer" names Job Details '
+      '(${match.how}) on $from'
+      '${overridingGoBack ? ' — overriding the generic go_back already fired for this utterance' : ''}'
+      ' — navigating straight there, not one screen back',
+    );
+    unawaited(_executeJobDetailsDestination(overridingGoBack: overridingGoBack));
+  }
+
+  Future<void> _executeJobDetailsDestination({required bool overridingGoBack}) async {
+    final jobId = widget.jobId;
+    if (jobId == null) {
+      _log_('DESTINATION TRIGGER: no job_id known (standalone mode) — skipping.');
+      return;
+    }
+    final myDispatchGeneration = _beginNewDispatchGeneration();
+    Map<String, dynamic> result;
+    _beginFunctionCallInFlight('deterministic view_job_details');
+    try {
+      result = await _pipelineDispatch(
+        name: 'view_job_details',
+        source: 'deterministic',
+        call: () async {
+          // The camera sits above every screen: close it the same way a
+          // spoken go_back does, then unwind the screens beneath it.
+          if (_screenTask != _ScreenTask.none || _cameraSession.controller != null) {
+            await _maybeCloseCameraFlowForGoBack(
+              {'status': 'already_at_job_details', 'job_id': jobId},
+              jobId: jobId,
+              tornDownReason: 'voice_go_to_job_details',
+            );
+          }
+          final status = _navigationSession.goToJobDetails(jobDetailRoute: activeJobDetailRoute);
+          return {'status': status, 'job_id': jobId};
+        },
+      );
+    } catch (e, stackTrace) {
+      debugPrint('GEMINI DETERMINISTIC TRIGGER ERROR (view_job_details): $e\n$stackTrace');
+      _log_('DESTINATION TRIGGER: view_job_details FAILED: $e');
+      return;
+    } finally {
+      _endFunctionCallInFlight('deterministic view_job_details');
+    }
+
+    _log_('DESTINATION TRIGGER: view_job_details result=$result');
+    _clearAllTriggerBuffersAfterSuccess('deterministic view_job_details');
+    _recordDispatchSucceeded(myDispatchGeneration, 'view_job_details');
+    if (_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: 'view_job_details')) return;
+    final status = result['status'];
+    final text = status == 'navigated_to_job_details' || (status == 'already_at_job_details' && overridingGoBack)
+        ? "Okay — you're on the job details screen."
+        : status == 'already_at_job_details'
+        ? "You're already on the job details screen."
+        : "I couldn't get to the job details screen — try the back arrow.";
+    _informGeminiToSpeakVerbatim(text, reason: 'deterministic view_job_details');
+  }
+
   /// FIX 2: whole-word/phrase match against [_intentionalGoBackPhrases] —
   /// same normalization/padding approach as [_looksLikeViewEstimateRequest]
   /// (lowercased, stripped to letters/spaces, space-padded substring
@@ -8602,6 +10056,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (!phraseMatch.exact) {
       debugPrint('FUZZY TRIGGER MATCH [go_back]: ${phraseMatch.describe()} matched in "$text"');
     }
+    _logIgnoredNegationPrefix('go_back', phraseMatch, text);
     return true;
   }
 
@@ -8662,6 +10117,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
     _goBackTriggerResolvedForCurrentUtterance = true;
+    _goBackFiredThisUtterance = true;
     _lastGoBackActivityAt = now;
     // PART G item 3 — see [_maybeTriggerDeterministic]'s matching comment.
     _interruptGeminiForDeterministicTrigger('go_back');
@@ -8721,6 +10177,22 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (_screenTask == _ScreenTask.cameraClosing) {
       return "The camera is closing — you'll be back on the job screen in a moment.";
     }
+    // The registry knows the screen actually showing — including one the
+    // technician tapped into, which this session's own push bookkeeping
+    // below never sees.
+    final registered = switch (ref.read(voiceCommandRegistryProvider.notifier).activeScreen) {
+      'JobDetailScreen' => 'the main job details screen',
+      'EstimateScreen' => 'the Estimate screen',
+      'ChangeOrdersScreen' => 'the Change Orders screen',
+      'InvoiceScreen' => 'the Invoice screen',
+      'InvoiceReviewScreen' => 'the Invoice Review screen',
+      'JobHistoryScreen' => 'the Job History screen',
+      'PhotoCaptureScreen' => 'the camera screen',
+      'PhotoPreviewScreen' => 'the photo preview screen',
+      'VoiceAssistantScreen' => 'the Voice Assistant screen',
+      _ => null,
+    };
+    if (registered != null) return "You're on $registered.";
     if (_viewScreenActive) {
       final label = switch (_navigationSession.topScreenName ?? _currentViewScreenName) {
         'view_estimate' => 'the Estimate screen',
@@ -8733,6 +10205,57 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return "You're currently on $label.";
     }
     return "You're on the main job details screen.";
+  }
+
+  /// KB GATE — which screen an unmatched utterance is being routed from,
+  /// and whether that screen allows the knowledge-base fallback (the
+  /// per-screen `kbFallbackEnabled` flag registered alongside each screen's
+  /// VOICE REGISTRY command set; `true` only for Job Detail). The camera
+  /// and photo-preview surfaces live inside this ambient overlay rather
+  /// than as routes, so Job Detail stays the registry's active screen
+  /// underneath them — [_screenTask] is checked first for exactly that
+  /// reason. Falls back to this session's own view bookkeeping (same as
+  /// [_describeCurrentScreen]) only for the single frame between one
+  /// screen unregistering and the next one's deferred registration.
+  ({String screen, bool kbFallbackEnabled}) _kbGateScreen() {
+    switch (_screenTask) {
+      case _ScreenTask.cameraOpening:
+      case _ScreenTask.cameraLive:
+      case _ScreenTask.cameraClosing:
+        return (screen: 'CameraCapture', kbFallbackEnabled: false);
+      case _ScreenTask.cameraCaptured:
+        return (screen: 'PhotoPreview', kbFallbackEnabled: false);
+      case _ScreenTask.none:
+        break;
+    }
+    if (_photoNote != null) return (screen: 'PhotoPreview', kbFallbackEnabled: false);
+    final registry = ref.read(voiceCommandRegistryProvider.notifier);
+    final active = registry.activeScreen;
+    if (active != null) return (screen: active, kbFallbackEnabled: registry.activeScreenKbFallbackEnabled);
+    if (_viewScreenActive) {
+      final screen = switch (_navigationSession.topScreenName ?? _currentViewScreenName) {
+        'view_estimate' => 'EstimateScreen',
+        'view_change_orders' => 'ChangeOrdersScreen',
+        'view_invoice' => 'InvoiceScreen',
+        'view_job_history' => 'JobHistoryScreen',
+        'get_last_photo' => 'PhotoViewerScreen',
+        _ => 'UnknownViewScreen',
+      };
+      return (screen: screen, kbFallbackEnabled: false);
+    }
+    return (screen: 'JobDetailScreen(no registrar yet)', kbFallbackEnabled: true);
+  }
+
+  /// Checks [_kbGateScreen] and logs the `KB GATE:` decision line. [source]
+  /// names which of the three KB entry points asked (early phrase match,
+  /// the catch-all, or a Gemini-initiated toolCall).
+  bool _kbGateAllows(String source) {
+    final gate = _kbGateScreen();
+    _log_(
+      'KB GATE: screen=${gate.screen} kbFallbackEnabled=${gate.kbFallbackEnabled} '
+      'action=${gate.kbFallbackEnabled ? 'routed_to_kb' : 'routed_to_clarification'} source=$source',
+    );
+    return gate.kbFallbackEnabled;
   }
 
   /// Directly executes `go_back` through the SAME dispatcher every genuine
@@ -8807,12 +10330,21 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// photo), matching [GeminiCameraSession.retake]'s own "discard, don't
   /// save" semantics, so the technician isn't left with the camera silently
   /// locked for the rest of the session.
+  ///
+  /// [tornDownReason] — see [_closeCameraFlowForNavigation]: the same close,
+  /// reached by the phone's back button or by moving to another screen
+  /// rather than a spoken go_back. Only changes the CAMERA OVERLAY TORN
+  /// DOWN log reason.
   Future<Map<String, dynamic>> _maybeCloseCameraFlowForGoBack(
     Map<String, dynamic> responsePayload, {
     required String jobId,
+    String tornDownReason = 'voice_go_back',
   }) async {
     if (responsePayload.containsKey('error')) return responsePayload;
     if (responsePayload['status'] == 'navigated_back') return responsePayload;
+    if (_screenTask != _ScreenTask.none) {
+      _log_('CAMERA OVERLAY TORN DOWN: reason=$tornDownReason (screenTask=${_screenTask.name})');
+    }
     // Reliability audit hardening (CHECK 5): consult the REAL camera
     // resource, not just `_screenTask`, as a defense-in-depth backstop —
     // `_screenTask` is now kept in sync with the resource on every camera
@@ -9956,6 +11488,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// itself only controls what THIS screen's own body renders (see
   /// [_buildCameraTaskBody]).
   void _updateScreenTaskForToolCall(String name, Map<String, dynamic> responsePayload) {
+    // A voice navigation to another screen while the camera is up moves
+    // past the camera — including "already on that screen" (e.g. Invoice
+    // under a camera opened from Invoice), where nothing gets pushed for
+    // the host route to notice.
+    if (_isNavigatingScreenFunction(name) && !responsePayload.containsKey('error') && _screenTask != _ScreenTask.none) {
+      unawaited(_closeCameraFlowForNavigation('screen_changed'));
+    }
     const cameraFunctionNames = {'open_camera', 'capture_photo', 'confirm_photo_upload', 'retake_photo'};
     if (!cameraFunctionNames.contains(name)) return;
 
@@ -11245,6 +12784,20 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// NOTHING) is making sure the client-side handling of that race can
   /// never silently eat the one turn that should have played, which is
   /// what [_currentResponseTurnId]'s per-chunk tagging now guarantees.
+  /// Spoken lines the APP starts on its own — not replies to anything the
+  /// technician said — keyed by their [_informGeminiToSpeakVerbatim] reason,
+  /// with the label their `LATENCY EXCLUDED (...)` line carries.
+  static const Map<String, String> _systemInitiatedReplyLabels = {
+    'inactivity_warning': 'inactivity turn',
+    'session_greeting': 'session greeting turn',
+    'session_greeting_replay': 'session greeting turn',
+  };
+
+  /// The most recent app-initiated line and when it was requested — its
+  /// first audible chunk is never timed against speech that came before
+  /// the request (see the LATENCY block in [_onResponseAudioChunk]).
+  ({String label, DateTime requestedAt})? _systemInitiatedTurn;
+
   void _informGeminiToSpeakVerbatim(String text, {required String reason, bool isFiller = false}) {
     if (_sessionClosing) {
       _pipelineLog('reply_requested', 'reason=$reason — NOT SENT: session is closing (left job scope) text="$text"');
@@ -11313,10 +12866,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       },
     });
     channel.sink.add(message);
+    _noteClientContentSent('verbatim:$reason');
     _log_('$reason: informed Gemini via clientContent (constrained verbatim instruction)');
+    final systemTurnLabel = _systemInitiatedReplyLabels[reason];
+    if (systemTurnLabel != null) {
+      _systemInitiatedTurn = (label: systemTurnLabel, requestedAt: DateTime.now());
+    }
     // See [_awaitingScriptedTurnWords]: from THIS send on, a turn only
     // plays once it's identified as this line, not because a timer fired.
-    _beginAwaitingScriptedTurn(text);
+    _beginAwaitingScriptedTurn(text, reason: reason);
   }
 
   /// Un-mutes [_suppressResponseAudioForDeterministic] the instant the
@@ -11457,6 +13015,17 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       if (_outgoingAudioPaused) _checkMicPauseWatchdog(idleThreshold: const Duration(milliseconds: 1000));
       return;
     }
+    // GEMINI INTENT CHECK — the classification turn is never meant to be
+    // heard, even if the model answers it out loud instead of (or as well
+    // as) calling the function. See [_maybeStartGeminiIntentCheck].
+    if (_geminiIntentCheck != null || _dropRestOfSpokenIntentCheckTurn) {
+      debugPrint(
+        'GEMINI LIVE TEST: GEMINI INTENT CHECK: dropping ${pcmBytes.length}-byte response chunk — intent '
+        'classification ${_geminiIntentCheck != null ? 'pending' : 'turn (spoken call syntax)'}',
+      );
+      if (_outgoingAudioPaused) _checkMicPauseWatchdog(idleThreshold: const Duration(milliseconds: 1000));
+      return;
+    }
     if (_fillerPassthroughActive && !_fillerAudioStarted) {
       _fillerAudioStarted = true;
       debugPrint('PENDING CALL FILLER: first filler chunk passed all gates at ${DateTime.now()} — playing');
@@ -11581,22 +13150,42 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           (transcriptAt == null || !transcriptAt.isAfter(speechEnd.add(_lateTranscriptMaxWait)));
       final reference = speechEndUsable ? speechEnd : (transcriptAt ?? stoppedAt);
       final latency = now.difference(reference);
-      _lastLatency = latency;
       final from = speechEndUsable
           ? 'end of speech Gemini received'
           : (transcriptAt != null ? 'transcript arrival (end of that speech not detected)' : 'last silence edge');
-      _log_('LATENCY (stopped speaking -> first response byte): ${latency.inMilliseconds}ms (from $from)');
-      _log_(
-        'LATENCY BREAKDOWN: speech end -> transcript '
-        '${speechEnd != null && transcriptAt != null ? '${transcriptAt.difference(speechEnd).inMilliseconds}ms${speechEndUsable ? '' : ' (too far apart to be the same speech)'}' : 'n/a'}, '
-        'transcript -> first response byte ${transcriptAt != null ? '${now.difference(transcriptAt).inMilliseconds}ms' : 'n/a'}, '
-        'old any-silence-edge figure ${now.difference(stoppedAt).inMilliseconds}ms',
-      );
+      // 9948b4d log: "LATENCY ... 47704ms (from last silence edge)" was the
+      // inactivity warning — the reply to the speech before it never played
+      // audibly, so the stopwatch was still running ~50s later and the app's
+      // own "Still there?" got timed as a response. A turn the APP asked for
+      // after the technician's last speech answers nothing they said, so it
+      // is excluded from the metric entirely (see [_systemInitiatedTurn]).
+      final systemTurn = _systemInitiatedTurn;
+      if (systemTurn != null && reference.isBefore(systemTurn.requestedAt)) {
+        _systemInitiatedTurn = null;
+        _log_(
+          'LATENCY EXCLUDED (${systemTurn.label}): first response byte of an app-initiated turn — the stopwatch\'s '
+          'reference ($from) was ${latency.inMilliseconds}ms ago, before the app asked for this line, so it times '
+          'nothing the technician said; not counted',
+        );
+      } else {
+        _lastLatency = latency;
+        _log_('LATENCY (stopped speaking -> first response byte): ${latency.inMilliseconds}ms (from $from)');
+        _log_(
+          'LATENCY BREAKDOWN: speech end -> transcript '
+          '${speechEnd != null && transcriptAt != null ? '${transcriptAt.difference(speechEnd).inMilliseconds}ms${speechEndUsable ? '' : ' (too far apart to be the same speech)'}' : 'n/a'}, '
+          'transcript -> first response byte ${transcriptAt != null ? '${now.difference(transcriptAt).inMilliseconds}ms' : 'n/a'}, '
+          'old any-silence-edge figure ${now.difference(stoppedAt).inMilliseconds}ms',
+        );
+      }
       _latencySpeechEndAt = null;
       _latencyTranscriptAt = null;
       if (mounted) setState(() {});
+    } else if (_systemInitiatedTurn != null) {
+      // Nothing was being timed: the app-initiated line just plays.
+      _systemInitiatedTurn = null;
     }
 
+    _captureGreetingChunk(pcmBytes);
     _enqueuePcmForPlayback(pcmBytes);
   }
 
@@ -11838,7 +13427,21 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     Future(() {
       if (mounted) setState(() {});
     });
+    // A session ending mid-greeting (left the job, "Loop Off") silences it.
+    widget.wakeGreeting?.stop(WakeGreetingOutcome.cancelled, 'session ended');
+    _abandonGreetingCapture('session ended');
+    _greetingReplayTimer?.cancel();
+    _greetingReplayTimer = null;
+    _greetingReplayArmed = false;
+    _transcriptStallTimer?.cancel();
+    _transcriptStallTimer = null;
     _screenTask = _ScreenTask.none;
+    // The overlay (and with it the post-frame host sync) is going away, so
+    // the camera's host route is removed here — never left orphaned on the
+    // stack after the session (see [_syncCameraHostRoute]).
+    final hostRoute = _cameraHostRoute;
+    _cameraHostRoute = null;
+    if (hostRoute != null) _removeCameraHostRoute(hostRoute, why: 'voice session ended');
     _cameraOpenConfirmed = false;
     _exitPhotoNote('voice session ended', outcome: 'session_ended');
     // The exit above already started its own photo's upload; anything else
@@ -11882,6 +13485,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _lateTranscriptFinalizeTimer?.cancel();
     _lateTranscriptFinalizeTimer = null;
     _awaitingLateTranscript = false;
+    _geminiIntentCheck?.timeout.cancel();
+    _geminiIntentCheck = null;
+    _dropRestOfSpokenIntentCheckTurn = false;
+    _pendingReconfirm = null;
+    _questionAnnouncement = null;
     // A session that failed or ended before setupComplete: its buffered
     // audio is discarded, never sent. A capture still opening is stopped
     // (generation bump) and waited for, so the recorder stop/close below
@@ -12150,6 +13758,134 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     );
   }
 
+  // ---------------------------------------------------------------------
+  // CAMERA HOST ROUTE (367d62af log) — the camera UI is painted by this
+  // ambient overlay, which lives OUTSIDE the Navigator, so on its own it
+  // had no place in the navigation stack: no VOICE REGISTRY transition, the
+  // phone's back button popped the screen underneath it, and screens pushed
+  // afterwards never dismissed it. While a camera flow is active, a plain
+  // placeholder route is pushed on the root navigator so the camera is a
+  // real, tracked screen on top of the one it was opened from. The camera
+  // itself is still drawn here (the overlay always paints above every
+  // route — `Overlay.rearrange` re-inserts foreign entries on top), so
+  // nothing about the camera/photo/note flow moves; the route only gives it
+  // a position:
+  //  - back button on it -> close the camera, exactly like a spoken go_back
+  //    (CAMERA OVERLAY TORN DOWN: reason=manual_nav);
+  //  - another screen pushed over it, or a voice navigation to any screen
+  //    -> close the camera (reason=screen_changed);
+  //  - camera flow over by any path -> the route is popped, returning to
+  //    exactly the screen underneath (which re-registers its commands).
+  // ---------------------------------------------------------------------
+
+  Route<void>? _cameraHostRoute;
+  bool _cameraHostSyncScheduled = false;
+
+  /// A navigation-driven close is running — no host route may be (re)pushed
+  /// meanwhile, and a second close request is a no-op.
+  bool _cameraNavCloseInProgress = false;
+
+  bool get _wantsCameraHostRoute =>
+      mounted && widget.ambient && _screenTask != _ScreenTask.none && !_sessionClosing && !_cameraNavCloseInProgress;
+
+  /// Called from every ambient build — every camera-state change goes
+  /// through `setState`, so this sees them all. The push/pop itself happens
+  /// after the frame (never during build).
+  void _scheduleCameraHostSync() {
+    if (!widget.ambient || _cameraHostSyncScheduled) return;
+    if ((_screenTask != _ScreenTask.none) == (_cameraHostRoute != null)) return;
+    _cameraHostSyncScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _cameraHostSyncScheduled = false;
+      _syncCameraHostRoute();
+    });
+  }
+
+  void _syncCameraHostRoute() {
+    final route = _cameraHostRoute;
+    if (_wantsCameraHostRoute && route == null) {
+      final navigator = rootNavigatorKey.currentState;
+      if (navigator == null) return;
+      final from = _kbGateScreen().screen;
+      late final Route<void> newRoute;
+      newRoute = PageRouteBuilder<void>(
+        settings: const RouteSettings(name: 'gemini_camera'),
+        transitionDuration: Duration.zero,
+        reverseTransitionDuration: Duration.zero,
+        pageBuilder: (_, _, _) => _CameraHostPage(
+          onBackPressed: () => unawaited(_closeCameraFlowForNavigation('manual_nav')),
+          onCovered: () => unawaited(_closeCameraFlowForNavigation('screen_changed')),
+        ),
+      );
+      _cameraHostRoute = newRoute;
+      _log_('CAMERA HOST: camera flow (${_screenTask.name}) is now the foreground screen — pushed its route over $from');
+      unawaited(
+        navigator.push(newRoute).then((_) {
+          if (!identical(_cameraHostRoute, newRoute)) return; // removed by us
+          // Removed by someone else (e.g. a pop-to-home) while the camera
+          // was still up — the camera goes with it. A session already
+          // closing (leaving the job) releases the camera in its own
+          // teardown.
+          _cameraHostRoute = null;
+          if (_sessionClosing || !mounted) return;
+          _log_('CAMERA HOST: route removed externally while the camera was up');
+          unawaited(_closeCameraFlowForNavigation('screen_changed'));
+        }),
+      );
+      return;
+    }
+    if (!_wantsCameraHostRoute && route != null && !_cameraNavCloseInProgress) {
+      _cameraHostRoute = null;
+      _removeCameraHostRoute(route, why: 'camera flow ended (${_screenTask.name})');
+    }
+  }
+
+  /// Pops [route] when it's on top (so the screen underneath gets its
+  /// didPopNext and re-registers its voice commands — `removeRoute` would
+  /// skip that), otherwise removes it in place. Deferred past the current
+  /// frame/navigator operation.
+  void _removeCameraHostRoute(Route<void> route, {required String why}) {
+    Future(() {
+      final navigator = route.navigator;
+      if (navigator == null || !route.isActive) return;
+      _log_('CAMERA HOST: removing the camera route ($why)');
+      if (route.isCurrent) {
+        navigator.pop();
+      } else {
+        navigator.removeRoute(route);
+      }
+    });
+  }
+
+  /// Closes the camera flow because the technician moved past it by some
+  /// means other than a spoken go_back — the SAME close a spoken go_back
+  /// does ([_maybeCloseCameraFlowForGoBack]). A close requested while a
+  /// native capture/upload is mid-flight waits for it rather than pulling
+  /// the camera out from under it.
+  Future<void> _closeCameraFlowForNavigation(String reason, {int attempt = 0}) async {
+    if (!mounted || _cameraNavCloseInProgress || _screenTask == _ScreenTask.none) return;
+    if (_cameraNativeCallInProgress || _photoUploadInFlight) {
+      if (attempt == 0) {
+        _log_('CAMERA HOST: close ($reason) waiting — a native capture/upload is still in flight');
+      }
+      if (attempt < 120) {
+        Timer(const Duration(milliseconds: 500), () => _closeCameraFlowForNavigation(reason, attempt: attempt + 1));
+      }
+      return;
+    }
+    _cameraNavCloseInProgress = true;
+    try {
+      await _maybeCloseCameraFlowForGoBack(
+        const {'status': 'already_at_job_details'},
+        jobId: widget.jobId ?? '',
+        tornDownReason: reason,
+      );
+    } finally {
+      _cameraNavCloseInProgress = false;
+      if (mounted) setState(() {}); // re-sync: the host route comes off now
+    }
+  }
+
   /// The ambient-mode UI (see [GeminiLiveTestScreen.ambient]'s doc
   /// comment) — routes to one of three presentations:
   ///  - [_viewScreenActive] (a view_* screen — Estimate/Change Orders/
@@ -12167,7 +13903,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   ///    [_buildAmbientScreenTaskUi], a normal opaque `Scaffold`, since that
   ///    content needs its own solid background.
   Widget _buildAmbientUi(BuildContext context) {
-    if (_viewScreenActive) return const SizedBox.shrink();
+    _scheduleCameraHostSync();
+    // An active camera flow is ALWAYS the foreground screen — its own host
+    // route sits on top of whatever screen it was opened from (see
+    // [_syncCameraHostRoute]). 367d62af log: opened from Invoice, the
+    // camera went live while this returned nothing, so it stayed invisible
+    // until the technician backed out of Invoice and found it underneath.
+    if (_viewScreenActive && _screenTask == _ScreenTask.none) return const SizedBox.shrink();
     return _screenTask == _ScreenTask.none
         ? _buildAmbientPureConversationUi(context)
         : _buildAmbientScreenTaskUi(context);
@@ -12473,6 +14215,45 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// The camera flow's placeholder page on the root navigator — see the
+/// CAMERA HOST ROUTE notes in [_GeminiLiveTestScreenState]. Paints only a
+/// plain background (the ambient overlay draws the actual camera above
+/// it), registers as its own VOICE REGISTRY screen with no commands and no
+/// KB fallback, turns the phone's back button into "close the camera", and
+/// reports another screen being pushed over it.
+class _CameraHostPage extends ConsumerStatefulWidget {
+  const _CameraHostPage({required this.onBackPressed, required this.onCovered});
+
+  final VoidCallback onBackPressed;
+  final VoidCallback onCovered;
+
+  @override
+  ConsumerState<_CameraHostPage> createState() => _CameraHostPageState();
+}
+
+class _CameraHostPageState extends ConsumerState<_CameraHostPage>
+    with SafeRefDisposal<_CameraHostPage>, VoiceCommandRegistrarMixin<_CameraHostPage> {
+  @override
+  List<VoiceCommand> buildVoiceCommands() => const [];
+
+  @override
+  void didPushNext() {
+    super.didPushNext();
+    widget.onCovered();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) widget.onBackPressed();
+      },
+      child: const ColoredBox(color: AppColors.background, child: SizedBox.expand()),
     );
   }
 }

@@ -14,6 +14,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../routing/app_navigator_key.dart';
 import '../screens/gemini_live_test_screen.dart';
 import '../services/gemini_token_cache.dart';
+import '../services/wake_greeting_clip.dart';
 import 'currently_viewed_job_provider.dart';
 import 'deepgram_command_capture.dart';
 import 'permission_providers.dart';
@@ -258,7 +259,8 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
 
   /// A token for a Gemini session starting right now — the pre-fetched
   /// spare when there is one, otherwise fetched on demand (the old path).
-  Future<String> takeGeminiToken() => _geminiTokens.take();
+  /// [wakeAt] is only logged (see [GeminiTokenCache.take]).
+  Future<String> takeGeminiToken({DateTime? wakeAt}) => _geminiTokens.take(wakeAt: wakeAt);
 
   /// Called from `FieldLoopApp`'s lifecycle observer. Backgrounded: drop
   /// the spare and stop refreshing it (same release-on-pause the camera
@@ -1228,8 +1230,15 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // no-op error listener only keeps an early return below from leaving a
     // failed fetch unhandled; the session itself still awaits and reports
     // any error exactly as before.
-    final tokenFuture = takeGeminiToken();
+    final wakeAt = _wakeWordDetectedAt;
+    final tokenFuture = takeGeminiToken(wakeAt: wakeAt);
     unawaited(tokenFuture.then((_) {}, onError: (Object _) {}));
+
+    // The greeting starts NOW, from the saved clip, instead of after the
+    // session connects and Gemini speaks it — see wake_greeting_clip.dart.
+    // The session screen holds back mic audio while it plays and stops it
+    // the moment the technician is heard speaking.
+    final greeting = _startWakeGreeting(wakeAt);
 
     await pauseForExternalSession('wake_word');
 
@@ -1238,6 +1247,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // the mic was being released just above.
     if (!_jobScopeActive) {
       debugPrint('VOICE: wake word heard but job scope is not active — not starting a Gemini session');
+      greeting?.stop(WakeGreetingOutcome.cancelled, 'no session started (out of job scope)');
       await resumeAfterExternalSession('wake_word_out_of_scope');
       return;
     }
@@ -1245,6 +1255,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     final jobId = _ref.read(currentlyViewedJobIdProvider);
     if (jobId == null) {
       debugPrint('VOICE: wake word heard but no job is currently open — nothing to start a Gemini session for');
+      greeting?.stop(WakeGreetingOutcome.cancelled, 'no session started (no job open)');
       await resumeAfterExternalSession('wake_word_no_job');
       return;
     }
@@ -1252,6 +1263,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     final navigatorState = rootNavigatorKey.currentState;
     if (navigatorState == null) {
       debugPrint('VOICE ERROR: rootNavigatorKey has no live NavigatorState — cannot start a Gemini session');
+      greeting?.stop(WakeGreetingOutcome.cancelled, 'no session started (no navigator)');
       await resumeAfterExternalSession('wake_word_no_navigator');
       return;
     }
@@ -1266,6 +1278,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     final overlay = navigatorState.overlay;
     if (overlay == null) {
       debugPrint('VOICE ERROR: no root Overlay available — cannot start a Gemini session');
+      greeting?.stop(WakeGreetingOutcome.cancelled, 'no session started (no overlay)');
       await resumeAfterExternalSession('wake_word_no_overlay');
       return;
     }
@@ -1280,6 +1293,8 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
         jobId: jobId,
         ambient: true,
         tokenFuture: tokenFuture,
+        wakeDetectedAt: wakeAt,
+        wakeGreeting: greeting,
         endRequest: endRequest,
         onAmbientSessionEnded: () {
           entry.remove();
@@ -1289,6 +1304,8 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     );
     overlay.insert(entry);
     await sessionEnded.future;
+    // Backstop — the screen's own teardown already stops it.
+    greeting?.stop(WakeGreetingOutcome.cancelled, 'session ended');
     if (identical(_activeGeminiSessionEndRequest, endRequest)) _activeGeminiSessionEndRequest = null;
 
     // Defensive backstop, not the primary resume path: GeminiLiveTestScreen
@@ -1299,6 +1316,22 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // idempotency guard), and only actually does something if some future
     // change ever let the entry go away without running _teardown() first.
     await resumeAfterExternalSession('wake_word_session_returned');
+  }
+
+  /// Plays the saved greeting clip for this wake word, unless no session
+  /// could start (the same scope/job checks [_triggerGeminiSession] repeats
+  /// after releasing the mic) or the on-device recognizer already heard more
+  /// after the wake word in the same breath ("FieldLoop, take a photo") —
+  /// that command is the opening, and a greeting over it would only
+  /// compete. Null when skipped; the screen then behaves exactly as before.
+  WakeGreetingPlayback? _startWakeGreeting(DateTime? wakeAt) {
+    if (wakeAt == null) return null;
+    if (!_jobScopeActive || _ref.read(currentlyViewedJobIdProvider) == null) return null;
+    if (_pendingCommandText.isNotEmpty) {
+      debugPrint('WAKE GREETING: skipped — the technician kept talking after the wake word ("$_pendingCommandText")');
+      return null;
+    }
+    return WakeGreetingPlayback.start(detectedAt: wakeAt);
   }
 
   /// Cuts short an in-flight Deepgram capture (see

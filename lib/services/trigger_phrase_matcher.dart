@@ -47,7 +47,10 @@
 ///    capture_photo. The old literal-substring path actually DID fire on
 ///    it (" take it " is right there as a substring); loosening matching
 ///    without adding this would have made that worse, not better. See
-///    [_negatedAt].
+///    [_negatedAt]. The one exception: a "No,"/"Nope,"/"Nah," cut off from
+///    the phrase by punctuation is a reaction, not a negation ("No, go
+///    back." is a go-back request) — see [clauseBoundariesBefore]. "No,
+///    don't take it" still vetoes on its "don't".
 ///  - SCOPE WORDS ARE LOAD-BEARING. 'last'/'another'/'again' separate
 ///    get_last_photo from open_camera/capture_photo, so they are
 ///    unskippable too.
@@ -198,9 +201,52 @@ bool _wordMatches(String transcriptStem, String phraseStem) {
   return _editDistance(transcriptStem, phraseStem) <= 1;
 }
 
-bool _negatedAt(List<String> words, int index) {
+/// Negation words that are just as often a standalone REACTION as a
+/// negation: "No, go back." / "Nope, show me the invoice." — a correction or
+/// a verbal tic in front of the command, not "don't go back". Only these can
+/// be cut off from what follows by punctuation; "not"/"never"/"don't" can't
+/// stand alone like that, so they always negate.
+const Set<String> interjectionNegationWords = {'no', 'nope', 'nah'};
+
+final RegExp _clauseBoundaryGap = RegExp(r'[,.;:!?…—–]|\s-|-\s');
+
+/// For each token [tokenizeTriggerText] produces from [text], whether a
+/// clause boundary — `, . ; : ! ?`, a dash, or an ellipsis — sits between
+/// it and the token before it. Token-for-token aligned with
+/// [tokenizeTriggerText] (both split on every non-letter), so index `i`
+/// here describes word `i` there.
+///
+/// 9948b4d log (u=20): "No, go back." on the Invoice screen was vetoed as
+/// a negated "go back" — tokenizing had already thrown the comma away, so
+/// the matcher saw "no go back". The comma is exactly what tells "No, go
+/// back." (a correction, then a command) from "no go back".
+List<bool> clauseBoundariesBefore(String text) {
+  final lower = text.toLowerCase();
+  final boundaries = <bool>[];
+  var previousEnd = -1;
+  for (final match in RegExp('[a-z]+').allMatches(lower)) {
+    final gap = previousEnd < 0 ? '' : lower.substring(previousEnd, match.start);
+    // A spaced hyphen ("No - go back") is a dash; an unspaced one
+    // ("follow-up") joins a word and is not a boundary.
+    boundaries.add(_clauseBoundaryGap.hasMatch(gap));
+    previousEnd = match.end;
+  }
+  return boundaries;
+}
+
+/// The interjection a match was allowed past (see [interjectionNegationWords]),
+/// or null. Pure; [_negatedAt] uses it, and callers log it.
+String? _ignoredInterjectionAt(List<String> words, List<bool>? boundaries, int index) {
+  if (index <= 0 || boundaries == null || index >= boundaries.length) return null;
+  final prev = words[index - 1];
+  if (interjectionNegationWords.contains(prev) && boundaries[index]) return prev;
+  return null;
+}
+
+bool _negatedAt(List<String> words, int index, [List<bool>? boundaries]) {
   if (index <= 0) return false;
   final prev = words[index - 1];
+  if (_ignoredInterjectionAt(words, boundaries, index) != null) return false;
   if (_negationWords.contains(prev)) return true;
   // "don t take it" / "didn t keep it" — the apostrophe already split the
   // contraction into two tokens, so the real negation sits one further back.
@@ -212,10 +258,21 @@ bool _negatedAt(List<String> words, int index) {
 /// can say which phrase fired and whether it needed the fuzzy path, making
 /// this directly verifiable from a real log instead of inferred.
 class TriggerPhraseMatch {
-  const TriggerPhraseMatch({required this.phrase, required this.exact, required this.gapWords});
+  const TriggerPhraseMatch({
+    required this.phrase,
+    required this.exact,
+    required this.gapWords,
+    this.ignoredNegationPrefix,
+  });
 
   /// The phrase list entry that matched, verbatim as written in the list.
   final String phrase;
+
+  /// Set when a leading "No,"/"Nope,"/"Nah," directly in front of the phrase
+  /// was read as a reaction, not a negation, because punctuation separates
+  /// it from the phrase (see [clauseBoundariesBefore]) — the word itself.
+  /// Callers log this as `NEGATION PREFIX IGNORED`.
+  final String? ignoredNegationPrefix;
 
   /// True when the phrase matched word-for-word with no stemming difference
   /// and no inserted filler — i.e. the old literal-substring path would
@@ -237,6 +294,7 @@ TriggerPhraseMatch? _matchStemmedPhrase(
   List<String> rawWords,
   List<String> phraseWords,
   String phraseLabel,
+  List<bool> boundaries,
 ) {
   for (var start = 0; start < words.length; start++) {
     var w = start;
@@ -258,8 +316,13 @@ TriggerPhraseMatch? _matchStemmedPhrase(
       w++;
     }
     if (p < phraseWords.length) continue;
-    if (_negatedAt(words, start)) continue;
-    return TriggerPhraseMatch(phrase: phraseLabel, exact: !anyFuzzyWord && gaps == 0, gapWords: gaps);
+    if (_negatedAt(words, start, boundaries)) continue;
+    return TriggerPhraseMatch(
+      phrase: phraseLabel,
+      exact: !anyFuzzyWord && gaps == 0,
+      gapWords: gaps,
+      ignoredNegationPrefix: _ignoredInterjectionAt(words, boundaries, start),
+    );
   }
   return null;
 }
@@ -277,10 +340,11 @@ TriggerPhraseMatch? matchAnyTriggerPhrase(String transcript, List<String> phrase
   final rawWords = tokenizeTriggerText(transcript);
   if (rawWords.isEmpty) return null;
   final words = stemTriggerWords(rawWords);
+  final boundaries = clauseBoundariesBefore(transcript);
   for (final phrase in phrases) {
     final phraseWords = stemTriggerWords(tokenizeTriggerText(phrase));
     if (phraseWords.isEmpty) continue;
-    final match = _matchStemmedPhrase(words, rawWords, phraseWords, phrase);
+    final match = _matchStemmedPhrase(words, rawWords, phraseWords, phrase, boundaries);
     if (match != null) return match;
   }
   return null;
@@ -292,6 +356,7 @@ TriggerPhraseMatch? matchAnyTriggerPhrase(String transcript, List<String> phrase
 /// internally. Returns false when the phrase isn't present at all.
 bool triggerPhraseIsNegated(String transcript, String phrase) {
   final words = stemTriggerWords(tokenizeTriggerText(transcript));
+  final boundaries = clauseBoundariesBefore(transcript);
   final phraseWords = stemTriggerWords(tokenizeTriggerText(phrase));
   if (phraseWords.isEmpty || words.isEmpty) return false;
   var sawOccurrence = false;
@@ -305,7 +370,7 @@ bool triggerPhraseIsNegated(String transcript, String phrase) {
     }
     if (!ok) continue;
     sawOccurrence = true;
-    if (!_negatedAt(words, start)) return false;
+    if (!_negatedAt(words, start, boundaries)) return false;
   }
   return sawOccurrence;
 }

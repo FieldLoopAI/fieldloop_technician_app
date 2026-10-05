@@ -21,6 +21,10 @@ const Map<String, ({Duration delay, String text})> pendingCallFillers = {
   'open_camera': (delay: Duration(seconds: 5), text: 'Just a moment, opening the camera.'),
   'capture_photo': (delay: Duration(milliseconds: 1500), text: 'Just a second, still capturing.'),
   'confirm_photo_upload': (delay: Duration(milliseconds: 1500), text: 'Still uploading, one more second.'),
+  // Not a camera call and no audio hard-pause — spoken the same way, just
+  // without the passthrough (see `_dispatchWithOpenCameraSafeguards`). No
+  // follow-up: the lookup itself now fails within `kbAnswerRequestTimeout`.
+  'get_kb_answer': (delay: Duration(milliseconds: 1500), text: 'One moment, checking that.'),
 };
 
 /// One follow-up line for a call still pending long after its first filler

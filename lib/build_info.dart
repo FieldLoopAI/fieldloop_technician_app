@@ -12,8 +12,8 @@
 
 /// Incrementing build counter — see `build_number.txt` at the repo root,
 /// which the generator script bumps by 1 every time it runs.
-const int kBuildNumber = 144;
+const int kBuildNumber = 167;
 
 /// Wall-clock time this build was generated, captured when the generator
 /// script ran — NOT a hardcoded value that could be forgotten to update.
-const String kBuildTimestamp = '2026-09-29 17:32';
+const String kBuildTimestamp = '2026-10-02 15:42';
