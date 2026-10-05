@@ -102,17 +102,22 @@ class JobCompleteActionController extends StateNotifier<AsyncValue<void>> {
       final warningShown = !evidence.hasAny;
 
       debugPrint('JOB COMPLETE: checking for an open visit to close before completing job $jobId...');
-      final openVisitArrivedAt = await fetchOpenVisitArrivedAt(jobId);
-      if (openVisitArrivedAt != null) {
-        debugPrint(
-          'JOB COMPLETE: job $jobId has an open visit (arrived $openVisitArrivedAt) — '
-          'auto-closing it before completion',
-        );
-        await insertDepartureEvent(jobId: jobId, technicianId: technicianId, source: 'job_complete');
-        _ref.invalidate(openVisitProvider(jobId));
-      } else {
-        debugPrint('JOB COMPLETE: job $jobId has no open visit — nothing to auto-close');
-      }
+      // Serialized with the automatic/manual arrive/depart writes (see
+      // `runVisitWriteExclusive`) so a departure debounce firing at the
+      // same moment can't double-close the visit.
+      await runVisitWriteExclusive(jobId, 'job-complete auto-close', () async {
+        final openVisitArrivedAt = await fetchOpenVisitArrivedAt(jobId);
+        if (openVisitArrivedAt != null) {
+          debugPrint(
+            'JOB COMPLETE: job $jobId has an open visit (arrived $openVisitArrivedAt) — '
+            'auto-closing it before completion',
+          );
+          await insertDepartureEvent(jobId: jobId, technicianId: technicianId, source: 'job_complete');
+        } else {
+          debugPrint('JOB COMPLETE: job $jobId has no open visit — nothing to auto-close');
+        }
+      });
+      _ref.invalidate(openVisitProvider(jobId));
 
       debugPrint('JOB COMPLETE: inserting field_events (job_complete) for job $jobId (before status flip)...');
       await supabase.from('field_events').insert({

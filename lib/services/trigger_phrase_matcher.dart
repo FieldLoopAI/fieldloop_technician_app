@@ -293,6 +293,7 @@ TriggerPhraseMatch? _matchStemmedPhrase(
   List<String> words,
   List<String> rawWords,
   List<String> phraseWords,
+  List<String> rawPhraseWords,
   String phraseLabel,
   List<bool> boundaries,
 ) {
@@ -303,7 +304,9 @@ TriggerPhraseMatch? _matchStemmedPhrase(
     var anyFuzzyWord = false;
     while (p < phraseWords.length && w < words.length) {
       if (_wordMatches(words[w], phraseWords[p])) {
-        if (rawWords[w] != phraseWords[p]) anyFuzzyWord = true;
+        // Raw against RAW: comparing against the stemmed phrase word logged
+        // every verbatim "picture" phrase as fuzzy ("picture" vs "pictur").
+        if (rawWords[w] != rawPhraseWords[p]) anyFuzzyWord = true;
         w++;
         p++;
         continue;
@@ -342,9 +345,10 @@ TriggerPhraseMatch? matchAnyTriggerPhrase(String transcript, List<String> phrase
   final words = stemTriggerWords(rawWords);
   final boundaries = clauseBoundariesBefore(transcript);
   for (final phrase in phrases) {
-    final phraseWords = stemTriggerWords(tokenizeTriggerText(phrase));
+    final rawPhraseWords = tokenizeTriggerText(phrase);
+    final phraseWords = stemTriggerWords(rawPhraseWords);
     if (phraseWords.isEmpty) continue;
-    final match = _matchStemmedPhrase(words, rawWords, phraseWords, phrase, boundaries);
+    final match = _matchStemmedPhrase(words, rawWords, phraseWords, rawPhraseWords, phrase, boundaries);
     if (match != null) return match;
   }
   return null;

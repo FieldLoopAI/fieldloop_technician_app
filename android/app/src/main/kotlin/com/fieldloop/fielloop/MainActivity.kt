@@ -57,6 +57,7 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "getAudioRouteInfo" -> result.success(getAudioRouteInfo())
+                    "getActiveRecordingInfo" -> result.success(getActiveRecordingInfo())
                     "isBluetoothAudioDevicePresent" -> result.success(isBluetoothAudioDevicePresent())
                     "startBluetoothScoAudio" -> startBluetoothScoAudio(result)
                     "stopBluetoothScoAudio" -> result.success(stopBluetoothScoAudio())
@@ -458,6 +459,56 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * DIAGNOSTIC ONLY (FIX 5 — tablet-only transcript timeouts). Read-only:
+     * what Android ACTUALLY has in effect for this app's live recording(s),
+     * as opposed to what the app asked flutter_sound for. A non-privileged
+     * app only ever sees its own recordings here. Answers the open
+     * tablet-vs-phone question with data: the real client and hardware
+     * capture formats, the audio source and input device in use, whether
+     * the platform is silencing this client, and which pre-processing
+     * effects (AEC / noise suppression / AGC) are attached.
+     */
+    private fun getActiveRecordingInfo(): Map<String, Any?> {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        fun describeFormat(format: android.media.AudioFormat): String =
+            "${format.sampleRate}Hz ch=${format.channelCount} encoding=${format.encoding}"
+
+        val recordings = try {
+            audioManager.activeRecordingConfigurations.map { config ->
+                val entry = mutableMapOf<String, Any?>(
+                    "audioSource" to config.clientAudioSource,
+                    "sessionId" to config.clientAudioSessionId,
+                    "clientFormat" to describeFormat(config.clientFormat),
+                    "deviceFormat" to describeFormat(config.format),
+                    "inputDevice" to (config.audioDevice?.let { describeDevice(it) } ?: "unknown"),
+                )
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    entry["clientSilenced"] = config.isClientSilenced
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    entry["clientEffects"] = config.clientEffects.map { it.name }
+                    entry["deviceEffects"] = config.effects.map { it.name }
+                }
+                entry
+            }
+        } catch (e: Exception) {
+            listOf(mapOf("error" to "${e.javaClass.simpleName}: ${e.message}"))
+        }
+
+        return mapOf(
+            "device" to "${Build.MANUFACTURER} ${Build.MODEL} (API ${Build.VERSION.SDK_INT})",
+            "smallestScreenWidthDp" to resources.configuration.smallestScreenWidthDp,
+            "isTablet" to (resources.configuration.smallestScreenWidthDp >= 600),
+            "audioMode" to audioManager.mode,
+            "outputSampleRate" to audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE),
+            "aecAvailable" to android.media.audiofx.AcousticEchoCanceler.isAvailable(),
+            "nsAvailable" to android.media.audiofx.NoiseSuppressor.isAvailable(),
+            "agcAvailable" to android.media.audiofx.AutomaticGainControl.isAvailable(),
+            "activeRecordings" to recordings,
+        )
     }
 
     private fun describeDevice(device: AudioDeviceInfo): String {

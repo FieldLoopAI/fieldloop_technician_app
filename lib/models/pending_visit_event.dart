@@ -31,6 +31,7 @@ class PendingVisitEvent {
     required this.eventType,
     required this.source,
     required this.eventTs,
+    this.visitSeq,
     required this.createdAt,
     this.status = PendingVisitEventStatus.pending,
   });
@@ -53,6 +54,10 @@ class PendingVisitEvent {
   /// shifted to whenever the write eventually succeeds.
   final DateTime eventTs;
 
+  /// `metadata.visit_seq` for a queued `gps_arrive` (null for a departure)
+  /// — see `visit_provider.dart`'s duplicate-arrival protection.
+  final int? visitSeq;
+
   final DateTime createdAt;
   final PendingVisitEventStatus status;
 
@@ -64,6 +69,7 @@ class PendingVisitEvent {
       'event_type': eventType,
       'source': source,
       'event_ts': eventTs.toUtc().toIso8601String(),
+      'visit_seq': visitSeq,
       'created_at': createdAt.toIso8601String(),
       'status': status.name,
     };
@@ -77,6 +83,7 @@ class PendingVisitEvent {
       eventType: map['event_type'] as String,
       source: map['source'] as String,
       eventTs: DateTime.parse(map['event_ts'] as String),
+      visitSeq: map['visit_seq'] as int?,
       createdAt: DateTime.parse(map['created_at'] as String),
       status: PendingVisitEventStatus.fromName(map['status'] as String),
     );

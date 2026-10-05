@@ -22,6 +22,7 @@
 /// so trade/job questions keep reaching the knowledge base.
 library;
 
+import 'camera_request_matcher.dart';
 import 'trigger_phrase_matcher.dart';
 
 /// Words dropped before matching — spoken filler that carries no intent.
@@ -58,6 +59,7 @@ class CommandIntent {
     required this.objects,
     required this.actions,
     this.vetoWords = const {},
+    this.requestShape,
   });
 
   /// The trigger/function name, e.g. `open_camera`.
@@ -74,7 +76,20 @@ class CommandIntent {
   /// neighboring intents from colliding ("last photo" is get_last_photo,
   /// never open_camera).
   final Set<String> vetoWords;
+
+  /// When set and it returns false for the transcript, an action word does
+  /// NOT earn the action+object score — the sentence mentions the object
+  /// but isn't asking for it (see `camera_request_matcher.dart`, Module
+  /// D3). The bare-object / short-utterance scores still apply, so at most
+  /// it lands WEAK (clarification), never a direct action.
+  final bool Function(String transcript)? requestShape;
 }
+
+/// open_camera's [CommandIntent.requestShape]: false only when the strict
+/// camera matcher recognized the noun AND judged the sentence a remark. A
+/// noun it doesn't recognize (garbled ASR, "foto") keeps the fuzzy layer's
+/// own judgement, exactly as before.
+bool _cameraRequestShape(String transcript) => matchLooseCameraRequest(transcript) is! CameraRequestRejection;
 
 const Set<String> _navigationActions = {
   'show', 'see', 'view', 'open', 'pull', 'bring', 'check', 'look', 'display', 'go', 'take', 'give', 'need', 'want',
@@ -99,6 +114,7 @@ const List<CommandIntent> defaultCommandIntents = [
       'fire', 'pull', 'bring', 'click',
     },
     vetoWords: {'last', 'previous', 'latest', 'recent', 'earlier', 'delete'},
+    requestShape: _cameraRequestShape,
   ),
   CommandIntent(
     trigger: 'get_last_photo',
@@ -271,7 +287,12 @@ class IntentScore {
 
 /// Scores one intent against already-normalized [words]. [boundaries] (see
 /// [normalizeCommandWordsWithBoundaries]) keeps negation inside its clause.
-IntentScore? scoreIntent(CommandIntent intent, List<String> words, {List<bool>? boundaries}) {
+IntentScore? scoreIntent(
+  CommandIntent intent,
+  List<String> words, {
+  List<bool>? boundaries,
+  bool allowActionMatch = true,
+}) {
   if (words.any((w) => intent.vetoWords.any((v) => _sameWord(w, v)))) return null;
 
   int objectAt = -1;
@@ -296,6 +317,7 @@ IntentScore? scoreIntent(CommandIntent intent, List<String> words, {List<bool>? 
     final action = intent.actions.where((a) => _sameWord(words[i], a)).firstOrNull;
     if (action == null) continue;
     if (_negatedBefore(words, i, boundaries)) return null;
+    if (!allowActionMatch) break;
     cutOff = cutOff || (boundaries != null && _negationCutOffByBoundary(words, i, boundaries));
     return IntentScore(
       intent,
@@ -401,7 +423,13 @@ IntentDecision classifyCommandIntent(String transcript, {List<CommandIntent> int
   if (words.isEmpty) return const IntentDecision(IntentDecisionKind.none);
 
   final scores = [
-    for (final intent in intents) ?scoreIntent(intent, words, boundaries: normalized.boundaries),
+    for (final intent in intents)
+      ?scoreIntent(
+        intent,
+        words,
+        boundaries: normalized.boundaries,
+        allowActionMatch: intent.requestShape?.call(transcript) ?? true,
+      ),
   ]..sort((a, b) => b.confidence.compareTo(a.confidence));
   if (scores.isEmpty) return const IntentDecision(IntentDecisionKind.none);
 

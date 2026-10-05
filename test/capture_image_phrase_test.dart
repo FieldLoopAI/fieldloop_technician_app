@@ -40,7 +40,7 @@ void main() {
 
   group('camera not open yet: open_camera still resolves exactly as before', () {
     test('"let\'s take the image" still matches open_camera\'s own phrase', () {
-      expect(matchAnyTriggerPhrase("let's take the image", openCamera)?.phrase, 'lets take the image');
+      expect(matchAnyTriggerPhrase("let's take the image", openCamera)?.phrase, 'let s take the image');
     });
     test('"take the image" still reaches open_camera via the intent layer', () {
       final d = classifyCommandIntent('take the image');

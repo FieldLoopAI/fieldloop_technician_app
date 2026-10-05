@@ -27,7 +27,9 @@ class PendingVisitEventsDb {
     final dbPath = p.join(await getDatabasesPath(), 'fielloop_pending_visit_events.db');
     final db = await openDatabase(
       dbPath,
-      version: 1,
+      // v2 adds `visit_seq` (duplicate-arrival protection — see
+      // `visit_provider.dart`); rows queued under v1 keep it NULL.
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE pending_visit_events (
@@ -37,10 +39,16 @@ class PendingVisitEventsDb {
             event_type TEXT NOT NULL,
             source TEXT NOT NULL,
             event_ts TEXT NOT NULL,
+            visit_seq INTEGER,
             created_at TEXT NOT NULL,
             status TEXT NOT NULL
           )
         ''');
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute('ALTER TABLE pending_visit_events ADD COLUMN visit_seq INTEGER');
+        }
       },
     );
     _db = db;

@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'job_runtime_provider.dart';
+import 'visit_provider.dart';
 
 /// Whether a manual/geofence arrival has already been logged for this job,
 /// straight from `field_events` (`event_type = 'gps_arrive'`). This is the
@@ -45,37 +46,67 @@ class ArrivalActionController extends StateNotifier<AsyncValue<void>> {
   final String jobId;
 
   /// [source] is stored on the `field_events` row's metadata so `'manual'`
-  /// (the "I've Arrived" button) and `'automatic'` (geofence trigger) can be
-  /// told apart later.
-  Future<void> markArrived({required String technicianId, String source = 'manual'}) async {
+  /// (the "I've Arrived" button / voice "arrived") and `'automatic'`
+  /// (geofence trigger) can be told apart later.
+  ///
+  /// Serialized with every other arrive/depart write for this job and
+  /// re-checked against a FRESH read first (see `visit_provider.dart`'s
+  /// "Duplicate-arrival protection") — never the cached
+  /// [arrivalEventProvider], which still says "not arrived" while another
+  /// caller's insert is in flight. Returns [VisitWriteOutcome.alreadyLogged]
+  /// without writing if this job already has an arrival, `null` on failure.
+  Future<VisitWriteOutcome?> markArrived({required String technicianId, String source = 'manual'}) async {
     state = const AsyncLoading();
+    VisitWriteOutcome? outcome;
     final result = await AsyncValue.guard(() async {
       final supabase = Supabase.instance.client;
       final now = DateTime.now();
 
       try {
-        debugPrint('ARRIVAL: inserting field_events (gps_arrive, source=$source) for job $jobId...');
-        await supabase.from('field_events').insert({
-          'job_id': jobId,
-          'technician_id': technicianId,
-          'event_type': 'gps_arrive',
-          'event_ts': now.toUtc().toIso8601String(),
-          'metadata': {'source': source},
-        });
-        debugPrint('ARRIVAL: field_events insert succeeded for job $jobId');
+        outcome = await runVisitWriteExclusive(jobId, 'first arrival (source=$source)', () async {
+          final snapshot = await fetchVisitSnapshot(jobId);
+          if (snapshot.everArrived == true) {
+            debugPrint(
+              'VISIT GUARD: first arrival (source=$source) for job $jobId skipped — an arrival is already '
+              'recorded, NOT writing a duplicate On Site marker',
+            );
+            return VisitWriteOutcome.alreadyLogged;
+          }
 
-        debugPrint('ARRIVAL: updating jobs.status to on_site for job $jobId...');
-        await supabase.from('jobs').update({'status': 'on_site'}).eq('id', jobId);
-        debugPrint('ARRIVAL: jobs.status update succeeded for job $jobId');
+          debugPrint('ARRIVAL: inserting field_events (gps_arrive, source=$source) for job $jobId...');
+          try {
+            await supabase.from('field_events').insert({
+              'job_id': jobId,
+              'technician_id': technicianId,
+              'event_type': 'gps_arrive',
+              'event_ts': now.toUtc().toIso8601String(),
+              'metadata': {'source': source, if (snapshot.nextVisitSeq != null) 'visit_seq': snapshot.nextVisitSeq},
+            });
+          } catch (e) {
+            if (!isDuplicateArrivalError(e)) rethrow;
+            debugPrint(
+              'VISIT GUARD: first arrival (source=$source) for job $jobId rejected by the DB unique '
+              'constraint — already recorded, NOT writing a duplicate',
+            );
+            return VisitWriteOutcome.alreadyLogged;
+          }
+          debugPrint('ARRIVAL: field_events insert succeeded for job $jobId');
+
+          debugPrint('ARRIVAL: updating jobs.status to on_site for job $jobId...');
+          await supabase.from('jobs').update({'status': 'on_site'}).eq('id', jobId);
+          debugPrint('ARRIVAL: jobs.status update succeeded for job $jobId');
+          return VisitWriteOutcome.written;
+        });
       } catch (e, stackTrace) {
         debugPrint('ARRIVAL ERROR: $e\n$stackTrace');
         rethrow;
       }
 
-      _ref.read(jobRuntimeProvider(jobId).notifier).setArrived(now);
+      if (outcome == VisitWriteOutcome.written) _ref.read(jobRuntimeProvider(jobId).notifier).setArrived(now);
       _ref.invalidate(arrivalEventProvider(jobId));
+      _ref.invalidate(openVisitProvider(jobId));
     });
-    if (!mounted) return;
-    state = result;
+    if (mounted) state = result;
+    return outcome;
   }
 }

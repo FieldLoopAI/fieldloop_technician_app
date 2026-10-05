@@ -19,6 +19,7 @@ import 'job_complete_provider.dart';
 import 'job_dictations_provider.dart';
 import 'job_estimate_provider.dart';
 import 'job_runtime_provider.dart';
+import 'visit_provider.dart';
 import 'voice_command_registry_provider.dart';
 
 /// Trigger words for the ask-a-question flow — "help" is the primary,
@@ -212,19 +213,16 @@ Future<void> handleGenerateInvoiceCommand({
   }
 }
 
-/// Mirrors the exact same already-arrived check and `markArrived` call the
-/// on-screen "I've Arrived" button uses (`arrivalEventProvider` /
-/// `arrivalActionProvider`).
+/// Goes through the exact same `markArrived` call the on-screen "I've
+/// Arrived" button uses (`arrivalActionProvider`). The already-arrived check
+/// happens INSIDE `markArrived`, serialized against the geofence trigger and
+/// against a fresh read — NOT against the cached `arrivalEventProvider`,
+/// which still reads "not arrived" while an automatic arrival's insert is in
+/// flight (the D4 duplicate On Site marker race).
 Future<void> _handleArrived(WidgetRef ref, String jobId) async {
   try {
     final service = ref.read(globalVoiceServiceProvider.notifier);
     debugPrint('VOICE: "arrived" command matched for job $jobId');
-    final alreadyArrivedAt = await ref.read(arrivalEventProvider(jobId).future);
-    if (alreadyArrivedAt != null) {
-      debugPrint('VOICE: arrival already logged for job $jobId');
-      unawaited(service.speak('Arrival already logged'));
-      return;
-    }
 
     final technicianId = ref.read(authControllerProvider).value?.id;
     if (technicianId == null) {
@@ -236,11 +234,13 @@ Future<void> _handleArrived(WidgetRef ref, String jobId) async {
     // The write itself must finish before we know which confirmation to
     // speak, so this part stays sequential — FIX 3 only applies to not
     // blocking on the confirmation's playback afterward (below).
-    await ref.read(arrivalActionProvider(jobId).notifier).markArrived(technicianId: technicianId);
-    final result = ref.read(arrivalActionProvider(jobId));
-    if (result.hasError) {
-      debugPrint('VOICE ERROR: arrival logging failed for job $jobId: ${result.error}');
+    final outcome = await ref.read(arrivalActionProvider(jobId).notifier).markArrived(technicianId: technicianId);
+    if (outcome == null) {
+      debugPrint('VOICE ERROR: arrival logging failed for job $jobId: ${ref.read(arrivalActionProvider(jobId)).error}');
       unawaited(service.speak("Sorry, I didn't catch that"));
+    } else if (outcome == VisitWriteOutcome.alreadyLogged) {
+      debugPrint('VOICE: arrival already logged for job $jobId');
+      unawaited(service.speak('Arrival already logged'));
     } else {
       debugPrint('VOICE: arrival logged for job $jobId');
       unawaited(service.speak('Arrival logged'));

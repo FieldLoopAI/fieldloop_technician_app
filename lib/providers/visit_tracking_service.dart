@@ -341,10 +341,13 @@ class VisitTrackingService {
         );
         return;
       }
-      await _ref
+      final outcome = await _ref
           .read(visitActionProvider(job.id).notifier)
           .logDeparture(technicianId: technicianId, source: 'automatic');
       if (_jobId != job.id) return;
+      if (outcome == null) _log('automatic visit write failed (see VisitActionController error) — not retrying on every GPS fix');
+      // `alreadyLogged` = a manual "Leaving Site" beat this timer — still
+      // "departed", just resynced from the fresh read instead of written.
       _visitOpen = false;
     } finally {
       _transitionInFlight = false;
@@ -362,10 +365,14 @@ class VisitTrackingService {
         );
         return;
       }
-      await _ref
+      final outcome = await _ref
           .read(visitActionProvider(job.id).notifier)
           .logReArrival(technicianId: technicianId, source: 'automatic');
       if (_jobId != job.id) return;
+      if (outcome == null) _log('automatic visit write failed (see VisitActionController error) — not retrying on every GPS fix');
+      // `alreadyLogged` = a manual "Back on Site" (or another device)
+      // already opened this visit; [_visitOpen] was the stale cache that
+      // used to let this path write a second On Site marker.
       _visitOpen = true;
     } finally {
       _transitionInFlight = false;
