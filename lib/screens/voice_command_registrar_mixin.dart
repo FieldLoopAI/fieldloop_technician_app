@@ -5,6 +5,14 @@ import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/voice_route_observer.dart';
 
+/// Build 174 — RAPID SWAP fix: the leaving screen's unregister and the
+/// arriving screen's register are applied together in one end-of-frame
+/// flush, with owner tokens so a stale unregister can't remove a newer
+/// screen's commands (see [VoiceCommandRegistry.requestRegister]).
+/// false = the previous immediate-unregister / post-frame-register path,
+/// unchanged.
+const bool atomicVoiceRegistry = true;
+
 /// Mix into any job-scoped screen that has voice commands available.
 /// Registers [buildVoiceCommands] into the shared `voiceCommandRegistryProvider`
 /// exactly while this screen is the active/visible one, and removes them
@@ -48,7 +56,11 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
   void initState() {
     super.initState();
     _voiceRegistry = capture((ref) => ref.read(voiceCommandRegistryProvider.notifier));
+    _ownerToken = _voiceRegistry.newOwnerToken();
   }
+
+  /// This screen instance's owner token in the registry (atomic path).
+  late final int _ownerToken;
 
   @override
   void didChangeDependencies() {
@@ -83,6 +95,10 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
   /// what makes that visible instead of assumed.
   void _registerCommands() {
     debugPrint('VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: $T register TRIGGERED (didPush/didPopNext)');
+    if (atomicVoiceRegistry) {
+      _voiceRegistry.requestRegister(_ownerToken, '$T', buildVoiceCommands(), kbFallbackEnabled: kbFallbackEnabled);
+      return;
+    }
     final commands = buildVoiceCommands();
     final ids = commands.map((c) => c.id).toList(growable: false);
     final generation = ++_registrationGeneration;
@@ -109,6 +125,10 @@ mixin VoiceCommandRegistrarMixin<T extends ConsumerStatefulWidget> on SafeRefDis
 
   void _unregisterCommands() {
     debugPrint('VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: $T unregister TRIGGERED (didPushNext/didPop/dispose)');
+    if (atomicVoiceRegistry) {
+      _voiceRegistry.requestUnregister(_ownerToken, '$T');
+      return;
+    }
     _registrationGeneration++;
     // Before the empty-ids early return: a screen whose command list is
     // empty (e.g. Job Detail for a completed job) still recorded itself as

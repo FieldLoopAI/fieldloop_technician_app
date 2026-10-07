@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 /// One registered voice command. [matches] is checked against the
@@ -47,7 +47,16 @@ const Duration shortCommandPauseWindow = Duration(milliseconds: 700);
 /// job-specific business logic — it only ever asks "does anything in this
 /// map match what was just said?"
 class VoiceCommandRegistry extends StateNotifier<Map<String, VoiceCommand>> {
-  VoiceCommandRegistry() : super(const {});
+  /// [scheduleFlush] runs the atomic-handoff flush (see [requestRegister]);
+  /// defaults to the end of the current frame. Tests pass their own.
+  VoiceCommandRegistry({void Function(void Function() flush)? scheduleFlush})
+    : _scheduleFlush = scheduleFlush ?? _endOfFrame,
+      super(const {});
+
+  static void _endOfFrame(void Function() flush) {
+    WidgetsBinding.instance.addPostFrameCallback((_) => flush());
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
 
   /// DIAGNOSTIC (voice-going-stale investigation) — when the immediately
   /// PREVIOUS registry change (register or unregister, from ANY screen)
@@ -134,6 +143,147 @@ class VoiceCommandRegistry extends StateNotifier<Map<String, VoiceCommand>> {
     _logChange('unregisterAll', ids);
     state = next;
   }
+
+  // --- Build 174: atomic handoff with owner tokens (RAPID SWAP fix) ---------
+  //
+  // Old path (above): the leaving screen's unregister applied at once and
+  // the arriving screen's register a frame later — two registry changes
+  // 8–92ms apart on every screen change, each logged as RAPID SWAP, with
+  // no commands registered in between. And an unregister removed ids by
+  // name, so a late dispose could remove an id a newer screen had already
+  // re-registered.
+  //
+  // New path: both requests are queued and applied together in ONE flush
+  // at the end of the frame — one state write, one log line, no empty gap.
+  // Every command is owned by the token of the screen that registered it;
+  // an unregister only removes ids that token still owns, so a stale
+  // owner's unregister is a no-op once a newer screen owns the registry.
+  // Between a release request and its flush (at most one frame) the
+  // releasing owner's commands stop matching, exactly as if already gone.
+
+  final void Function(void Function() flush) _scheduleFlush;
+  int _lastOwnerToken = 0;
+  final Map<String, int> _ownerById = {};
+  int? _activeOwner;
+  final List<_RegistryOp> _pendingOps = [];
+  final Set<int> _releasing = {};
+  bool _flushScheduled = false;
+
+  /// A fresh owner token — one per screen instance.
+  int newOwnerToken() => ++_lastOwnerToken;
+
+  /// The token owning [id] right now (tests/diagnostics).
+  int? ownerOf(String id) => _ownerById[id];
+
+  /// Owner [owner] ([screen]) becomes the active screen with [commands]
+  /// as its whole command set, at the next flush.
+  void requestRegister(int owner, String screen, List<VoiceCommand> commands, {required bool kbFallbackEnabled}) {
+    _releasing.remove(owner);
+    _pendingOps.add(_RegistryOp.register(owner, screen, commands, kbFallbackEnabled));
+    _ensureFlush();
+  }
+
+  /// Owner [owner] gives up its commands at the next flush. A no-op for
+  /// any id another owner has taken since.
+  void requestUnregister(int owner, String screen) {
+    _releasing.add(owner);
+    _pendingOps.add(_RegistryOp.unregister(owner, screen));
+    _ensureFlush();
+  }
+
+  void _ensureFlush() {
+    if (_flushScheduled) return;
+    _flushScheduled = true;
+    _scheduleFlush(flushPending);
+  }
+
+  /// Applies every queued request in order, as one change. Public so tests
+  /// (and an injected scheduler) can run it directly.
+  void flushPending() {
+    _flushScheduled = false;
+    if (!mounted || _pendingOps.isEmpty) {
+      _pendingOps.clear();
+      return;
+    }
+    final ops = List<_RegistryOp>.of(_pendingOps);
+    _pendingOps.clear();
+    final next = Map<String, VoiceCommand>.of(state);
+    final before = {for (final e in _ownerById.entries) e.key: e.value};
+    final screens = <String>[];
+    for (final op in ops) {
+      if (op.isRegister) {
+        // A re-register replaces this owner's whole set (double register).
+        final keep = {for (final c in op.commands) c.id};
+        _ownerById.removeWhere((id, o) {
+          final drop = o == op.owner && !keep.contains(id);
+          if (drop) next.remove(id);
+          return drop;
+        });
+        for (final c in op.commands) {
+          next[c.id] = _owned(c, op.owner);
+          _ownerById[c.id] = op.owner;
+        }
+        _activeOwner = op.owner;
+        _activeScreen = op.screen;
+        _activeScreenKbFallbackEnabled = op.kbFallbackEnabled;
+        screens.add('+${op.screen}#${op.owner}');
+      } else {
+        _ownerById.removeWhere((id, o) {
+          final drop = o == op.owner;
+          if (drop) next.remove(id);
+          return drop;
+        });
+        if (_activeOwner == op.owner) {
+          _activeOwner = null;
+          _activeScreen = null;
+          _activeScreenKbFallbackEnabled = false;
+        }
+        screens.add('-${op.screen}#${op.owner}');
+      }
+    }
+    _releasing.removeWhere((o) => !_ownerById.containsValue(o));
+    final removed = [for (final id in before.keys) if (!_ownerById.containsKey(id)) id];
+    final added = [for (final e in _ownerById.entries) if (before[e.key] != e.value) e.key];
+    // A register always refreshes handlers (fresh closures), even when the
+    // id set didn't change; only a flush of nothing but no-ops is skipped.
+    final anyRegister = ops.any((op) => op.isRegister && _ownerById.containsValue(op.owner));
+    if (removed.isEmpty && added.isEmpty && !anyRegister) {
+      debugPrint(
+        'VOICE REGISTRY [t=${DateTime.now().millisecondsSinceEpoch}]: handoff ${screens.join(' ')} — no net change '
+        '(stale or superseded requests ignored)',
+      );
+      return;
+    }
+    _logChange('handoff ${screens.join(' ')} -[${removed.join(', ')}] +', added);
+    state = next;
+  }
+
+  /// [command] tagged with its owner: it stops matching (and its handler
+  /// does nothing) once that owner has asked to release, even before the
+  /// flush lands — so a command can never reach a screen that is leaving.
+  VoiceCommand _owned(VoiceCommand command, int owner) => VoiceCommand(
+    id: command.id,
+    pauseWindow: command.pauseWindow,
+    matches: (text) => !_releasing.contains(owner) && command.matches(text),
+    handler: (raw) {
+      if (_releasing.contains(owner) || _ownerById[command.id] != owner) {
+        debugPrint('VOICE REGISTRY: "${command.id}" dropped — its screen (#$owner) is leaving');
+        return Future.value();
+      }
+      return command.handler(raw);
+    },
+  );
+}
+
+class _RegistryOp {
+  _RegistryOp.register(this.owner, this.screen, this.commands, this.kbFallbackEnabled) : isRegister = true;
+  _RegistryOp.unregister(this.owner, this.screen) : isRegister = false, commands = const [], kbFallbackEnabled = false;
+
+  final bool isRegister;
+  final int owner;
+  final String screen;
+  final List<VoiceCommand> commands;
+  final bool kbFallbackEnabled;
 }
 
 final voiceCommandRegistryProvider =
