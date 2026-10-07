@@ -1,4 +1,5 @@
 import 'package:fielloop/build_identity.dart';
+import 'package:fielloop/screens/gemini_live_test_screen.dart' show kVoiceFlagsSummary;
 import 'package:fielloop/services/trigger_phrase_matcher.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -38,5 +39,16 @@ void main() {
         expect(matchAnyTriggerPhrase(text, ['log a note']), isNull, reason: text);
       }
     });
+  });
+
+  test('build 175: every new voice flag is in the BUILD line flags, default true', () {
+    for (final flag in [
+      'jobFactClipLengthFromText',
+      'jobDetailsReplyCacheable',
+      'kbCatchAllTimeoutSaysOutOfScope',
+      'coalesceRegistryNavigation',
+    ]) {
+      expect(kVoiceFlagsSummary, contains('$flag=true'), reason: flag);
+    }
   });
 }
