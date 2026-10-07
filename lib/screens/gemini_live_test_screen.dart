@@ -45,6 +45,7 @@ import '../services/echo_override_policy.dart';
 import '../services/echo_sequence_matcher.dart';
 import '../services/gemini_function_dispatcher.dart';
 import '../services/gemini_outbound_guard.dart';
+import '../services/job_fact_clip_cache.dart';
 import '../services/job_facts.dart';
 import '../services/latency_stats.dart';
 import '../services/navigation_destination.dart';
@@ -944,6 +945,14 @@ const String _cameraOpenReplyLong = "Camera's open — ready when you are.";
 /// the job address"). Also moves "where are we" from get_current_screen to
 /// the address. false = all of this off, "where are we" back on the screen.
 const bool _jobFactsAnswers = true;
+
+/// Build 174 (C14–C16): a job-fact answer Gemini has already spoken
+/// cleanly for this job (address, customer name, estimate) is kept in a
+/// bounded per-job memory cache and replayed locally on the next ask — see
+/// `job_fact_clip_cache.dart`. Logs `JOB FACT CACHED hit|miss`. The first
+/// ask per fact per job still goes through Gemini (no TTS in this
+/// mechanism). false = every job-fact line goes through Gemini, as before.
+const bool _jobFactAudioCache = true;
 
 /// C20: "call / text / email the customer" gets a short "I can't" reply.
 const bool _unsupportedActionReplies = true;
@@ -3617,6 +3626,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // providers then stay current via Realtime + in-app updates), so the
     // voice commands for them don't wait ~1.1–1.2s on a fetch later.
     final prefetchJobId = widget.jobId;
+    // Build 174 — job-fact clips are scoped to this session's job.
+    _jobFactClips.bindJob(prefetchJobId);
     if (_prefetchJobDataForVoice && prefetchJobId != null) {
       ref.read(jobEstimateProvider(prefetchJobId));
       ref.read(jobChangeOrdersProvider(prefetchJobId));
@@ -4406,12 +4417,57 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// as Gemini audio — if one is saved and nothing makes it unsafe right
   /// now. Returns false when the caller must use the Gemini path instead.
   bool _playCachedConfirmation(String text, {required String reason}) {
+    final jobFactKind = jobFactKindForReason(reason);
+    if (jobFactKind != null) return _playCachedJobFact(text, kind: jobFactKind, reason: reason);
     if (!_useCachedConfirmationClips || !isCacheableConfirmation(reason)) return false;
     final pcm = confirmationClips.pcmFor(text);
     if (pcm == null) {
       _log_('CONFIRMATION CLIP: none cached yet for "$text" — Gemini speaks it this time (recorded if it plays cleanly)');
       return false;
     }
+    return _playClipPcm(pcm, text: text, reason: reason);
+  }
+
+  // --- Build 174: job-fact clips (see [_jobFactAudioCache]) -------------
+
+  final JobFactClipCache _jobFactClips = JobFactClipCache();
+
+  /// A miss waiting for Gemini's first audio byte, so its
+  /// `JOB FACT CACHED miss` line can say how long that took.
+  ({String jobId, JobFactKind kind, DateTime at})? _pendingJobFactMiss;
+
+  bool _playCachedJobFact(String text, {required JobFactKind kind, required String reason}) {
+    final jobId = widget.jobId;
+    if (!_jobFactAudioCache || jobId == null || !isCacheableJobFact(kind)) return false;
+    _jobFactClips.bindJob(jobId);
+    final pcm = _jobFactClips.pcmFor(jobId, kind, text);
+    if (pcm != null && _playClipPcm(pcm, text: text, reason: reason)) {
+      final actionAt = _turnActionDoneAt;
+      final ms = actionAt == null ? 0 : DateTime.now().difference(actionAt).inMilliseconds;
+      _log_('JOB FACT CACHED hit job=$jobId kind=${kind.name} ms_to_first_audio=$ms');
+      return true;
+    }
+    // Miss (or the clip couldn't play right now): Gemini speaks it exactly
+    // as before; the line is logged with its real time to first audio.
+    _pendingJobFactMiss = (jobId: jobId, kind: kind, at: _turnActionDoneAt ?? DateTime.now());
+    return false;
+  }
+
+  /// Called on the first Gemini audio chunk after a job-fact miss.
+  void _logJobFactMissFirstAudio() {
+    final miss = _pendingJobFactMiss;
+    if (miss == null) return;
+    _pendingJobFactMiss = null;
+    _log_(
+      'JOB FACT CACHED miss job=${miss.jobId} kind=${miss.kind.name} '
+      'ms_to_first_audio=${DateTime.now().difference(miss.at).inMilliseconds} (Gemini spoke it; kept for the next '
+      'ask if it plays cleanly)',
+    );
+  }
+
+  /// Plays already-found clip [pcm] for [text] unless something makes it
+  /// unsafe right now; false = the caller uses the Gemini path.
+  bool _playClipPcm(Uint8List pcm, {required String text, required String reason}) {
     final now = DateTime.now();
     final String? blocker = !_pcmReady
         ? 'audio player re-initialising'
@@ -4471,14 +4527,38 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// `turnComplete` only if the whole turn played and its transcript is the
   /// script word for word. Anything else (interrupted, duplicate-suppressed,
   /// a newer turn, extra words) saves nothing.
-  ({String text, int turnId, BytesBuilder bytes})? _confirmationCapture;
+  ///
+  /// Build 174: a job-fact line ([jobFactKind] set) is recorded the same way
+  /// but kept only in [_jobFactClips] (memory, this job), never on disk.
+  ({String text, int turnId, BytesBuilder bytes, JobFactKind? jobFactKind, String? jobId})? _confirmationCapture;
 
   void _armConfirmationCapture() {
     _confirmationCapture = null;
-    if (!_useCachedConfirmationClips) return;
     final text = _awaitingScriptedTurnText;
+    final jobFactKind = jobFactKindForReason(_awaitingScriptedTurnReason);
+    final jobId = widget.jobId;
+    if (jobFactKind != null) {
+      if (!_jobFactAudioCache || jobId == null || !isCacheableJobFact(jobFactKind)) return;
+      _jobFactClips.bindJob(jobId);
+      if (_jobFactClips.pcmFor(jobId, jobFactKind, text) != null) return;
+      _confirmationCapture = (
+        text: text,
+        turnId: _currentResponseTurnId,
+        bytes: BytesBuilder(copy: false),
+        jobFactKind: jobFactKind,
+        jobId: jobId,
+      );
+      return;
+    }
+    if (!_useCachedConfirmationClips) return;
     if (!isCacheableConfirmation(_awaitingScriptedTurnReason) || confirmationClips.pcmFor(text) != null) return;
-    _confirmationCapture = (text: text, turnId: _currentResponseTurnId, bytes: BytesBuilder(copy: false));
+    _confirmationCapture = (
+      text: text,
+      turnId: _currentResponseTurnId,
+      bytes: BytesBuilder(copy: false),
+      jobFactKind: null,
+      jobId: null,
+    );
   }
 
   void _captureConfirmationChunk(Uint8List pcmBytes) {
@@ -4505,6 +4585,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
     if (!confirmationTranscriptMatches(_currentTurnGeminiText, capture.text)) {
       _log_('CONFIRMATION CLIP: not saving — the turn said "$_currentTurnGeminiText", not exactly "${capture.text}"');
+      return;
+    }
+    final jobFactKind = capture.jobFactKind;
+    final jobId = capture.jobId;
+    if (jobFactKind != null && jobId != null) {
+      final kept = _jobFactClips.put(jobId, jobFactKind, capture.text, capture.bytes.takeBytes());
+      _log_(
+        'JOB FACT CACHED ${kept ? 'stored' : 'not stored (other job or implausible length)'} job=$jobId '
+        'kind=${jobFactKind.name} (${_jobFactClips.count} clip(s), ${_jobFactClips.bytes} bytes)',
+      );
       return;
     }
     unawaited(confirmationClips.save(capture.text, capture.bytes.takeBytes()));
@@ -14278,6 +14368,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _captureGreetingChunk(pcmBytes);
     _captureConfirmationChunk(pcmBytes);
     _playedModelAudioChunks++;
+    _logJobFactMissFirstAudio();
     _enqueuePcmForPlayback(pcmBytes);
   }
 
@@ -14499,6 +14590,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _logLatencySummaryOnce();
     _appOwnsCurrentReply = false;
     _confirmationCapture = null;
+    // Build 174 — job-fact clips never outlive the session.
+    _jobFactClips.clear();
+    _pendingJobFactMiss = null;
     // CONFIRMED CRASH ("_lifecycleState != _ElementLifecycle.defunct") — the
     // same class of bug fixed several times elsewhere in this codebase (see
     // e.g. JobDetailScreen.dispose's `Future(() { _viewedJobIdController.state
