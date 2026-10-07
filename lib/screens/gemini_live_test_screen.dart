@@ -973,6 +973,16 @@ const bool _jobFactClipLengthFromText = true;
 /// (first try interrupted) and hit from then on. false = the old wording.
 const bool _jobDetailsReplyCacheable = true;
 
+/// Build 175 (item 3): a get_kb_answer that came from the KB CATCH-ALL
+/// (nothing else matched) and then times out or errors says
+/// [outOfScopeReply] ("I can only help with this job.") instead of "Sorry,
+/// I couldn't reach the knowledge base…" (b174 14:51:52, "What's the
+/// weather today?", 8007ms). A KB call from a real phrase match keeps the
+/// "couldn't reach" line. The 8s `kbAnswerRequestTimeout` is unchanged.
+/// The KB TIMEOUT/ERROR SPOKEN line now carries `source=` and `reply=`.
+/// false = every KB timeout/error says "couldn't reach", as before.
+const bool _kbCatchAllTimeoutSaysOutOfScope = true;
+
 /// C20: "call / text / email the customer" gets a short "I can't" reply.
 const bool _unsupportedActionReplies = true;
 
@@ -1008,6 +1018,7 @@ final String kVoiceFlagsSummary =
     'negationGuard=$_negationGuardEnabled atomicVoiceRegistry=$atomicVoiceRegistry '
     'jobFactAudioCache=$_jobFactAudioCache jobFactClipLengthFromText=$_jobFactClipLengthFromText '
     'jobDetailsReplyCacheable=$_jobDetailsReplyCacheable '
+    'kbCatchAllTimeoutSaysOutOfScope=$_kbCatchAllTimeoutSaysOutOfScope '
     'jobFactsAnswers=$_jobFactsAnswers '
     'unsupportedActionReplies=$_unsupportedActionReplies kbMissSaysOutOfScope=$_kbMissSaysOutOfScope '
     'cameraNarrationAsPhotoNote=$_cameraNarrationAsPhotoNote shortCameraOpenReply=$_shortCameraOpenReply '
@@ -9208,6 +9219,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         kbTrigger,
         args: {'question': transcript, 'job_id': ?widget.jobId},
         buildSpokenText: _buildKbCatchAllSpokenText,
+        kbSource: KbCallSource.catchAll,
       ),
     );
   }
@@ -10639,6 +10651,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _TranscriptTrigger trigger, {
     required Map<String, dynamic> args,
     required String Function(Map<String, dynamic> result) buildSpokenText,
+    // Build 175 — only read for get_kb_answer's timeout/error reply.
+    KbCallSource kbSource = KbCallSource.match,
   }) async {
     // DIAGNOSTIC (added after the "zero deterministic triggers fired"
     // regression report): unconditional entry log — this MUST print for
@@ -10687,7 +10701,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // request already superseded it.
       if (trigger.name == 'get_kb_answer' &&
           !_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: trigger.name)) {
-        _informGeminiToSpeakVerbatim(_kbHardErrorSpokenText(e.toString()), reason: 'deterministic get_kb_answer error');
+        _informGeminiToSpeakVerbatim(
+          _kbHardErrorSpokenText(e.toString(), source: kbSource),
+          reason: 'deterministic get_kb_answer error',
+        );
       }
       return;
     } finally {
@@ -10837,12 +10854,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// A get_kb_answer call that FAILED (network error, or the
   /// `kbAnswerRequestTimeout` bound) — distinct from a genuine no-match,
   /// which says [_kbNoAnswerText]. Logs the KB TIMEOUT/ERROR SPOKEN marker.
-  String _kbHardErrorSpokenText(String error) {
+  String _kbHardErrorSpokenText(String error, {KbCallSource source = KbCallSource.match}) {
     final startedAt = _kbCallStartedAt;
     final elapsedMs = startedAt == null ? -1 : DateTime.now().difference(startedAt).inMilliseconds;
     final outcome = error.contains('TimeoutException') ? 'timeout_reduced' : 'error_spoken';
-    _log_('KB TIMEOUT/ERROR SPOKEN: trigger=get_kb_answer elapsedMs=$elapsedMs outcome=$outcome error=$error');
-    return "Sorry, I couldn't reach the knowledge base right now — try again in a moment.";
+    final reply = kbFailureReply(source: source, catchAllSaysOutOfScope: _kbCatchAllTimeoutSaysOutOfScope);
+    _log_(
+      'KB TIMEOUT/ERROR SPOKEN: trigger=get_kb_answer elapsedMs=$elapsedMs outcome=$outcome '
+      'source=${source == KbCallSource.catchAll ? 'catch_all' : 'match'} reply="$reply" error=$error',
+    );
+    return reply;
   }
 
   /// C19 — what a KB miss says (see [_kbMissSaysOutOfScope]). The backend

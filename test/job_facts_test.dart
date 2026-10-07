@@ -182,4 +182,19 @@ void main() {
       expect(outOfScopeReply.split(' ').length, 7);
     });
   });
+
+  group("build 175 — KB timeout/error reply by source (item 3)", () {
+    test("catch-all (e.g. \"What's the weather today?\") timeout says the out-of-scope line", () {
+      expect(kbFailureReply(source: KbCallSource.catchAll, catchAllSaysOutOfScope: true), outOfScopeReply);
+      expect(outOfScopeReply, "I can only help with this job.");
+    });
+    test("a real KB phrase match keeps \"couldn't reach the knowledge base\"", () {
+      expect(kbFailureReply(source: KbCallSource.match, catchAllSaysOutOfScope: true), kbUnreachableReply);
+      expect(kbUnreachableReply, contains("couldn't reach the knowledge base"));
+    });
+    test("flag off: both paths say the old line", () {
+      expect(kbFailureReply(source: KbCallSource.catchAll, catchAllSaysOutOfScope: false), kbUnreachableReply);
+      expect(kbFailureReply(source: KbCallSource.match, catchAllSaysOutOfScope: false), kbUnreachableReply);
+    });
+  });
 }

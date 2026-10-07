@@ -243,3 +243,19 @@ String unsupportedActionReply(UnsupportedActionKind kind) => switch (kind) {
 
 /// Spoken instead of the knowledge-base-miss line (7 words).
 const String outOfScopeReply = 'I can only help with this job.';
+
+/// What a get_kb_answer TIMEOUT or ERROR says.
+const String kbUnreachableReply = "Sorry, I couldn't reach the knowledge base right now — try again in a moment.";
+
+/// Where a get_kb_answer call came from: `catch_all` = nothing else matched
+/// the utterance (often off-topic, e.g. "What's the weather today?");
+/// `match` = the KB's own phrase list matched a real job-knowledge question.
+enum KbCallSource { catchAll, match }
+
+/// Build 175 (item 3): a catch-all KB call that times out or errors says
+/// [outOfScopeReply] when [catchAllSaysOutOfScope] — nothing marked it as a
+/// job question, so "couldn't reach the knowledge base" only confused
+/// (b174 14:51:52, "What's the weather today?"). A real KB match keeps
+/// [kbUnreachableReply].
+String kbFailureReply({required KbCallSource source, required bool catchAllSaysOutOfScope}) =>
+    source == KbCallSource.catchAll && catchAllSaysOutOfScope ? outOfScopeReply : kbUnreachableReply;
