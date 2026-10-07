@@ -54,6 +54,11 @@ void main() {
       'What is the job address': JobFactKind.address,
       'How long have we been here?': JobFactKind.timeOnSite,
       'How long have we been on site?': JobFactKind.timeOnSite,
+      // Build 174 — the garbled b173 transcript and its siblings (C17).
+      'How long have been here?': JobFactKind.timeOnSite,
+      'how long been here': JobFactKind.timeOnSite,
+      'How long we been here?': JobFactKind.timeOnSite,
+      'How long have been on site?': JobFactKind.timeOnSite,
       'What was on the estimate?': JobFactKind.estimateSummary,
       'What did we quote?': JobFactKind.estimateSummary,
     };
@@ -64,6 +69,16 @@ void main() {
     test('a screen question is never taken as an address question', () {
       expect(matchJobFactQuestion('Where are we, which screen is this?'), isNull);
       expect(matchJobFactQuestion('Where are we on this page?'), isNull);
+    });
+
+    test('real out-of-scope "how long" questions stay off the job-fact path (KB gate keeps them)', () {
+      for (final text in ['How long does a breaker last?', 'How long has this panel been here?', 'How long is the warranty?']) {
+        expect(matchJobFactQuestion(text), isNull, reason: text);
+      }
+    });
+
+    test('C19 out-of-scope reply is under 10 words', () {
+      expect(outOfScopeReply.split(' ').length, lessThan(10));
     });
 
     test('negated / unrelated speech does not match', () {

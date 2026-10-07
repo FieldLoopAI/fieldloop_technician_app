@@ -983,6 +983,17 @@ const bool _negationGuardEnabled = true;
 const String _negationGuardReply = 'Okay.';
 const Set<String> _cameraNegationGuardedActions = {'open_camera', 'capture_photo', 'retake_photo'};
 
+/// Build 174 — every voice switch, for the `BUILD:` line (app start and
+/// first session open), so a log shows exactly what the build ran with.
+final String kVoiceFlagsSummary =
+    'negationGuard=$_negationGuardEnabled atomicVoiceRegistry=$atomicVoiceRegistry '
+    'jobFactAudioCache=$_jobFactAudioCache jobFactsAnswers=$_jobFactsAnswers '
+    'unsupportedActionReplies=$_unsupportedActionReplies kbMissSaysOutOfScope=$_kbMissSaysOutOfScope '
+    'cameraNarrationAsPhotoNote=$_cameraNarrationAsPhotoNote shortCameraOpenReply=$_shortCameraOpenReply '
+    'cachedConfirmationClips=$_useCachedConfirmationClips prefetchJobData=$_prefetchJobDataForVoice '
+    'silentOnMissingTranscript=$silentOnMissingTranscript '
+    'transcriptTimeoutMs=${transcriptTimeoutFallbackAfter.inMilliseconds}';
+
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
 /// connectivity proof's stop-timing, not a real VAD.
@@ -3991,6 +4002,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // correct — that distinction is exactly what this makes visible).
       debugPrint('GEMINI FULL SYSTEM INSTRUCTION BEING SENT:\n$_effectiveSystemInstruction');
       channel.sink.add(setupMessage);
+      // Build 174 — the BUILD line again on the first session of this
+      // process, in case logcat was started after the app.
+      logBuildIdentityOnFirstSessionOpen(flags: kVoiceFlagsSummary);
       // FIX 1 — one greppable line per session: which end-of-speech setting
       // this run is measuring (see [_serverVadSilenceDurationMs]).
       _log_(
@@ -7217,6 +7231,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       if (name == 'confirm_photo_upload' || name == 'retake_photo') {
         _lastPhotoDecisionActivityAt = DateTime.now();
         _log_('toolCall: "$name" (id=$id) — GEMINI-INITIATED (Gemini called this itself, not the deterministic trigger)');
+        if (name == 'confirm_photo_upload') _markKeepCommandHeard(_lastPhotoDecisionActivityAt!, source: 'gemini_toolcall');
       }
 
       // ISSUE 1 fix (CONFIRMED via f5a8bd8b-flutter_run_log.txt:
@@ -11686,6 +11701,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _photoDecisionResolvedForCurrentUtterance = true;
     _photoDecisionAmbiguousStreak = 0;
     final now = DateTime.now();
+    if (action == 'confirm_photo_upload') _markKeepCommandHeard(now, source: 'phrase');
     final lastActivity = _lastPhotoDecisionActivityAt;
     if (lastActivity != null && now.difference(lastActivity) < _photoDecisionDebounce) {
       _log_(
@@ -11875,6 +11891,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
     final flow = _PhotoNoteFlow(keptId, jobId, DateTime.now());
     _photoNote = flow;
+    _keepCommandAtByKeptId[keptId] = _lastKeepCommandHeardAt ?? flow.enteredAt;
+    _lastKeepCommandHeardAt = null;
     _timedOutPhotoNote = null;
     // The photo preview stays up (camera held) for the whole note question
     // — see [_finishKeptPhotoPreview].
@@ -12049,7 +12067,29 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
   }
 
+  // --- Build 174: C11 keep -> save timing (logging only) ----------------
+
+  /// When the most recent "keep" was heard (phrase path or Gemini's own
+  /// toolCall), until [_enterPhotoNote] files it under its kept photo.
+  DateTime? _lastKeepCommandHeardAt;
+  final Map<int, DateTime> _keepCommandAtByKeptId = {};
+
+  void _markKeepCommandHeard(DateTime at, {required String source}) {
+    _lastKeepCommandHeardAt = at;
+    _log_('C11 KEEP heard at=${at.toIso8601String().substring(11, 23)} source=$source');
+  }
+
   void _recordKeptPhotoUploaded(int keptId, Map<String, dynamic> result) {
+    final keepAt = _keepCommandAtByKeptId.remove(keptId);
+    if (keepAt != null) {
+      final savedAt = DateTime.now();
+      // Uses debugPrint: this can run after the screen is torn down.
+      debugPrint(
+        'GEMINI LIVE TEST: C11 KEEP->SAVE kept_id=$keptId keep_at=${keepAt.toIso8601String().substring(11, 23)} '
+        'saved_at=${savedAt.toIso8601String().substring(11, 23)} keep_to_save_ms=${savedAt.difference(keepAt).inMilliseconds} '
+        'status=${result['status']} (includes the note step)',
+      );
+    }
     final photo = result['kept_photo_ref'] as KeptPhotoRef?;
     _log_(
       'PHOTO NOTE [upload]: kept photo #$keptId ${result['status']}${result.containsKey('note_status') ? ' '

@@ -62,6 +62,14 @@ const List<String> timeOnSitePhrases = [
   'how long we ve been on site',
   'how long have we been at this job',
   'how long have we been on this job',
+  // Build 174 — STT drops the subject (6 Oct b173: "How long have been
+  // here?" went to the KB and got "I can only help with this job.").
+  'how long have been here',
+  'how long have been on site',
+  'how long been here',
+  'how long been on site',
+  'how long we been here',
+  'how long we been on site',
 ];
 
 const List<String> estimateSummaryPhrases = [

@@ -10,6 +10,16 @@ void main() {
     );
   });
 
+  test('full BUILD line carries version, VAD value, flags and when it was printed', () {
+    final line = describeFullBuildLine(flags: 'negationGuard=true', when: 'first_session_open');
+    expect(line, startsWith('BUILD: stamp='));
+    expect(line, contains('version=1.0.'));
+    expect(line, contains('vad_silence_ms=default'));
+    expect(line, contains('flags=[negationGuard=true]'));
+    expect(line, endsWith('when=first_session_open'));
+    expect(versionForBuild(174), '1.0.174');
+  });
+
   test('VAD label: default when no --dart-define (the test run passes none)', () {
     expect(kVadSilenceMsDefine, 0);
     expect(kVadSettingLabel, 'vad_silence_ms=default vad_end_sensitivity=default');

@@ -29,9 +29,27 @@ String describeBuildIdentity({
 
 String get currentBuildMode => kReleaseMode ? 'release' : (kProfileMode ? 'profile' : 'debug');
 
-void logBuildIdentity() {
-  debugPrint(
+/// Version as the APK is named: `FieldLoop_v1.0.<build>_<date>.apk`.
+String versionForBuild(int stamp) => '1.0.$stamp';
+
+/// The full BUILD line: identity, version, VAD setting, voice flags, and
+/// [when] it was printed (app start / first session open).
+String describeFullBuildLine({required String flags, required String when}) =>
     '${describeBuildIdentity(stamp: kBuildNumber, commit: kGitCommit, mode: currentBuildMode, builtAt: kBuildTimestamp)} '
-    '$kVadSettingLabel',
-  );
+    'version=${versionForBuild(kBuildNumber)} $kVadSettingLabel flags=[$flags] when=$when';
+
+/// Printed at app start ([when] = `app_start`) and again on the first voice
+/// session open of the process (`first_session_open`), in case logcat was
+/// started after launch.
+void logBuildIdentity({String flags = '', String when = 'app_start'}) {
+  debugPrint(describeFullBuildLine(flags: flags, when: when));
+}
+
+bool _buildLineLoggedForSession = false;
+
+/// Once per process — see [logBuildIdentity].
+void logBuildIdentityOnFirstSessionOpen({required String flags}) {
+  if (_buildLineLoggedForSession) return;
+  _buildLineLoggedForSession = true;
+  logBuildIdentity(flags: flags, when: 'first_session_open');
 }
