@@ -962,6 +962,17 @@ const bool _jobFactAudioCache = true;
 /// false = build 174's fixed 600ms–8s bounds.
 const bool _jobFactClipLengthFromText = true;
 
+/// Build 175 (item 2): "go back to main/home screen" (view_job_details)
+/// says "Okay, you're on the job details screen." instead of "Okay — you're
+/// on …". The dash version's server transcript was only ever "Okay —"
+/// (7 of 7 b174 turns), so its clip was never saved and TURN IDENTITY held
+/// it to turnComplete (3.0–3.5s to first audio) — see
+/// `jobDetailsNavigatedReply` in `confirmation_clip.dart`. The save rules
+/// are unchanged (exact transcript, clean turn, keyed by text). Invoice and
+/// change orders needed no change: their clips were simply not saved yet
+/// (first try interrupted) and hit from then on. false = the old wording.
+const bool _jobDetailsReplyCacheable = true;
+
 /// C20: "call / text / email the customer" gets a short "I can't" reply.
 const bool _unsupportedActionReplies = true;
 
@@ -996,6 +1007,7 @@ const Set<String> _cameraNegationGuardedActions = {'open_camera', 'capture_photo
 final String kVoiceFlagsSummary =
     'negationGuard=$_negationGuardEnabled atomicVoiceRegistry=$atomicVoiceRegistry '
     'jobFactAudioCache=$_jobFactAudioCache jobFactClipLengthFromText=$_jobFactClipLengthFromText '
+    'jobDetailsReplyCacheable=$_jobDetailsReplyCacheable '
     'jobFactsAnswers=$_jobFactsAnswers '
     'unsupportedActionReplies=$_unsupportedActionReplies kbMissSaysOutOfScope=$_kbMissSaysOutOfScope '
     'cameraNarrationAsPhotoNote=$_cameraNarrationAsPhotoNote shortCameraOpenReply=$_shortCameraOpenReply '
@@ -4607,7 +4619,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
     if (!confirmationTranscriptMatches(_currentTurnGeminiText, capture.text)) {
-      _log_('CONFIRMATION CLIP: not saving — the turn said "$_currentTurnGeminiText", not exactly "${capture.text}"');
+      final truncated = confirmationTranscriptTruncated(_currentTurnGeminiText, capture.text);
+      _log_(
+        'CONFIRMATION CLIP: not saving — the turn said "$_currentTurnGeminiText", not exactly "${capture.text}"'
+        '${truncated ? ' (transcript_truncated: the server transcript stopped early; audio not verifiable)' : ''}',
+      );
       return;
     }
     final jobFactKind = capture.jobFactKind;
@@ -11123,7 +11139,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: 'view_job_details')) return;
     final status = result['status'];
     final text = status == 'navigated_to_job_details' || (status == 'already_at_job_details' && overridingGoBack)
-        ? "Okay — you're on the job details screen."
+        ? jobDetailsNavigatedReply(cacheableWording: _jobDetailsReplyCacheable)
         : status == 'already_at_job_details'
         ? "You're already on the job details screen."
         : "I couldn't get to the job details screen — try the back arrow.";

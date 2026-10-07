@@ -113,4 +113,65 @@ void main() {
       expect(await store.preload(), 0);
     });
   });
+
+  group('build 175 — live-spoken navigation replies become cacheable (item 2)', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('confirmation_clip_nav_test'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    // The reply lines behind the five slow b174 turns, keyed by the reason each is requested under.
+    const cases = <String, String>{
+      'go back to main/home screen': 'deterministic view_job_details',
+      'open the invoice': 'deterministic view_invoice',
+      'show me the change order(s)': 'deterministic view_change_orders',
+    };
+    final lines = <String, String>{
+      'deterministic view_job_details': jobDetailsNavigatedReply(cacheableWording: true),
+      'deterministic view_invoice': "The invoice is up — anything you'd like me to check on it?",
+      'deterministic view_change_orders': "I've opened the change orders — there aren't any on this job yet.",
+    };
+
+    test('every case is a cacheable confirmation reason', () {
+      cases.forEach((phrase, reason) => expect(isCacheableConfirmation(reason), isTrue, reason: phrase));
+    });
+
+    test('the 174 job-details transcript ("Okay —") never matched and is flagged as truncated', () {
+      expect(confirmationTranscriptMatches('Okay —', jobDetailsNavigatedReplyOld), isFalse);
+      expect(confirmationTranscriptTruncated('Okay —', jobDetailsNavigatedReplyOld), isTrue);
+      expect(confirmationTranscriptTruncated("Okay — you're", jobDetailsNavigatedReplyOld), isTrue);
+      expect(confirmationTranscriptTruncated('Okay — going back now', jobDetailsNavigatedReplyOld), isFalse);
+      expect(confirmationTranscriptTruncated(jobDetailsNavigatedReplyOld, jobDetailsNavigatedReplyOld), isFalse);
+    });
+
+    test('the new job-details wording keeps the same words, comma instead of the dash', () {
+      expect(jobDetailsNavigatedReply(cacheableWording: false), jobDetailsNavigatedReplyOld);
+      expect(jobDetailsNavigatedReplyCacheable, "Okay, you're on the job details screen.");
+      expect(confirmationTranscriptMatches("Okay, you're on the job details screen.", jobDetailsNavigatedReplyCacheable), isTrue);
+    });
+
+    for (final entry in cases.entries) {
+      test('${entry.key}: first clean spoken reply is saved, then plays from cache by exact text', () async {
+        final line = lines[entry.value]!;
+        final store = ConfirmationClipStore(directory: () async => dir);
+        await store.preload();
+        expect(store.pcmFor(line), isNull, reason: 'no clip yet: Gemini fallback');
+        // A full, exact transcript is the only thing that lets a turn be saved.
+        expect(confirmationTranscriptMatches(line, line), isTrue);
+        expect(await store.save(line, _pcm(2600)), isTrue);
+        final next = ConfirmationClipStore(directory: () async => dir);
+        await next.preload();
+        expect(next.pcmFor(line), _pcm(2600));
+        // Keyed by the exact text: any other wording misses (no stale text).
+        expect(next.pcmFor('$line Anything else?'), isNull);
+      });
+    }
+
+    test('a truncated turn is never saved, so Gemini stays the fallback', () async {
+      final store = ConfirmationClipStore(directory: () async => dir);
+      const line = jobDetailsNavigatedReplyCacheable;
+      expect(confirmationTranscriptMatches('Okay,', line), isFalse, reason: 'the screen then never calls save()');
+      expect(store.pcmFor(line), isNull);
+      expect(dir.listSync(), isEmpty);
+    });
+  });
 }

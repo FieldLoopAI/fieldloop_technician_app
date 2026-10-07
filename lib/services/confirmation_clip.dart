@@ -50,6 +50,33 @@ bool confirmationTranscriptMatches(String transcript, String script) {
   return heard.isNotEmpty && heard == _normalize(script);
 }
 
+/// Whether [transcript] is the start of [script] but not all of it — the
+/// server's transcript stopped early. Diagnostic only: such a turn is still
+/// never saved (its audio can't be checked word for word).
+bool confirmationTranscriptTruncated(String transcript, String script) {
+  final heard = _normalize(transcript);
+  final full = _normalize(script);
+  return heard.isNotEmpty && heard != full && full.startsWith(heard);
+}
+
+/// Build 175 — Job Details confirmation ("go back to main/home screen").
+///
+/// MEASURED (b174, 7 Oct, 7 of 7 turns at 14:18:55, 14:31:17, 14:31:52,
+/// 14:32:37, 14:33:29, 14:42:40): Gemini spoke the whole of
+/// [jobDetailsNavigatedReplyOld] (64 audio tokens ≈ 2.6s) but its output
+/// transcript was only ever "Okay —" (once "Okay — you're"), so
+/// [confirmationTranscriptMatches] never passed and the clip was never
+/// saved; the one-word transcript also kept TURN IDENTITY holding the audio
+/// until turnComplete (first audio 3.0–3.5s). go_back's "Okay, I've taken
+/// you back." — same opening word, a comma instead of the dash — was
+/// transcribed in full and saved on its first clean turn (14:18:23).
+const String jobDetailsNavigatedReplyOld = "Okay — you're on the job details screen.";
+const String jobDetailsNavigatedReplyCacheable = "Okay, you're on the job details screen.";
+
+/// The Job Details confirmation; [cacheableWording] = build 175's.
+String jobDetailsNavigatedReply({required bool cacheableWording}) =>
+    cacheableWording ? jobDetailsNavigatedReplyCacheable : jobDetailsNavigatedReplyOld;
+
 /// Splits [pcm] (mono int16) into playback-sized chunks, each a whole number
 /// of samples — the same ~100ms granularity Gemini's own chunks arrive in.
 List<Uint8List> splitPcmForPlayback(Uint8List pcm, {int chunkBytes = 4800}) {
