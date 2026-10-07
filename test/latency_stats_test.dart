@@ -59,12 +59,19 @@ void main() {
       expect(line, contains('action->firstAudio p50=20ms p90=800ms (n=2)'));
       expect(line, contains('total p50=1500ms p90=2000ms (n=3)'));
       expect(line, contains('replies from cached clip: 1/3'));
-      expect(line, isNot(contains('late transcripts')));
-      final withExtras =
-          describeTurnTimingSummary(turns, lateTranscripts: 3, vadSetting: 'silence=400,endSensitivity=default');
+      expect(line, isNot(contains('late_transcripts')));
+      final withExtras = describeTurnTimingSummary(
+        turns,
+        lateTranscripts: 3,
+        maxLateMs: 7548,
+        vadSetting: 'vad_silence_ms=400 vad_end_sensitivity=default',
+      );
       expect(withExtras, startsWith(line));
-      expect(withExtras, endsWith('; late transcripts (>=3s): 3; vad=silence=400,endSensitivity=default'));
-      expect(describeTurnTimingSummary(const [], lateTranscripts: 0), 'TURN TIMING SUMMARY: n=0; late transcripts (>=3s): 0');
+      expect(withExtras, endsWith('; late_transcripts=3 max_late_ms=7548; vad_silence_ms=400 vad_end_sensitivity=default'));
+      expect(
+        describeTurnTimingSummary(const [], lateTranscripts: 0),
+        'TURN TIMING SUMMARY: n=0; late_transcripts=0 max_late_ms=0',
+      );
       expect(describeTurnTimingSummary(const []), 'TURN TIMING SUMMARY: n=0');
     });
   });

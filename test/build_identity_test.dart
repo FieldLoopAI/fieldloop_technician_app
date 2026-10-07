@@ -10,6 +10,11 @@ void main() {
     );
   });
 
+  test('VAD label: default when no --dart-define (the test run passes none)', () {
+    expect(kVadSilenceMsDefine, 0);
+    expect(kVadSettingLabel, 'vad_silence_ms=default vad_end_sensitivity=default');
+  });
+
   // Module A's note command — 'log a note' was added to the site_condition
   // phrase list in gemini_live_test_screen.dart.
   group('"log a note" phrase (Module A)', () {

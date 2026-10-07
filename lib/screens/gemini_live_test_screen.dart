@@ -17,6 +17,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../build_identity.dart';
 import '../config/env.dart';
 import '../models/kept_photo_ref.dart';
 import '../models/job_estimate.dart' show JobEstimate;
@@ -904,17 +905,19 @@ const bool _prefetchJobDataForVoice = true;
 ///   flutter build apk --release --dart-define=VAD_SILENCE_MS=300
 /// Optional, same mechanism: --dart-define=VAD_END_SENSITIVITY=HIGH|LOW
 /// (`automaticActivityDetection.endOfSpeechSensitivity`). The values in
-/// use are logged once per session as `VAD CONFIG:`.
-const int _vadSilenceMsDefine = int.fromEnvironment('VAD_SILENCE_MS');
-const String _vadEndSensitivityDefine = String.fromEnvironment('VAD_END_SENSITIVITY');
+/// use are logged once per session as `VAD CONFIG:`, and (build 174) in
+/// the `BUILD:` line and TURN TIMING SUMMARY — the defines are read in
+/// `build_identity.dart` so the startup BUILD line can show them too.
+const int _vadSilenceMsDefine = kVadSilenceMsDefine;
+const String _vadEndSensitivityDefine = kVadEndSensitivityDefine;
 const int? _serverVadSilenceDurationMs = _vadSilenceMsDefine > 0 ? _vadSilenceMsDefine : null;
 const String? _serverVadEndSensitivity = _vadEndSensitivityDefine == 'HIGH'
     ? 'END_SENSITIVITY_HIGH'
     : (_vadEndSensitivityDefine == 'LOW' ? 'END_SENSITIVITY_LOW' : null);
 
-/// Short label of this build's VAD setting, for TURN TIMING SUMMARY.
-const String _vadSettingLabel =
-    'silence=${_serverVadSilenceDurationMs ?? 'default'},endSensitivity=${_serverVadEndSensitivity ?? 'default'}';
+/// Short label of this build's VAD setting, for TURN TIMING SUMMARY (same
+/// text as in the BUILD line).
+const String _vadSettingLabel = kVadSettingLabel;
 
 /// The `automaticActivityDetection` fields this build sends — empty = the
 /// whole `realtimeInputConfig` is left out of setup, exactly as before.
@@ -5347,8 +5350,20 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     debugPrint(
       'GEMINI LIVE TEST: ${describeLatencySummary(_sessionLatenciesMs, deadStretches: _sessionDeadStretches, hangs: _sessionHangs)}',
     );
+    // A late transcript still waiting on its outcome is written now (plain
+    // debugPrint — this can run from dispose, where setState is unsafe).
+    final pendingLate = _pendingLateTranscript;
+    _pendingLateTranscript = null;
+    _lateTranscriptOutcomeTimer?.cancel();
+    _lateTranscriptOutcomeTimer = null;
+    if (pendingLate != null) {
+      final action = _playedModelAudioChunks > pendingLate.audioChunksAtArrival ? 'gemini_reply' : 'no_app_action';
+      debugPrint(
+        'GEMINI LIVE TEST: ${describeTranscriptLate(msAfterSpeechEnd: pendingLate.ms, action: action, text: pendingLate.text)}',
+      );
+    }
     debugPrint(
-      'GEMINI LIVE TEST: ${describeTurnTimingSummary(_sessionTurnTimings, lateTranscripts: _sessionLateTranscripts, vadSetting: _vadSettingLabel)}',
+      'GEMINI LIVE TEST: ${describeTurnTimingSummary(_sessionTurnTimings, lateTranscripts: _sessionLateTranscripts, maxLateMs: _sessionMaxLateMs, vadSetting: _vadSettingLabel)}',
     );
   }
 
@@ -8083,7 +8098,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           _log_(
             'TRANSCRIPT TIMEOUT RECOVERY: action=silent_await_late — no transcript ${waitedMs}ms after the speech '
             'edge; not replying, "Thinking..." released. Still listening: if a transcript arrives it is routed '
-            'normally and logged as LATE TRANSCRIPT with how late it was.',
+            'normally and logged as TRANSCRIPT LATE with how late it was and what was done with it.',
           );
           _pipelineLog('transcript_timeout', 'silent_await_late — no reply; a late transcript is still handled normally');
         case TranscriptTimeoutAction.askToRepeat:
@@ -8105,6 +8120,40 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   DateTime? _transcriptTimedOutSpeechEndAt;
   DateTime? _lastSpeechEndEdgeAt;
   int _sessionLateTranscripts = 0;
+  int _sessionMaxLateMs = 0;
+
+  /// Build 174 — a late transcript whose `TRANSCRIPT LATE` line waits for
+  /// what the app does with it: the next scripted reply's reason (see
+  /// [_informGeminiToSpeakVerbatim]), else after
+  /// [_lateTranscriptOutcomeWindow] `gemini_reply` if Gemini audio played
+  /// since, or `no_app_action`. Logging only — routing is unchanged.
+  ({int ms, String text, int audioChunksAtArrival})? _pendingLateTranscript;
+  Timer? _lateTranscriptOutcomeTimer;
+  static const Duration _lateTranscriptOutcomeWindow = Duration(seconds: 4);
+
+  /// Gemini audio chunks played this session — only read to tell whether
+  /// Gemini answered a late transcript on its own.
+  int _playedModelAudioChunks = 0;
+
+  void _recordLateTranscript(int msAfterSpeechEnd, String text) {
+    _resolveLateTranscript(null);
+    _sessionLateTranscripts++;
+    if (msAfterSpeechEnd > _sessionMaxLateMs) _sessionMaxLateMs = msAfterSpeechEnd;
+    _pendingLateTranscript = (ms: msAfterSpeechEnd, text: text, audioChunksAtArrival: _playedModelAudioChunks);
+    _lateTranscriptOutcomeTimer = Timer(_lateTranscriptOutcomeWindow, () => _resolveLateTranscript(null));
+  }
+
+  /// Logs the pending `TRANSCRIPT LATE` line, if any. [action] null = no
+  /// scripted reply came: `gemini_reply` or `no_app_action`.
+  void _resolveLateTranscript(String? action) {
+    final pending = _pendingLateTranscript;
+    _lateTranscriptOutcomeTimer?.cancel();
+    _lateTranscriptOutcomeTimer = null;
+    if (pending == null) return;
+    _pendingLateTranscript = null;
+    final resolved = action ?? (_playedModelAudioChunks > pending.audioChunksAtArrival ? 'gemini_reply' : 'no_app_action');
+    _log_(describeTranscriptLate(msAfterSpeechEnd: pending.ms, action: resolved, text: pending.text));
+  }
 
   void _maybeLogLateTranscript(String textChunk) {
     final timedOutEnd = _transcriptTimedOutSpeechEndAt;
@@ -8123,12 +8172,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         );
         return;
       }
-      _sessionLateTranscripts++;
-      _log_(describeLateTranscript(msAfterSpeechEnd: sinceLatest, text: textChunk.trim()));
+      _recordLateTranscript(sinceLatest, textChunk.trim());
       return;
     }
-    _sessionLateTranscripts++;
-    _log_(describeLateTranscript(msAfterSpeechEnd: now.difference(timedOutEnd).inMilliseconds, text: textChunk.trim()));
+    _recordLateTranscript(now.difference(timedOutEnd).inMilliseconds, textChunk.trim());
   }
 
   void _stopAwaitingLateTranscript(String reason) {
@@ -13827,6 +13874,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       }
     }
     if (!isFiller) _turnActionDoneAt ??= DateTime.now();
+    if (!isFiller && !isResend && _pendingLateTranscript != null) _resolveLateTranscript(reason.replaceAll(' ', '_'));
     // Change 3 — a fixed confirmation with a saved clip plays locally; no
     // "say exactly" turn is sent (see [_playCachedConfirmation]).
     if (!isFiller && !isResend && _playCachedConfirmation(text, reason: reason)) return;
@@ -14229,6 +14277,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
     _captureGreetingChunk(pcmBytes);
     _captureConfirmationChunk(pcmBytes);
+    _playedModelAudioChunks++;
     _enqueuePcmForPlayback(pcmBytes);
   }
 

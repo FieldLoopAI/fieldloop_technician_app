@@ -69,11 +69,14 @@ void main() {
     }
   });
 
-  test('LATE TRANSCRIPT line says how late it really was, with the text (FIX 2)', () {
+  test('TRANSCRIPT LATE line says how late it was, what was done, and no claimed cause', () {
+    final line =
+        describeTranscriptLate(msAfterSpeechEnd: 7548, action: 'negation_guard', text: "I don't want to take photo.");
     expect(
-      describeLateTranscript(msAfterSpeechEnd: 7548, text: "I don't want to take photo."),
-      'LATE TRANSCRIPT: late transcript arrived 7548ms after speech end (4548ms after the 3000ms timeout); '
-      'text="I don\'t want to take photo." — routed normally',
+      line,
+      'TRANSCRIPT LATE ms=7548 action=negation_guard cause=unconfirmed (4548ms after the 3000ms timeout) '
+      'text="I don\'t want to take photo."',
     );
+    expect(line, isNot(contains('silent_non_speech')));
   });
 }

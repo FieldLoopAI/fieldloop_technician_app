@@ -59,13 +59,14 @@ class TurnTiming {
 /// `TURN TIMING SUMMARY` — p50/p90 of each part, logged at session end
 /// next to `LATENCY SUMMARY`.
 ///
-/// [lateTranscripts]: transcripts that arrived >= 3s after speech end (the
-/// `LATE TRANSCRIPT` lines); [vadSetting]: which end-of-speech A/B setting
-/// this session ran with. Both are appended only when given, so the line is
+/// [lateTranscripts]/[maxLateMs]: transcripts that arrived after the 3s
+/// timeout (the `TRANSCRIPT LATE` lines) and the latest of them, in ms
+/// after speech end; [vadSetting]: which end-of-speech A/B setting this
+/// session ran with. Each is appended only when given, so the line is
 /// otherwise unchanged.
-String describeTurnTimingSummary(List<TurnTiming> turns, {int? lateTranscripts, String? vadSetting}) {
-  final extra = '${lateTranscripts == null ? '' : '; late transcripts (>=3s): $lateTranscripts'}'
-      '${vadSetting == null ? '' : '; vad=$vadSetting'}';
+String describeTurnTimingSummary(List<TurnTiming> turns, {int? lateTranscripts, int? maxLateMs, String? vadSetting}) {
+  final extra = '${lateTranscripts == null ? '' : '; late_transcripts=$lateTranscripts max_late_ms=${maxLateMs ?? 0}'}'
+      '${vadSetting == null ? '' : '; $vadSetting'}';
   if (turns.isEmpty) return 'TURN TIMING SUMMARY: n=0$extra';
   String part(String label, Iterable<int?> values) {
     final present = [for (final v in values) ?v];

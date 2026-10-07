@@ -52,9 +52,13 @@ TranscriptTimeoutAction decideTranscriptTimeout({
   return silent ? TranscriptTimeoutAction.silentAwaitLate : TranscriptTimeoutAction.askToRepeat;
 }
 
-/// The `LATE TRANSCRIPT` line for a transcript that arrived after the
-/// timeout had already gone silent — how late it really was, and its text.
-String describeLateTranscript({required int msAfterSpeechEnd, required String text}) =>
-    'LATE TRANSCRIPT: late transcript arrived ${msAfterSpeechEnd}ms after speech end '
+/// The `TRANSCRIPT LATE` line (build 174, was `LATE TRANSCRIPT`) for a
+/// transcript that arrived after the timeout had already gone silent: how
+/// late it really was (ms after speech end) and what the app then did with
+/// it — [action] is the app's reply/dispatch for it, or `no_app_action`.
+/// The cause is not known from the app's side, so it is always logged as
+/// `cause=unconfirmed`.
+String describeTranscriptLate({required int msAfterSpeechEnd, required String action, required String text}) =>
+    'TRANSCRIPT LATE ms=$msAfterSpeechEnd action=$action cause=unconfirmed '
     '(${msAfterSpeechEnd - transcriptTimeoutFallbackAfter.inMilliseconds}ms after the '
-    '${transcriptTimeoutFallbackAfter.inMilliseconds}ms timeout); text="$text" — routed normally';
+    '${transcriptTimeoutFallbackAfter.inMilliseconds}ms timeout) text="$text"';
