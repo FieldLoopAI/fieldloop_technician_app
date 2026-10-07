@@ -33,6 +33,8 @@ const Set<String> cacheableConfirmationReasons = {
   'deterministic view_estimate',
   'deterministic view_job_details',
   'deterministic open_camera',
+  // Build 174 — the fixed "Okay." a blocked negated camera request gets.
+  'negation_guard',
 };
 
 bool isCacheableConfirmation(String reason) => cacheableConfirmationReasons.contains(reason);

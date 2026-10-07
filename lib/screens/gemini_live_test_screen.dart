@@ -960,8 +960,15 @@ const bool _cameraNarrationAsPhotoNote = true;
 /// FIX 3 (6 Oct b173, Part 2 14:23:17): a negated camera request ("I don't
 /// want to take photo", "never mind") never fires open_camera,
 /// capture_photo or retake_photo — see `camera_negation_guard.dart`. Logs
-/// `NEGATION BLOCKED` and answers with one short line instead.
-const bool _cameraNegationGuard = true;
+/// `NEGATION GUARD blocked intent=… transcript="…"` (once per utterance)
+/// and answers "Okay." instead. Build 174: renamed from
+/// `_cameraNegationGuard`; also gates Gemini's own toolCall on the
+/// utterance text itself, not only when the phrase layer blocked first.
+const bool _negationGuardEnabled = true;
+
+/// The one reply a blocked negation gets (cached-clip eligible, see
+/// `cacheableConfirmationReasons`).
+const String _negationGuardReply = 'Okay.';
 const Set<String> _cameraNegationGuardedActions = {'open_camera', 'capture_photo', 'retake_photo'};
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
@@ -7041,6 +7048,26 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         continue;
       }
 
+      // FIX 3 — the technician negated this camera action this utterance
+      // (already blocked on the phrase path, or the utterance text itself
+      // negates it); Gemini's own call for it must not fire it either.
+      // Build 174: checked before the debounce claims below, so a blocked
+      // call doesn't hold off the technician's next real request.
+      if (_negationGuardEnabled &&
+          _cameraNegationGuardedActions.contains(name) &&
+          (_cameraNegationBlockedThisUtterance || _blockNegatedCameraAction(name, _utteranceHeardText))) {
+        _log_('NEGATION GUARD: Gemini toolCall "$name" (id=$id) NOT dispatched — the technician negated it');
+        functionResponses.add({
+          'id': id,
+          'name': name,
+          'response': {
+            'status': 'not_requested',
+            'message': 'The technician said not to do this. Nothing was done; do not mention it.',
+          },
+        });
+        continue;
+      }
+
       if (name == 'capture_photo') {
         debugPrint('BLOCKING TEST T1 (function triggered): ${DateTime.now()}');
       }
@@ -7153,24 +7180,6 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           'id': id,
           'name': name,
           'response': {'status': 'already_handled', 'job_id': args['job_id']},
-        });
-        continue;
-      }
-
-      // FIX 3 — the technician negated this camera action this utterance
-      // (NEGATION BLOCKED already logged and answered); Gemini's own call
-      // for it must not fire it either.
-      if (_cameraNegationGuard &&
-          _cameraNegationGuardedActions.contains(name) &&
-          _cameraNegationBlockedThisUtterance) {
-        _log_('NEGATION BLOCKED: Gemini toolCall "$name" (id=$id) NOT dispatched — the technician negated it');
-        functionResponses.add({
-          'id': id,
-          'name': name,
-          'response': {
-            'status': 'not_requested',
-            'message': 'The technician said not to do this. Nothing was done; do not mention it.',
-          },
         });
         continue;
       }
@@ -10141,25 +10150,32 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// per new utterance) — also stops a Gemini toolCall for the same action.
   bool _cameraNegationBlockedThisUtterance = false;
 
-  /// True when [action] must not fire because [heard] negates it (see
-  /// [_cameraNegationGuard]). Logs `NEGATION BLOCKED`, answers once per
-  /// utterance with a short acknowledgment, and claims the utterance so
-  /// nothing else (intent check, clarification) answers it.
+  /// True when [action] must not fire because [heard] (or, when that
+  /// buffer was already cleared, the whole utterance) negates it — see
+  /// [_negationGuardEnabled]. The first block of an utterance logs
+  /// `NEGATION GUARD blocked`, answers "Okay." and claims the utterance so
+  /// nothing else (intent check, clarification) answers it; any further
+  /// block in the same utterance only logs `NEGATION GUARD also blocked`.
+  /// No action fires and no camera/screen state changes.
   bool _blockNegatedCameraAction(String action, String heard) {
-    if (!_cameraNegationGuard || !_cameraNegationGuardedActions.contains(action)) return false;
-    final cue = cameraActionNegation(heard);
+    if (!_negationGuardEnabled || !_cameraNegationGuardedActions.contains(action)) return false;
+    var text = heard.trim();
+    var cue = text.isEmpty ? null : cameraActionNegation(text);
+    final utterance = _utteranceHeardText.trim();
+    if (cue == null && utterance.isNotEmpty && utterance != text) {
+      text = utterance;
+      cue = cameraActionNegation(text);
+    }
     if (cue == null) return false;
-    _log_('NEGATION BLOCKED: $action NOT fired — "$cue" in "$heard" (screen=${_screenTask.name})');
     _pipelineLog('matched_not_fired', 'trigger=$action reason=negation ("$cue")');
-    if (_cameraNegationBlockedThisUtterance) return true;
+    if (_cameraNegationBlockedThisUtterance) {
+      _log_('NEGATION GUARD also blocked intent=$action (same utterance, cue="$cue")');
+      return true;
+    }
     _cameraNegationBlockedThisUtterance = true;
-    final reply = switch (_screenTask) {
-      _ScreenTask.cameraCaptured => 'Okay, no retake.',
-      _ScreenTask.none => "Okay, I won't open the camera.",
-      _ => 'Okay, no photo.',
-    };
-    _clearAllTriggerBuffersAfterSuccess('negation blocked $action');
-    _informGeminiToSpeakVerbatim(reply, reason: 'negation_blocked $action');
+    _log_('NEGATION GUARD blocked intent=$action transcript="$text" (cue="$cue", screen=${_screenTask.name})');
+    _clearAllTriggerBuffersAfterSuccess('negation guard blocked $action');
+    _informGeminiToSpeakVerbatim(_negationGuardReply, reason: 'negation_guard');
     return true;
   }
 
