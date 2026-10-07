@@ -46,12 +46,35 @@ const Duration shortCommandPauseWindow = Duration(milliseconds: 700);
 /// recognizer) never needs to know anything about screens, navigation, or
 /// job-specific business logic — it only ever asks "does anything in this
 /// map match what was just said?"
+/// Build 175 (RAPID SWAP residual): one navigation that touches several
+/// routes over consecutive frames — "go back to home screen" from Invoice
+/// with the camera prewarmed pushes `_CameraHostPage` to close the camera
+/// (frame A: `-InvoiceScreen +_CameraHostPage`), then pops it and Invoice
+/// (frame B) — becomes ONE handoff: the flush waits until
+/// [registryCoalesceQuietFrames] end-of-frame ticks pass with no new
+/// request (never longer than [registryCoalesceMaxFrames]). b174 logged
+/// these as two handoffs 31ms (14:18:52.442) and 48ms (14:31:14.869) apart,
+/// each a RAPID SWAP. Two separate navigations still warn. false = flush at
+/// the end of the frame of the first request, as in build 174.
+const bool coalesceRegistryNavigation = true;
+const int registryCoalesceQuietFrames = 3;
+const int registryCoalesceMaxFrames = 30;
+
 class VoiceCommandRegistry extends StateNotifier<Map<String, VoiceCommand>> {
-  /// [scheduleFlush] runs the atomic-handoff flush (see [requestRegister]);
-  /// defaults to the end of the current frame. Tests pass their own.
-  VoiceCommandRegistry({void Function(void Function() flush)? scheduleFlush})
-    : _scheduleFlush = scheduleFlush ?? _endOfFrame,
-      super(const {});
+  /// [scheduleFlush] runs [callback] at the end of the next frame (the
+  /// atomic-handoff flush, see [requestRegister], waits on it); defaults to
+  /// a post-frame callback. Tests pass their own, and their own [clock].
+  VoiceCommandRegistry({
+    void Function(void Function() callback)? scheduleFlush,
+    this.coalesceNavigation = coalesceRegistryNavigation,
+    DateTime Function()? clock,
+  }) : _scheduleFlush = scheduleFlush ?? _endOfFrame,
+       _clock = clock ?? DateTime.now,
+       super(const {});
+
+  /// See [coalesceRegistryNavigation].
+  final bool coalesceNavigation;
+  final DateTime Function() _clock;
 
   static void _endOfFrame(void Function() flush) {
     WidgetsBinding.instance.addPostFrameCallback((_) => flush());
@@ -78,7 +101,7 @@ class VoiceCommandRegistry extends StateNotifier<Map<String, VoiceCommand>> {
   static const Duration _rapidSwapThreshold = Duration(seconds: 1);
 
   void _logChange(String action, Iterable<String> ids) {
-    final now = DateTime.now();
+    final now = _clock();
     final last = _lastChangeAt;
     _lastChangeAt = now;
     final tsMs = now.millisecondsSinceEpoch;
@@ -191,16 +214,40 @@ class VoiceCommandRegistry extends StateNotifier<Map<String, VoiceCommand>> {
     _ensureFlush();
   }
 
+  /// Frames ticked since the last request, and since the first pending one
+  /// (see [coalesceRegistryNavigation]).
+  int _quietFrames = 0;
+  int _heldFrames = 0;
+
   void _ensureFlush() {
+    _quietFrames = 0;
     if (_flushScheduled) return;
     _flushScheduled = true;
-    _scheduleFlush(flushPending);
+    _scheduleFlush(_onFrameTick);
+  }
+
+  /// End of a frame with requests pending: flush now, or — coalescing —
+  /// wait another frame while this navigation is still producing requests.
+  void _onFrameTick() {
+    _flushScheduled = false;
+    if (coalesceNavigation && mounted && _pendingOps.isNotEmpty) {
+      _quietFrames++;
+      _heldFrames++;
+      if (_quietFrames < registryCoalesceQuietFrames && _heldFrames < registryCoalesceMaxFrames) {
+        _flushScheduled = true;
+        _scheduleFlush(_onFrameTick);
+        return;
+      }
+    }
+    flushPending();
   }
 
   /// Applies every queued request in order, as one change. Public so tests
   /// (and an injected scheduler) can run it directly.
   void flushPending() {
     _flushScheduled = false;
+    _quietFrames = 0;
+    _heldFrames = 0;
     if (!mounted || _pendingOps.isEmpty) {
       _pendingOps.clear();
       return;

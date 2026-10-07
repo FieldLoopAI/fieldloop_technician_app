@@ -1016,6 +1016,7 @@ const Set<String> _cameraNegationGuardedActions = {'open_camera', 'capture_photo
 /// first session open), so a log shows exactly what the build ran with.
 final String kVoiceFlagsSummary =
     'negationGuard=$_negationGuardEnabled atomicVoiceRegistry=$atomicVoiceRegistry '
+    'coalesceRegistryNavigation=$coalesceRegistryNavigation '
     'jobFactAudioCache=$_jobFactAudioCache jobFactClipLengthFromText=$_jobFactClipLengthFromText '
     'jobDetailsReplyCacheable=$_jobDetailsReplyCacheable '
     'kbCatchAllTimeoutSaysOutOfScope=$_kbCatchAllTimeoutSaysOutOfScope '
