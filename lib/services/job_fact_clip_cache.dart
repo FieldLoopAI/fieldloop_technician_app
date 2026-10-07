@@ -18,6 +18,12 @@
 ///  - keyed by the exact answer text, so a changed value (a new estimate
 ///    total) simply misses — a clip can never speak a stale value;
 ///  - time on site changes every minute and is never cached.
+///
+/// Build 175: the per-clip length bound is sized from the answer text
+/// ([maxClipForText]/[minClipForText]). Build 174's fixed 8s cap (shared
+/// with confirmation clips) refused every address: "401, SETU SQUARE, …
+/// Gujarat 382424." was 277–282 audio tokens ≈ 11.1–11.3s ≈ 532–541KB
+/// (tablet log 7 Oct 14:50:48 / 14:51:14), so a repeat never hit.
 library;
 
 import 'dart:collection';
@@ -41,11 +47,52 @@ JobFactKind? jobFactKindForReason(String reason) {
   return null;
 }
 
+/// Words the answer will be spoken as, counting each digit on its own
+/// ("382424" is read digit by digit) — the unit [maxClipForText] and
+/// [minClipForText] scale with.
+int spokenUnitsForText(String text) {
+  var units = 0;
+  for (final token in text.split(RegExp(r'[^A-Za-z0-9]+'))) {
+    if (token.isEmpty) continue;
+    final digits = token.replaceAll(RegExp(r'[^0-9]'), '').length;
+    units += digits + (token.length > digits ? 1 : 0);
+  }
+  return units;
+}
+
+/// Longest plausible clip for [text]: 2s + 1s per spoken unit, never below
+/// the confirmation-clip cap (8s) and never above 30s. The 7 Oct address
+/// (21 units, spoken in ~11.3s) gets 23s — about twice what it took.
+Duration maxClipForText(String text) {
+  final ms = 2000 + 1000 * spokenUnitsForText(text);
+  final floor = ConfirmationClipStore.maxClip.inMilliseconds;
+  return Duration(milliseconds: ms.clamp(floor, 30000));
+}
+
+/// Shortest plausible clip for [text]: 150ms per spoken unit (twice the
+/// pace of fast speech), never below the confirmation-clip floor (600ms).
+/// A recording well short of this lost audio somewhere and is refused even
+/// though its transcript matched.
+Duration minClipForText(String text) {
+  final ms = 150 * spokenUnitsForText(text);
+  final floor = ConfirmationClipStore.minClip.inMilliseconds;
+  return Duration(milliseconds: ms < floor ? floor : ms);
+}
+
+/// PCM length (mono int16 at 24kHz) as a duration.
+Duration jobFactClipDuration(Uint8List pcm) =>
+    Duration(microseconds: (pcm.length ~/ 2) * 1000000 ~/ kWakeGreetingSampleRateHz);
+
 class JobFactClipCache {
-  JobFactClipCache({this.maxEntries = 8, this.maxBytes = 3 * 1024 * 1024});
+  JobFactClipCache({this.maxEntries = 8, this.maxBytes = 3 * 1024 * 1024, this.sizeLimitFromText = true});
 
   final int maxEntries;
   final int maxBytes;
+
+  /// true (build 175) = the per-clip length bound comes from the answer
+  /// text ([maxClipForText]/[minClipForText]); false = build 174's fixed
+  /// confirmation-clip bounds (600ms–8s).
+  final bool sizeLimitFromText;
 
   String? _jobId;
   final LinkedHashMap<String, Uint8List> _pcmByKey = LinkedHashMap();
@@ -82,11 +129,27 @@ class JobFactClipCache {
   /// Keeps [pcm] (mono int16 at 24kHz) as [kind]'s answer [text] for
   /// [jobId]. False — nothing kept — for another job, an uncacheable kind,
   /// or an implausible length (same bounds as confirmation clips).
-  bool put(String jobId, JobFactKind kind, String text, Uint8List pcm) {
-    if (jobId != _jobId || !isCacheableJobFact(kind)) return false;
-    final duration = Duration(microseconds: (pcm.length ~/ 2) * 1000000 ~/ kWakeGreetingSampleRateHz);
-    if (duration < ConfirmationClipStore.minClip || duration > ConfirmationClipStore.maxClip) return false;
-    if (pcm.length > maxBytes) return false;
+  bool put(String jobId, JobFactKind kind, String text, Uint8List pcm) => store(jobId, kind, text, pcm) == null;
+
+  /// The per-clip length bounds [put] applies to [text].
+  ({Duration min, Duration max}) boundsFor(String text) => sizeLimitFromText
+      ? (min: minClipForText(text), max: maxClipForText(text))
+      : (min: ConfirmationClipStore.minClip, max: ConfirmationClipStore.maxClip);
+
+  /// [put], but says why nothing was kept: null = stored, otherwise the
+  /// exact check that refused it (for the `JOB FACT CACHED not stored` line).
+  String? store(String jobId, JobFactKind kind, String text, Uint8List pcm) {
+    if (jobId != _jobId) return 'other job (cache bound to ${_jobId ?? 'none'})';
+    if (!isCacheableJobFact(kind)) return 'kind ${kind.name} is never cached';
+    final duration = jobFactClipDuration(pcm);
+    final bounds = boundsFor(text);
+    if (duration < bounds.min) {
+      return 'too short: ${duration.inMilliseconds}ms < min ${bounds.min.inMilliseconds}ms for this text';
+    }
+    if (duration > bounds.max) {
+      return 'too long: ${duration.inMilliseconds}ms > max ${bounds.max.inMilliseconds}ms for this text';
+    }
+    if (pcm.length > maxBytes) return 'over the byte cap: ${pcm.length} > $maxBytes bytes';
     final key = _key(kind, text);
     final old = _pcmByKey.remove(key);
     if (old != null) _bytes -= old.length;
@@ -101,6 +164,6 @@ class JobFactClipCache {
       final oldest = _pcmByKey.keys.first;
       _bytes -= _pcmByKey.remove(oldest)!.length;
     }
-    return true;
+    return null;
   }
 }

@@ -954,6 +954,14 @@ const bool _jobFactsAnswers = true;
 /// mechanism). false = every job-fact line goes through Gemini, as before.
 const bool _jobFactAudioCache = true;
 
+/// Build 175 (C15): a job-fact clip's length bound is sized from its answer
+/// text (`maxClipForText` in `job_fact_clip_cache.dart`) instead of the
+/// fixed 8s confirmation-clip cap, which refused every ~11s address in the
+/// 174 logs ("JOB FACT CACHED not stored", 14:50:48 / 14:51:14). The
+/// `not stored` line now names the exact check, clip bytes and ms.
+/// false = build 174's fixed 600ms–8s bounds.
+const bool _jobFactClipLengthFromText = true;
+
 /// C20: "call / text / email the customer" gets a short "I can't" reply.
 const bool _unsupportedActionReplies = true;
 
@@ -987,7 +995,8 @@ const Set<String> _cameraNegationGuardedActions = {'open_camera', 'capture_photo
 /// first session open), so a log shows exactly what the build ran with.
 final String kVoiceFlagsSummary =
     'negationGuard=$_negationGuardEnabled atomicVoiceRegistry=$atomicVoiceRegistry '
-    'jobFactAudioCache=$_jobFactAudioCache jobFactsAnswers=$_jobFactsAnswers '
+    'jobFactAudioCache=$_jobFactAudioCache jobFactClipLengthFromText=$_jobFactClipLengthFromText '
+    'jobFactsAnswers=$_jobFactsAnswers '
     'unsupportedActionReplies=$_unsupportedActionReplies kbMissSaysOutOfScope=$_kbMissSaysOutOfScope '
     'cameraNarrationAsPhotoNote=$_cameraNarrationAsPhotoNote shortCameraOpenReply=$_shortCameraOpenReply '
     'cachedConfirmationClips=$_useCachedConfirmationClips prefetchJobData=$_prefetchJobDataForVoice '
@@ -4444,7 +4453,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
   // --- Build 174: job-fact clips (see [_jobFactAudioCache]) -------------
 
-  final JobFactClipCache _jobFactClips = JobFactClipCache();
+  final JobFactClipCache _jobFactClips = JobFactClipCache(sizeLimitFromText: _jobFactClipLengthFromText);
 
   /// A miss waiting for Gemini's first audio byte, so its
   /// `JOB FACT CACHED miss` line can say how long that took.
@@ -4604,10 +4613,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final jobFactKind = capture.jobFactKind;
     final jobId = capture.jobId;
     if (jobFactKind != null && jobId != null) {
-      final kept = _jobFactClips.put(jobId, jobFactKind, capture.text, capture.bytes.takeBytes());
+      final pcm = capture.bytes.takeBytes();
+      final refused = _jobFactClips.store(jobId, jobFactKind, capture.text, pcm);
+      final bounds = _jobFactClips.boundsFor(capture.text);
       _log_(
-        'JOB FACT CACHED ${kept ? 'stored' : 'not stored (other job or implausible length)'} job=$jobId '
-        'kind=${jobFactKind.name} (${_jobFactClips.count} clip(s), ${_jobFactClips.bytes} bytes)',
+        'JOB FACT CACHED ${refused == null ? 'stored' : 'not stored ($refused)'} job=$jobId '
+        'kind=${jobFactKind.name} clip=${pcm.length}B/${jobFactClipDuration(pcm).inMilliseconds}ms '
+        'limit=${bounds.min.inMilliseconds}-${bounds.max.inMilliseconds}ms '
+        '(${_jobFactClips.count} clip(s), ${_jobFactClips.bytes} bytes)',
       );
       return;
     }

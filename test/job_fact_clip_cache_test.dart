@@ -69,6 +69,60 @@ void main() {
       expect(cache.bytes, lessThanOrEqualTo(24 * 2 * 5000));
     });
 
+    // Build 175 — the 7 Oct tablet address (277-282 audio tokens ≈ 11.1-11.3s).
+    const address = '401, SETU SQUARE, SONA CROSS ROAD, New CG Rd, Nigam Nagar, Ahmedabad, Gujarat 382424.';
+
+    test('build 175: a long (~11.3s) address is stored and a repeat hits', () {
+      final cache = JobFactClipCache()..bindJob('job-1');
+      cache.put('job-1', JobFactKind.customerName, 'hariom.', _pcm(1200));
+      expect(cache.store('job-1', JobFactKind.address, address, _pcm(11300, 5)), isNull);
+      expect(cache.count, 2);
+      // A later ask in the same session (same cache instance, same job).
+      cache.bindJob('job-1');
+      expect(cache.pcmFor('job-1', JobFactKind.address, address)!.first, 5);
+    });
+
+    test('build 175: the 174 fixed bounds refused that same address (regression proof)', () {
+      final cache = JobFactClipCache(sizeLimitFromText: false)..bindJob('job-1');
+      expect(cache.store('job-1', JobFactKind.address, address, _pcm(11300)), startsWith('too long: 11300ms > max 8000ms'));
+    });
+
+    test('build 175: a different job misses and a late recording for it is refused', () {
+      final cache = JobFactClipCache()..bindJob('job-1');
+      cache.put('job-1', JobFactKind.address, address, _pcm(11300));
+      expect(cache.pcmFor('job-2', JobFactKind.address, address), isNull);
+      cache.bindJob('job-2');
+      expect(cache.pcmFor('job-1', JobFactKind.address, address), isNull);
+      expect(cache.store('job-1', JobFactKind.address, address, _pcm(11300)), startsWith('other job'));
+    });
+
+    test('build 175: a cut-off recording (far shorter than the text) is not stored', () {
+      final cache = JobFactClipCache()..bindJob('job-1');
+      // 21 spoken units → min 3150ms; 1.5s of audio cannot be the whole line.
+      expect(spokenUnitsForText(address), 21);
+      expect(cache.store('job-1', JobFactKind.address, address, _pcm(1500)), startsWith('too short'));
+      expect(cache.count, 0);
+    });
+
+    test('build 175: length limits scale with the text but stay bounded', () {
+      expect(maxClipForText('hariom.'), const Duration(seconds: 8), reason: 'never below the old cap');
+      expect(maxClipForText(address), const Duration(seconds: 23));
+      expect(maxClipForText(List.filled(60, 'word').join(' ')), const Duration(seconds: 30), reason: 'hard ceiling');
+      expect(minClipForText('hariom.'), const Duration(milliseconds: 600));
+      final cache = JobFactClipCache()..bindJob('j');
+      expect(cache.store('j', JobFactKind.address, address, _pcm(23500)), startsWith('too long'));
+    });
+
+    test('build 175: the byte cap still holds for long clips', () {
+      final cache = JobFactClipCache(maxBytes: 24 * 2 * 10000)..bindJob('j');
+      expect(cache.store('j', JobFactKind.address, address, _pcm(11300)), startsWith('over the byte cap'));
+      final roomy = JobFactClipCache(maxBytes: 24 * 2 * 15000)..bindJob('j');
+      roomy.put('j', JobFactKind.customerName, 'hariom.', _pcm(5000));
+      expect(roomy.put('j', JobFactKind.address, address, _pcm(11300)), isTrue);
+      expect(roomy.bytes, lessThanOrEqualTo(24 * 2 * 15000));
+      expect(roomy.pcmFor('j', JobFactKind.customerName, 'hariom.'), isNull, reason: 'oldest evicted to fit');
+    });
+
     test('reason parsing', () {
       expect(jobFactKindForReason('job_fact address'), JobFactKind.address);
       expect(jobFactKindForReason('job_fact timeOnSite'), JobFactKind.timeOnSite);
