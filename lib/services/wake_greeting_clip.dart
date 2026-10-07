@@ -100,7 +100,11 @@ Uint8List pcm16ToWav(Uint8List pcm, {int sampleRate = kWakeGreetingSampleRateHz}
 /// Stable across runs (unlike `String.hashCode`) — names the cache file
 /// after the greeting text, so changing [kWakeGreetingText] simply misses
 /// the old clip and records a new one.
-String _fnv1a32Hex(String text) {
+String _fnv1a32Hex(String text) => clipFileKey(text);
+
+/// The stable per-text file key shared by every locally cached Gemini clip
+/// (this greeting, and the confirmation clips in `confirmation_clip.dart`).
+String clipFileKey(String text) {
   var hash = 0x811c9dc5;
   for (final unit in text.codeUnits) {
     hash ^= unit;

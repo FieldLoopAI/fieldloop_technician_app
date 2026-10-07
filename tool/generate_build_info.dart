@@ -28,6 +28,8 @@ void main() {
   String two(int n) => n.toString().padLeft(2, '0');
   final timestamp = '${now.year}-${two(now.month)}-${two(now.day)} ${two(now.hour)}:${two(now.minute)}';
 
+  final gitCommit = _gitCommit(projectRoot);
+
   final outFile = File('$projectRoot/lib/build_info.dart');
   outFile.writeAsStringSync('''
 // GENERATED FILE — DO NOT EDIT BY HAND.
@@ -49,7 +51,33 @@ const int kBuildNumber = $buildNumber;
 /// Wall-clock time this build was generated, captured when the generator
 /// script ran — NOT a hardcoded value that could be forgotten to update.
 const String kBuildTimestamp = '$timestamp';
+
+/// Short git commit hash of the tree this build was generated from, with
+/// `-dirty` appended when the tree had uncommitted changes or new files (the two
+/// files this generator itself writes don't count).
+const String kGitCommit = '$gitCommit';
 ''');
 
-  stdout.writeln('generate_build_info: wrote build #$buildNumber @ $timestamp -> ${outFile.path}');
+  stdout.writeln('generate_build_info: wrote build #$buildNumber @ $timestamp ($gitCommit) -> ${outFile.path}');
+}
+
+/// `git rev-parse --short HEAD`, plus `-dirty` if any file other
+/// than this script's own outputs differs from HEAD (or is new). 'unknown' when git
+/// isn't available — never fails the build.
+String _gitCommit(String projectRoot) {
+  try {
+    final head = Process.runSync('git', ['rev-parse', '--short', 'HEAD'], workingDirectory: projectRoot, runInShell: true);
+    if (head.exitCode != 0) return 'unknown';
+    final hash = (head.stdout as String).trim();
+    final status = Process.runSync(
+      'git',
+      ['status', '--porcelain', '--', '.', ':!build_number.txt', ':!lib/build_info.dart'],
+      workingDirectory: projectRoot,
+      runInShell: true,
+    );
+    final dirty = status.exitCode == 0 && (status.stdout as String).trim().isNotEmpty;
+    return dirty ? '$hash-dirty' : hash;
+  } catch (_) {
+    return 'unknown';
+  }
 }

@@ -12,8 +12,13 @@
 
 /// Incrementing build counter — see `build_number.txt` at the repo root,
 /// which the generator script bumps by 1 every time it runs.
-const int kBuildNumber = 171;
+const int kBuildNumber = 173;
 
 /// Wall-clock time this build was generated, captured when the generator
 /// script ran — NOT a hardcoded value that could be forgotten to update.
-const String kBuildTimestamp = '2026-10-05 13:55';
+const String kBuildTimestamp = '2026-10-06 13:35';
+
+/// Short git commit hash of the tree this build was generated from, with
+/// `-dirty` appended when the tree had uncommitted changes or new files (the two
+/// files this generator itself writes don't count).
+const String kGitCommit = '0a5eb6f6-dirty';

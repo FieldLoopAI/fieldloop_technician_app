@@ -3,10 +3,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app.dart';
+import 'build_identity.dart';
 import 'providers/local_notifications_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  logBuildIdentity();
 
   await Supabase.initialize(
     url: 'https://glpzohfzldvztseriwky.supabase.co',

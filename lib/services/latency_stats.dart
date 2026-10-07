@@ -29,3 +29,55 @@ String describeLatencySummary(List<int> latenciesMs, {required int deadStretches
   return 'LATENCY SUMMARY: n=${latenciesMs.length} p50=${p50}ms p90=${p90}ms max=${max}ms '
       'deadStretches(>=3s)=$deadStretches hangs=$hangs (all values: ${latenciesMs.join(', ')})';
 }
+
+/// Change 5 — one turn's split, logged as `TURN TIMING` next to the
+/// unchanged `LATENCY` line. Any part can be null when that moment wasn't
+/// observed (e.g. no transcript before the reply, or no app action).
+class TurnTiming {
+  const TurnTiming({
+    this.speechEndToTranscriptMs,
+    this.transcriptToActionMs,
+    this.actionToFirstAudioMs,
+    required this.totalMs,
+    required this.replyFromClip,
+  });
+
+  final int? speechEndToTranscriptMs;
+  final int? transcriptToActionMs;
+  final int? actionToFirstAudioMs;
+  final int totalMs;
+  final bool replyFromClip;
+
+  String describe() {
+    String ms(int? v) => v == null ? 'n/a' : '${v}ms';
+    return 'TURN TIMING: speech end -> transcript ${ms(speechEndToTranscriptMs)}, transcript -> action done '
+        '${ms(transcriptToActionMs)}, action done -> first audio ${ms(actionToFirstAudioMs)}, total ${totalMs}ms '
+        '(reply=${replyFromClip ? 'cached clip' : 'gemini'})';
+  }
+}
+
+/// `TURN TIMING SUMMARY` — p50/p90 of each part, logged at session end
+/// next to `LATENCY SUMMARY`.
+///
+/// [lateTranscripts]: transcripts that arrived >= 3s after speech end (the
+/// `LATE TRANSCRIPT` lines); [vadSetting]: which end-of-speech A/B setting
+/// this session ran with. Both are appended only when given, so the line is
+/// otherwise unchanged.
+String describeTurnTimingSummary(List<TurnTiming> turns, {int? lateTranscripts, String? vadSetting}) {
+  final extra = '${lateTranscripts == null ? '' : '; late transcripts (>=3s): $lateTranscripts'}'
+      '${vadSetting == null ? '' : '; vad=$vadSetting'}';
+  if (turns.isEmpty) return 'TURN TIMING SUMMARY: n=0$extra';
+  String part(String label, Iterable<int?> values) {
+    final present = [for (final v in values) ?v];
+    if (present.isEmpty) return '$label n/a';
+    return '$label p50=${nearestRankPercentile(present, 50)}ms p90=${nearestRankPercentile(present, 90)}ms '
+        '(n=${present.length})';
+  }
+
+  final clips = turns.where((t) => t.replyFromClip).length;
+  return 'TURN TIMING SUMMARY: n=${turns.length}; '
+      '${part('speechEnd->transcript', turns.map((t) => t.speechEndToTranscriptMs))}; '
+      '${part('transcript->action', turns.map((t) => t.transcriptToActionMs))}; '
+      '${part('action->firstAudio', turns.map((t) => t.actionToFirstAudioMs))}; '
+      '${part('total', turns.map((t) => t.totalMs))}; replies from cached clip: $clips/${turns.length}$extra';
+}

@@ -147,6 +147,9 @@ void main() {
     test('the confirmed premature claim is detected', () {
       expect(completionClaimFunctionIn("Camera's open — ready when you are."), 'open_camera');
     });
+    test("the short C21 reply (\"Camera's open.\") is still recognized as an open_camera claim", () {
+      expect(completionClaimFunctionIn("Camera's open."), 'open_camera');
+    });
     test('other completed-open wording is detected', () {
       for (final s in ['The camera is open now.', "Okay, I've opened the camera.", "Camera's ready."]) {
         expect(completionClaimFunctionIn(s), 'open_camera', reason: s);

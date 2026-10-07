@@ -12,6 +12,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/env.dart';
 import '../models/change_order.dart';
+import '../models/job_estimate.dart';
 import '../models/job_history_entry.dart';
 import '../models/job_photo.dart';
 import '../models/kept_photo_ref.dart';
@@ -1606,6 +1607,19 @@ T? _readAfterAwaitIfStillMounted<T>(WidgetRef ref, ProviderListenable<T> provide
 /// Gemini can speak the real details, not just confirm it navigated.
 /// `estimate: null` when the job has none yet — same as `EstimateScreen`
 /// itself would show.
+/// Change 4 (5 Oct acceptance logs: view_estimate dispatch 1105ms,
+/// view_change_orders 1244ms, vs. 0–1ms for the other screens). The screen
+/// was already pushed first; the time was the awaited `refresh()` fetch,
+/// which the spoken line depends on ("there isn't one on this job yet" vs.
+/// "Here's the estimate"). Both providers are long-lived (not auto-
+/// disposed), loaded on creation — the voice session now creates them as it
+/// opens — and kept current by Supabase Realtime plus every in-app write.
+/// So when the state is ALREADY loaded (AsyncData), the reply uses it and
+/// the refresh runs in the background; while it's still loading or errored,
+/// the fetch is awaited exactly as before, so the line is never spoken
+/// before the real state is known. false = always await the fetch.
+const bool kVoiceUsesLoadedJobDataForSpokenReply = true;
+
 Future<Map<String, dynamic>> _viewEstimate({
   required WidgetRef ref,
   required GeminiNavigationSession navigationSession,
@@ -1614,8 +1628,20 @@ Future<Map<String, dynamic>> _viewEstimate({
   final pushed = _pushUnlessAlreadyOnTop(navigationSession, 'view_estimate', EstimateScreen(jobId: jobId));
 
   final controller = ref.read(jobEstimateProvider(jobId).notifier);
-  await controller.refresh();
-  final estimate = _readAfterAwaitIfStillMounted(ref, jobEstimateProvider(jobId))?.valueOrNull;
+  final JobEstimate? estimate;
+  final known = ref.read(jobEstimateProvider(jobId));
+  if (kVoiceUsesLoadedJobDataForSpokenReply && known is AsyncData<JobEstimate?>) {
+    // Change 4 — see [kVoiceUsesLoadedJobDataForSpokenReply].
+    estimate = known.value;
+    debugPrint(
+      'VIEW ESTIMATE: answering from already-loaded state (${estimate == null ? 'no estimate' : 'estimate ${estimate.id}'}) '
+      '— refreshing in the background',
+    );
+    unawaited(controller.refresh());
+  } else {
+    await controller.refresh();
+    estimate = _readAfterAwaitIfStillMounted(ref, jobEstimateProvider(jobId))?.valueOrNull;
+  }
   return {
     'status': pushed ? 'navigated' : 'already_on_screen',
     'job_id': jobId,
@@ -1647,9 +1673,21 @@ Future<Map<String, dynamic>> _viewChangeOrders({
       _pushUnlessAlreadyOnTop(navigationSession, 'view_change_orders', ChangeOrdersScreen(jobId: jobId));
 
   final controller = ref.read(jobChangeOrdersProvider(jobId).notifier);
-  await controller.refresh();
-  final changeOrders =
-      _readAfterAwaitIfStillMounted(ref, jobChangeOrdersProvider(jobId))?.valueOrNull ?? const <ChangeOrder>[];
+  final List<ChangeOrder> changeOrders;
+  final known = ref.read(jobChangeOrdersProvider(jobId));
+  if (kVoiceUsesLoadedJobDataForSpokenReply && known is AsyncData<List<ChangeOrder>>) {
+    // Change 4 — see [kVoiceUsesLoadedJobDataForSpokenReply].
+    changeOrders = known.value;
+    debugPrint(
+      'VIEW CHANGE ORDERS: answering from already-loaded state (${changeOrders.length} change order(s)) — '
+      'refreshing in the background',
+    );
+    unawaited(controller.refresh());
+  } else {
+    await controller.refresh();
+    changeOrders =
+        _readAfterAwaitIfStillMounted(ref, jobChangeOrdersProvider(jobId))?.valueOrNull ?? const <ChangeOrder>[];
+  }
   return {
     'status': pushed ? 'navigated' : 'already_on_screen',
     'job_id': jobId,
