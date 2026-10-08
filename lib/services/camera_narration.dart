@@ -35,3 +35,30 @@ String? cameraNarrationRejection(String text, {required bool cameraLive}) {
   if (classifyCommandIntent(text).kind != IntentDecisionKind.none) return 'close to a known command';
   return null;
 }
+
+/// Build 175 (second pass) — "Capture this, there's water damage here.":
+/// the camera request opens the camera, and the clause(s) AFTER it are a
+/// description of what the photo is of. Returns that description when it
+/// passes [cameraNarrationRejection] (as if said with the camera live), so
+/// it can become the pending photo note exactly like C13 narration; `null`
+/// when there is nothing after the request, the request isn't found, or
+/// what follows is a command/question/too short ("Take a photo, then show
+/// me the invoice" keeps no note).
+///
+/// Only text after a clause boundary (comma, period, semicolon, dash…)
+/// counts — "Take a photo of the water damage" is one clause and keeps no
+/// note. [requestPhrases]: open_camera's phrase list (it lives in the
+/// screen); the loose verb-before-noun matcher is also tried.
+String? cameraRequestTrailingNarration(String text, {required List<String> requestPhrases}) {
+  final clauses = [
+    for (final c in text.split(RegExp(r'[,;:.!?]+|\s[-–—]+\s|[–—]+'))) c.trim(),
+  ].where((c) => c.isNotEmpty).toList();
+  if (clauses.length < 2) return null;
+  final requestAt = clauses.indexWhere(
+    (c) => matchAnyTriggerPhrase(c, requestPhrases) != null || matchLooseCameraRequest(c) is CameraRequestMatch,
+  );
+  if (requestAt < 0 || requestAt == clauses.length - 1) return null;
+  final description = clauses.sublist(requestAt + 1).join(', ');
+  if (cameraNarrationRejection(description, cameraLive: true) != null) return null;
+  return description;
+}

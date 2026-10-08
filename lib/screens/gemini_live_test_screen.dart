@@ -1007,6 +1007,48 @@ const bool _cameraNarrationAsPhotoNote = true;
 /// utterance text itself, not only when the phrase layer blocked first.
 const bool _negationGuardEnabled = true;
 
+/// Build 175 second pass, Step 1 (Bob's phrases): the negation guard also
+/// blocks on "forget the photo/picture", "forget about the photo",
+/// "(I've) changed my mind", "not right now", "never mind the photo" (only
+/// when no camera verb follows — `camera_negation_guard.dart`); an
+/// utterance that names the camera and cancels it with nothing firing
+/// ("Hold on, forget the photo for now.") is answered "Okay." before the
+/// intent layer, so neither the Gemini intent check nor the live "photo"
+/// shutter noun can act on it; and a bare "hold on"/"wait"/"one second" is
+/// filler (no KB call, no intent check, nothing said by the app).
+/// false = build 175's first-pass guard and routing.
+const bool _cameraCancelCuesExtended = true;
+
+/// Build 175 second pass, Step 1: "Capture this, there's water damage
+/// here." opens the camera AND keeps the description after the request as
+/// the pending photo note (the C13 narration mechanism — read back for a
+/// yes/no when the photo is kept, nothing saved without "yes"). Needs
+/// [_cameraNarrationAsPhotoNote]. Logs `CAMERA NARRATION NOTED (from the
+/// camera request)`. false = the description is dropped, as before.
+const bool _cameraRequestNarration = true;
+
+/// Bare pauses — "must do nothing at all" (Bob). Whole-utterance matches
+/// only, like [_nonInformationalFillerPhrases]; see [_cameraCancelCuesExtended].
+const List<String> _holdOnFillerPhrases = [
+  'hold on',
+  'hold on a second',
+  'hold on a sec',
+  'hold on a minute',
+  'hang on',
+  'hang on a second',
+  'hang on a sec',
+  'wait',
+  'wait a second',
+  'wait a sec',
+  'wait a minute',
+  'one second',
+  'one sec',
+  'just a second',
+  'just a sec',
+  'give me a second',
+  'give me a sec',
+];
+
 /// The one reply a blocked negation gets (cached-clip eligible, see
 /// `cacheableConfirmationReasons`).
 const String _negationGuardReply = 'Okay.';
@@ -1015,7 +1057,8 @@ const Set<String> _cameraNegationGuardedActions = {'open_camera', 'capture_photo
 /// Build 174 — every voice switch, for the `BUILD:` line (app start and
 /// first session open), so a log shows exactly what the build ran with.
 final String kVoiceFlagsSummary =
-    'negationGuard=$_negationGuardEnabled atomicVoiceRegistry=$atomicVoiceRegistry '
+    'negationGuard=$_negationGuardEnabled cameraCancelCuesExtended=$_cameraCancelCuesExtended '
+    'cameraRequestNarration=$_cameraRequestNarration atomicVoiceRegistry=$atomicVoiceRegistry '
     'coalesceRegistryNavigation=$coalesceRegistryNavigation '
     'jobFactAudioCache=$_jobFactAudioCache jobFactClipLengthFromText=$_jobFactClipLengthFromText '
     'jobDetailsReplyCacheable=$_jobDetailsReplyCacheable '
@@ -8094,6 +8137,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// toolCall) — the start of the end-to-end camera_preview_live timing.
   DateTime? _openCameraDispatchedAt;
 
+  /// The utterance that asked for the current open_camera — see
+  /// [_cameraRequestNarration].
+  ({int utteranceSeq, String text})? _openCameraRequest;
+
   /// Whether the current speech burst's audio was actually being sent to
   /// Gemini when it started (outgoing mic not paused for playback) — only
   /// then can a transcript for it ever arrive, so only then is it worth
@@ -8431,7 +8478,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     required Future<Map<String, dynamic>> Function() call,
   }) async {
     final startedAt = DateTime.now();
-    if (name == 'open_camera') _openCameraDispatchedAt = startedAt;
+    if (name == 'open_camera') {
+      _openCameraDispatchedAt = startedAt;
+      _openCameraRequest = (utteranceSeq: _utteranceSeq, text: _utteranceHeardText.trim());
+    }
     _pipelineLog('dispatch_start','function=$name source=$source mounted=$mounted $_utteranceStateSummary; ${_registrySnapshot()}');
     try {
       final result = await call();
@@ -8481,6 +8531,26 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final decision = classifyCommandIntent(transcript);
     _log_(decision.describe(transcript));
     _pipelineLog('intent_layer', '${decision.kind.name}${decision.best == null ? '' : ' best=${decision.best!.trigger}'}');
+
+    // Build 175 second pass — "Hold on, forget the photo for now.": names
+    // the camera, cancels it, and nothing fired. Answered "Okay." here,
+    // before the live shutter noun or the Gemini intent check below could
+    // act on "photo" (see [_cameraCancelCuesExtended]). Logged as the
+    // action this camera state would have fired.
+    if (_negationGuardEnabled &&
+        _cameraCancelCuesExtended &&
+        widget.jobId != null &&
+        standaloneCameraCancel(transcript, extendedCues: _cameraCancelCuesExtended) != null) {
+      final action = switch (_screenTask) {
+        _ScreenTask.cameraLive => 'capture_photo',
+        _ScreenTask.cameraCaptured => 'retake_photo',
+        _ => 'open_camera',
+      };
+      if (_blockNegatedCameraAction(action, transcript)) {
+        _pipelineLog('intent_layer', 'standalone_camera_cancel action=$action — answered "$_negationGuardReply"');
+        return;
+      }
+    }
 
     // Live camera only: a bare photo noun ("Tika shot" — ASR's "take a
     // shot") is FUZZY WEAK in general, but with the preview up and armed the
@@ -9865,7 +9935,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// text with one of these words in it still routes to the KB normally.
   bool _looksLikeNonInformationalFiller(String text) {
     final normalized = text.toLowerCase().replaceAll(RegExp('[^a-z ]'), ' ').trim().replaceAll(RegExp(r'\s+'), ' ');
-    return _nonInformationalFillerPhrases.contains(normalized);
+    return _nonInformationalFillerPhrases.contains(normalized) ||
+        (_cameraCancelCuesExtended && _holdOnFillerPhrases.contains(normalized));
   }
 
   /// Broad, NOT exact-phrase, whole-word/phrase pattern match for "the
@@ -10354,11 +10425,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   bool _blockNegatedCameraAction(String action, String heard) {
     if (!_negationGuardEnabled || !_cameraNegationGuardedActions.contains(action)) return false;
     var text = heard.trim();
-    var cue = text.isEmpty ? null : cameraActionNegation(text);
+    var cue = text.isEmpty ? null : cameraActionNegation(text, extendedCues: _cameraCancelCuesExtended);
     final utterance = _utteranceHeardText.trim();
     if (cue == null && utterance.isNotEmpty && utterance != text) {
       text = utterance;
-      cue = cameraActionNegation(text);
+      cue = cameraActionNegation(text, extendedCues: _cameraCancelCuesExtended);
     }
     if (cue == null) return false;
     _pipelineLog('matched_not_fired', 'trigger=$action reason=negation ("$cue")');
@@ -10407,6 +10478,29 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _clearAllTriggerBuffersAfterSuccess('camera narration noted');
     _informGeminiToSpeakVerbatim('Noted.', reason: 'camera_narration_noted');
     return true;
+  }
+
+  /// [_cameraRequestNarration] — called once open_camera has succeeded
+  /// (after the reopen discard above it): the description said after the
+  /// request in the SAME utterance becomes the pending photo note. Fires no
+  /// action and says nothing; the keep step reads it back for a yes/no.
+  void _noteCameraRequestNarration() {
+    final request = _openCameraRequest;
+    _openCameraRequest = null;
+    if (!_cameraRequestNarration || !_cameraNarrationAsPhotoNote || request == null) return;
+    // The toolCall can beat the transcript: still the same utterance, use
+    // what has arrived since.
+    final text = request.text.isNotEmpty
+        ? request.text
+        : (request.utteranceSeq == _utteranceSeq ? _utteranceHeardText.trim() : '');
+    if (text.isEmpty) return;
+    final description = cameraRequestTrailingNarration(text, requestPhrases: _openCameraIndicatorPhrases);
+    if (description == null) return;
+    _pendingCameraNarration = description;
+    _log_(
+      'CAMERA NARRATION NOTED (from the camera request): "$description" from "$text" kept as the pending photo '
+      'note — offered for saving when this photo is kept; no other action taken',
+    );
   }
 
   /// C14-C17/C22 — answers from job data already in memory; see
@@ -12811,6 +12905,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _log_('CAMERA NARRATION: discarded "$_pendingCameraNarration" — the camera was opened again, no photo was kept');
       _pendingCameraNarration = null;
     }
+    if (name == 'open_camera') _noteCameraRequestNarration();
     if (name == 'confirm_photo_upload') {
       _enterPhotoNote(keptId: responsePayload['kept_id'] as int?, jobId: responsePayload['job_id'] as String?);
     } else {

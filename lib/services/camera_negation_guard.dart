@@ -20,6 +20,7 @@
 /// never fires anything itself.
 library;
 
+import 'camera_request_matcher.dart';
 import 'trigger_phrase_matcher.dart';
 
 /// Contractions expanded before matching, keyed by their token form after
@@ -72,6 +73,21 @@ const List<List<String>> _cancelCues = [
   ['stop'],
 ];
 
+/// Build 175 (second pass) — Bob's cancel phrasings ("Hold on, forget the
+/// photo for now.", "I've changed my mind", "not right now"). Same rule as
+/// [_cancelCues]: they block only when no camera verb follows them, so
+/// "Forget the photo, take a picture of the roof" still goes through.
+const List<List<String>> _extendedCancelCues = [
+  ['forget', 'the', 'photo'],
+  ['forget', 'the', 'picture'],
+  ['forget', 'about', 'the', 'photo'],
+  ['forget', 'about', 'the', 'picture'],
+  ['changed', 'my', 'mind'],
+  ['not', 'right', 'now'],
+  ['never', 'mind', 'the', 'photo'],
+  ['never', 'mind', 'the', 'picture'],
+];
+
 /// [text] lowercased, punctuation stripped, contractions expanded, with
 /// whether a clause boundary (comma, period, dash…) comes before each word.
 ({List<String> words, List<bool> boundaries}) normalizeNegationText(String text) {
@@ -99,7 +115,9 @@ const List<List<String>> _cancelCues = [
 
 /// The cue that blocks a camera action in [text] ("do not ... take",
 /// "never mind", "do not (end)"), or `null` when nothing does.
-String? cameraActionNegation(String text) {
+/// [extendedCues]: also the build 175 second-pass cues
+/// ([_extendedCancelCues]).
+String? cameraActionNegation(String text, {bool extendedCues = true}) {
   final (:words, :boundaries) = normalizeNegationText(text);
   if (words.isEmpty) return null;
   bool isVerb(int i) => _cameraVerbStems.contains(stemTriggerWord(words[i]));
@@ -127,11 +145,23 @@ String? cameraActionNegation(String text) {
       // utterance with nothing but filler after it.
       if (j == words.length && cue.first == 'do') return '${cue.join(' ')} (end)';
     }
-    for (final cue in _cancelCues) {
+    for (final cue in [..._cancelCues, if (extendedCues) ..._extendedCancelCues]) {
       if (!cueAt(cue, i)) continue;
       final verbAfter = [for (var j = i + cue.length; j < words.length; j++) j].any(isVerb);
       if (!verbAfter) return cue.join(' ');
     }
   }
   return null;
+}
+
+/// Build 175 (second pass) — a camera cancel that names the camera but
+/// asks for nothing ("Hold on, forget the photo for now."): no phrase
+/// fires on it, so the guard above never ran, and the intent layer could
+/// still open the camera (Gemini intent check) or take a photo (the live
+/// "photo" shutter noun). Returns the blocking cue when [text] mentions a
+/// camera/photo word AND [cameraActionNegation] blocks; `null` otherwise —
+/// a bare "hold on"/"wait" (no camera word) is never one.
+String? standaloneCameraCancel(String text, {bool extendedCues = true}) {
+  if (matchLooseCameraRequest(text) == null) return null; // no camera/photo word at all
+  return cameraActionNegation(text, extendedCues: extendedCues);
 }
