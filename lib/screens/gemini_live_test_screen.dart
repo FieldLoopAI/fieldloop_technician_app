@@ -983,6 +983,22 @@ const bool _jobDetailsReplyCacheable = true;
 /// false = every KB timeout/error says "couldn't reach", as before.
 const bool _kbCatchAllTimeoutSaysOutOfScope = true;
 
+/// Build 175 second pass, Step 2 (C17): "What was on the estimate?" with
+/// no estimate in memory (prefetch still running or failed) says "I don't
+/// have the estimate details loaded." instead of "The estimate is still
+/// loading." — and a failed fetch is no longer reported as "loading".
+/// Still local job data only, never a network call. false = the old line.
+const bool _estimateNotLoadedHonestReply = true;
+
+/// Build 175 second pass, Step 2 (C19): a clearly general-knowledge
+/// question ("What's the weather today?" — an off-topic word and no job/
+/// trade word, `classifyOffTopicQuestion` in `job_facts.dart`) that no
+/// matcher placed is refused at once with "I can only help with this job."
+/// — no Gemini intent check (1.8s, never answered in b173/b174) and no KB
+/// catch-all (8s timeout). Logs `OUT OF SCOPE FAST REFUSAL decision=…`.
+/// false = intent check + KB catch-all, as before.
+const bool _offTopicFastRefusal = true;
+
 /// C20: "call / text / email the customer" gets a short "I can't" reply.
 const bool _unsupportedActionReplies = true;
 
@@ -1063,7 +1079,8 @@ final String kVoiceFlagsSummary =
     'jobFactAudioCache=$_jobFactAudioCache jobFactClipLengthFromText=$_jobFactClipLengthFromText '
     'jobDetailsReplyCacheable=$_jobDetailsReplyCacheable '
     'kbCatchAllTimeoutSaysOutOfScope=$_kbCatchAllTimeoutSaysOutOfScope '
-    'jobFactsAnswers=$_jobFactsAnswers '
+    'jobFactsAnswers=$_jobFactsAnswers estimateNotLoadedHonestReply=$_estimateNotLoadedHonestReply '
+    'offTopicFastRefusal=$_offTopicFastRefusal '
     'unsupportedActionReplies=$_unsupportedActionReplies kbMissSaysOutOfScope=$_kbMissSaysOutOfScope '
     'cameraNarrationAsPhotoNote=$_cameraNarrationAsPhotoNote shortCameraOpenReply=$_shortCameraOpenReply '
     'cachedConfirmationClips=$_useCachedConfirmationClips prefetchJobData=$_prefetchJobDataForVoice '
@@ -8579,6 +8596,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // (including the context-aware "I didn't catch that" reply) applies.
     }
 
+    // C19 fast refusal — see [_offTopicFastRefusal]. Only for an utterance
+    // no matcher placed at all (NO MATCH), before the Gemini intent check
+    // and the KB catch-all it would otherwise wait on.
+    if (decision.kind == IntentDecisionKind.none && _maybeRefuseOffTopicFast(transcript)) return;
+
     // The utterance right after "I have a question" IS the question: no
     // camera-intent check or "not sure what you need" reply — straight on to
     // the catch-all's normal KB routing (KB GATE unchanged). A confident
@@ -8614,6 +8636,36 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       case IntentDecisionKind.weak:
         _respondToWeakIntentMatch(transcript, decision);
     }
+  }
+
+  /// [_offTopicFastRefusal] — refuses a clearly general-knowledge question
+  /// ("What's the weather today?") with [outOfScopeReply] at once: no Gemini
+  /// intent check, no KB call. A job/trade word anywhere in it sends it on
+  /// to the normal routing (logged). Returns true when it answered.
+  bool _maybeRefuseOffTopicFast(String transcript) {
+    if (!_offTopicFastRefusal || widget.jobId == null) return false;
+    final hit = classifyOffTopicQuestion(transcript);
+    if (hit == null) return false;
+    if (hit.anchor != null) {
+      _log_(
+        'OUT OF SCOPE FAST REFUSAL: decision=not_refused heard="$transcript" topic="${hit.topic}" '
+        'jobWord="${hit.anchor}" — normal routing (intent check / KB) as before',
+      );
+      return false;
+    }
+    final endAt = _utteranceEndDetectedAt;
+    final ms = endAt == null ? -1 : DateTime.now().difference(endAt).inMilliseconds;
+    _log_(
+      'OUT OF SCOPE FAST REFUSAL: decision=refused heard="$transcript" topic="${hit.topic}" '
+      'screen=${_kbGateScreen().screen} ms_after_utterance_end=$ms reply="$outOfScopeReply" '
+      '(no Gemini intent check, no KB call)',
+    );
+    _pipelineLog('out_of_scope', 'refused topic=${hit.topic}');
+    // Same shape as the catch-all's conversational reply: this flag makes
+    // the KB catch-all stand down for this utterance.
+    _guardFailedReplySpokenThisUtterance = true;
+    _informGeminiToSpeakVerbatim(outOfScopeReply, reason: 'out_of_scope_fast');
+    return true;
   }
 
   // ---------------------------------------------------------------------
@@ -10551,7 +10603,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       case JobFactKind.estimateSummary:
         final AsyncValue<JobEstimate?>? estimate =
             ref.exists(jobEstimateProvider(jobId)) ? ref.read(jobEstimateProvider(jobId)) : null;
-        return estimateSummaryReply(loaded: estimate?.hasValue ?? false, estimate: estimate?.valueOrNull);
+        return estimateSummaryReply(
+          loaded: estimate?.hasValue ?? false,
+          estimate: estimate?.valueOrNull,
+          honestNotLoaded: _estimateNotLoadedHonestReply,
+        );
     }
   }
 

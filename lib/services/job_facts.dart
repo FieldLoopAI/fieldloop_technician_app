@@ -155,10 +155,16 @@ String timeOnSiteReply({
   return rest == 0 ? '$h on site.' : '$h ${rest == 1 ? '1 minute' : '$rest minutes'} on site.';
 }
 
+/// C17 when the estimate isn't in memory (prefetch still running, failed,
+/// or never started) — said instead of guessing (build 175 second pass).
+const String estimateNotLoadedReply = "I don't have the estimate details loaded.";
+
 /// Total and up to 3 line items, one sentence. [loaded] false while the
-/// prefetched estimate hasn't arrived yet.
-String estimateSummaryReply({required bool loaded, JobEstimate? estimate}) {
-  if (!loaded) return 'The estimate is still loading.';
+/// prefetched estimate hasn't arrived yet (or its fetch failed):
+/// [honestNotLoaded] says [estimateNotLoadedReply], otherwise the older
+/// "still loading" line.
+String estimateSummaryReply({required bool loaded, JobEstimate? estimate, bool honestNotLoaded = true}) {
+  if (!loaded) return honestNotLoaded ? estimateNotLoadedReply : 'The estimate is still loading.';
   if (estimate == null) return "There's no estimate on this job yet.";
   if (estimate.isVoided) return 'The estimate on this job was voided.';
   final total = spokenMoney(estimate.totalAmount);
@@ -243,6 +249,73 @@ String unsupportedActionReply(UnsupportedActionKind kind) => switch (kind) {
 
 /// Spoken instead of the knowledge-base-miss line (7 words).
 const String outOfScopeReply = 'I can only help with this job.';
+
+// --- C19 fast refusal (build 175 second pass) -------------------------------
+//
+// b174 14:51:42: "What's the weather today?" took ~10.5s from transcript to
+// reply — a 1.8s Gemini intent check that never answered, then the KB
+// catch-all's 8s timeout. These lists let the app refuse a clearly general-
+// knowledge question at once, without either call. Positive evidence only:
+// an off-topic word must be present AND no job/trade word may be — anything
+// else ("what's the gate code", "is the rain going to hurt the roof") goes
+// to the KB exactly as before.
+
+/// General-knowledge topics, as whole words/phrases (normalized: lowercase,
+/// apostrophes -> space).
+const List<String> offTopicPhrases = [
+  'weather',
+  'forecast',
+  'news',
+  'headlines',
+  'stock market',
+  'stock price',
+  'joke',
+  'president',
+  'prime minister',
+  'capital of',
+  'birthday',
+  'movie',
+  'movies',
+  'song',
+  'recipe',
+  'who won',
+  'football',
+  'basketball',
+  'baseball',
+  'cricket',
+  'what time is it',
+  'what day is it',
+  'what s the date',
+  'whats the date',
+  'what is the date',
+  'today s date',
+  'todays date',
+];
+
+/// Words that tie a question to the job — any one of them and the question
+/// goes to the KB as before, off-topic word or not.
+const Set<String> jobAnchorWords = {
+  'job', 'customer', 'customers', 'client', 'homeowner', 'owner', 'gate', 'code', 'address', 'estimate', 'invoice',
+  'quote', 'order', 'photo', 'picture', 'camera', 'site', 'house', 'home', 'roof', 'attic', 'panel', 'pipe', 'pipes',
+  'leak', 'water', 'wire', 'wiring', 'unit', 'system', 'install', 'installation', 'repair', 'part', 'parts',
+  'warranty', 'permit', 'appointment', 'visit', 'arrive', 'arrived', 'arrival', 'note', 'notes', 'history',
+  'material', 'materials', 'tool', 'tools', 'crew', 'work', 'shingle', 'shingles', 'gutter', 'gutters', 'hvac',
+  'furnace', 'ac', 'electrical', 'plumbing', 'concrete', 'paint', 'inspection', 'schedule', 'safety', 'phone',
+};
+
+/// The [offTopicPhrases] entry in [text] (whole words), with the first
+/// [jobAnchorWords] word also in it — refuse only when `anchor` is null.
+/// `null` when no off-topic phrase is there at all. Exact words only — no
+/// fuzzy match, so "whether" is never "weather".
+({String topic, String? anchor})? classifyOffTopicQuestion(String text) {
+  final words = tokenizeTriggerText(text);
+  if (words.isEmpty) return null;
+  final padded = ' ${words.join(' ')} ';
+  final topic = offTopicPhrases.where((p) => padded.contains(' $p ')).firstOrNull;
+  if (topic == null) return null;
+  final anchor = words.where(jobAnchorWords.contains).firstOrNull;
+  return (topic: topic, anchor: anchor);
+}
 
 /// What a get_kb_answer TIMEOUT or ERROR says.
 const String kbUnreachableReply = "Sorry, I couldn't reach the knowledge base right now — try again in a moment.";

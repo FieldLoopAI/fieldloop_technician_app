@@ -158,7 +158,8 @@ void main() {
 
     test('estimate: total + up to 3 items, one sentence', () {
       expect(estimateSummaryReply(loaded: true), "There's no estimate on this job yet.");
-      expect(estimateSummaryReply(loaded: false), 'The estimate is still loading.');
+      expect(estimateSummaryReply(loaded: false), "I don't have the estimate details loaded.");
+      expect(estimateSummaryReply(loaded: false, honestNotLoaded: false), 'The estimate is still loading.');
       expect(
         estimateSummaryReply(loaded: true, estimate: _estimate([('Roof patch', 800), ('Gutter cleaning', 450)], 1250)),
         'The estimate is \$1,250 for Roof patch and Gutter cleaning.',
@@ -195,6 +196,80 @@ void main() {
     test("flag off: both paths say the old line", () {
       expect(kbFailureReply(source: KbCallSource.catchAll, catchAllSaysOutOfScope: false), kbUnreachableReply);
       expect(kbFailureReply(source: KbCallSource.match, catchAllSaysOutOfScope: false), kbUnreachableReply);
+    });
+  });
+
+  group('build 175 second pass — C17 "What was on the estimate?"', () {
+    test('is a local job fact (estimateSummary), ahead of view_estimate, no network', () {
+      expect(matchJobFactQuestion('What was on the estimate?')?.kind, JobFactKind.estimateSummary);
+      // "What's on the estimate?" stays view_estimate's (it navigates).
+      expect(matchJobFactQuestion("What's on the estimate?"), isNull);
+    });
+    test('not loaded -> honest line, never a number', () {
+      final reply = estimateSummaryReply(loaded: false);
+      expect(reply, estimateNotLoadedReply);
+      expect(reply, isNot(contains(r'$')));
+    });
+    test('loaded -> the real total and items only', () {
+      final reply = estimateSummaryReply(loaded: true, estimate: _estimate([('Roof patch', 800)], 800));
+      expect(reply, 'The estimate is \$800 for Roof patch.');
+    });
+  });
+
+  group('build 175 second pass — C19 fast refusal (classifyOffTopicQuestion)', () {
+    const refused = {
+      "What's the weather today?": 'weather',
+      "What's the forecast for tomorrow?": 'forecast',
+      'Tell me a joke': 'joke',
+      'Who is the president?': 'president',
+      'Who won the game last night?': 'who won',
+      'What time is it?': 'what time is it',
+      "Is today Modi's birthday?": 'birthday',
+      "What's the capital of France?": 'capital of',
+    };
+    refused.forEach((text, topic) {
+      test('refused: "$text"', () {
+        final hit = classifyOffTopicQuestion(text);
+        expect(hit?.topic, topic);
+        expect(hit?.anchor, isNull);
+      });
+    });
+
+    // Real job questions must still reach the KB: no off-topic word, or a
+    // job word next to one.
+    const stillToKb = [
+      "What's the gate code?",
+      "What's the customer's phone?",
+      "What's the customer's phone number?",
+      'How do I check the breaker panel?',
+      'Is the rain going to affect the roof?',
+      "What's the weather going to do to the concrete?",
+      'What day is the appointment?',
+      "What's the date of the visit?",
+      'Whether we need a permit here',
+      'Do we have the parts in stock?',
+      'What time did we arrive?',
+    ];
+    for (final text in stillToKb) {
+      test('not refused: "$text"', () {
+        final hit = classifyOffTopicQuestion(text);
+        expect(hit == null || hit.anchor != null, isTrue, reason: '$hit');
+      });
+    }
+
+    test('job questions/commands in existingCommands are never refused', () {
+      for (final text in existingCommands) {
+        final hit = classifyOffTopicQuestion(text);
+        expect(hit == null || hit.anchor != null, isTrue, reason: text);
+      }
+    });
+
+    test('a refused question matches no command (the refusal only runs on NO MATCH)', () {
+      for (final text in refused.keys) {
+        expect(classifyCommandIntent(text).kind, IntentDecisionKind.none, reason: text);
+        expect(matchJobFactQuestion(text), isNull, reason: text);
+        expect(matchUnsupportedAction(text), isNull, reason: text);
+      }
     });
   });
 }
