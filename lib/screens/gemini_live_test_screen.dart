@@ -1028,6 +1028,14 @@ const bool _jobFactClipPrewarm = false;
 /// an early STALE TURN). Logs `SHORT SCRIPTED LINE`.
 const bool _playShortScriptedLinesImmediately = false;
 
+/// Build 175 second pass, Step 5 (logging only): once an utterance's
+/// transcript has arrived, a later speech-end edge in the same utterance
+/// (noise after the words) no longer restarts DEAD STRETCH or moves the
+/// LATENCY / TURN TIMING speech-end reference. b174 photo-note "Yes."
+/// (14:43:59.944): real gap 5.65s, logged 3.39s, "speech end -> transcript
+/// -1008ms". Logs `SPEECH END KEPT`. No routing, wake or greeting change.
+const bool _timingFromTrueSpeechEnd = true;
+
 /// C20: "call / text / email the customer" gets a short "I can't" reply.
 const bool _unsupportedActionReplies = true;
 
@@ -1111,6 +1119,7 @@ final String kVoiceFlagsSummary =
     'jobFactsAnswers=$_jobFactsAnswers estimateNotLoadedHonestReply=$_estimateNotLoadedHonestReply '
     'offTopicFastRefusal=$_offTopicFastRefusal cacheFixedReplyLines=$_cacheFixedReplyLines '
     'jobFactClipPrewarm=$_jobFactClipPrewarm playShortScriptedLinesImmediately=$_playShortScriptedLinesImmediately '
+    'timingFromTrueSpeechEnd=$_timingFromTrueSpeechEnd '
     'unsupportedActionReplies=$_unsupportedActionReplies kbMissSaysOutOfScope=$_kbMissSaysOutOfScope '
     'cameraNarrationAsPhotoNote=$_cameraNarrationAsPhotoNote shortCameraOpenReply=$_shortCameraOpenReply '
     'cachedConfirmationClips=$_useCachedConfirmationClips prefetchJobData=$_prefetchJobDataForVoice '
@@ -5731,9 +5740,26 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // LATENCY metric only — see [_latencySpeechEndAt]. Only speech Gemini
     // actually received can be what it is answering.
     if (_speechBurstReachedGemini) {
-      _latencySpeechEndAt = _speechStoppedAt;
-      _lastSpeechEndEdgeAt = _speechStoppedAt; // FIX 2 — see [_maybeLogLateTranscript]
-      _armResponseWatchdog(_speechStoppedAt!);
+      final trueEnd = _latencySpeechEndAt;
+      if (ignoreLaterSpeechEndEdge(
+        enabled: _timingFromTrueSpeechEnd,
+        currentSpeechEnd: trueEnd,
+        transcriptAt: _latencyTranscriptAt,
+      )) {
+        // Step 5 (b175 pass 2) — this utterance's transcript has already
+        // arrived, so its speech ended at [trueEnd]; this later edge is
+        // noise after it (b174 14:43:59.944 "Yes." -> edges at 01.285 and
+        // 02.209 re-armed DEAD STRETCH, logging 3.4s for a 5.6s gap).
+        _log_(
+          'SPEECH END KEPT: later edge ${_speechStoppedAt!.difference(trueEnd!).inMilliseconds}ms after the true '
+          'speech end ignored for timing (u=$_utteranceSeq, transcript already arrived) — DEAD STRETCH / '
+          'LATENCY / TURN TIMING still measured from the true speech end',
+        );
+      } else {
+        _latencySpeechEndAt = _speechStoppedAt;
+        _lastSpeechEndEdgeAt = _speechStoppedAt; // FIX 2 — see [_maybeLogLateTranscript]
+        _armResponseWatchdog(_speechStoppedAt!);
+      }
     }
     _speechBurstStartedAt = null;
     _log_(reason);

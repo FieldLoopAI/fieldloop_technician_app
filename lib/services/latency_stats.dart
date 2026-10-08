@@ -82,3 +82,12 @@ String describeTurnTimingSummary(List<TurnTiming> turns, {int? lateTranscripts, 
       '${part('action->firstAudio', turns.map((t) => t.actionToFirstAudioMs))}; '
       '${part('total', turns.map((t) => t.totalMs))}; replies from cached clip: $clips/${turns.length}$extra';
 }
+
+/// Step 5 (build 175 second pass) — whether a speech-end edge must be
+/// ignored for timing: the utterance already has a speech end
+/// ([currentSpeechEnd]) AND its transcript has already arrived
+/// ([transcriptAt]), so a later edge in the same utterance is noise after
+/// the words, not the end of them. Logging only — DEAD STRETCH, LATENCY and
+/// TURN TIMING then measure from the true speech end.
+bool ignoreLaterSpeechEndEdge({required bool enabled, DateTime? currentSpeechEnd, DateTime? transcriptAt}) =>
+    enabled && currentSpeechEnd != null && transcriptAt != null;
