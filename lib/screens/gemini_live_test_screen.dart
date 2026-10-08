@@ -999,6 +999,35 @@ const bool _estimateNotLoadedHonestReply = true;
 /// false = intent check + KB catch-all, as before.
 const bool _offTopicFastRefusal = true;
 
+/// Build 175 second pass, Step 3: more fixed lines play from a cached clip
+/// after their first clean play — capture/retake/keep confirmations, "I've
+/// saved that note.", the last-photo lines, "Sorry, I can't make calls." /
+/// "…send messages.", "I can only help with this job.", "Noted.", "I've
+/// uploaded the photo with your note." Keyed by reason AND exact text
+/// (`cacheableFixedReplyLines` in `confirmation_clip.dart`), so a variable
+/// line under the same reason is never cached. Save rules unchanged.
+/// false = only build 175's first-pass cacheable reasons.
+const bool _cacheFixedReplyLines = true;
+
+/// Build 175 second pass, Step 3 — DEFAULT OFF. After job data loads, the
+/// open Gemini session speaks each job-fact line once (address, customer
+/// name, estimate summary when loaded) with playback muted; the audio is
+/// kept in the per-job job-fact clip cache so even the FIRST ask plays
+/// locally. Only when the session is quiet (no speech, playback, reply or
+/// call in flight for 2.5s); the line in flight is abandoned the moment the
+/// technician speaks or the app needs to answer (one retry per line). Logs
+/// `JOB FACT PREWARM started|stored|not stored|cancelled kind=… ms=…` with
+/// the audio-token cost. Risks: see the build 175 second-pass report.
+const bool _jobFactClipPrewarm = false;
+
+/// Build 175 second pass, Step 3 — DEFAULT OFF. TURN IDENTITY holds a
+/// scripted line's audio until its transcript has 2+ words, so a 1–2 word
+/// line ("Okay.", "Noted.") waited for the whole turn (b174: 3.0–3.5s). On,
+/// a 1–2 word script plays as soon as the first transcript word IS the
+/// line's opening word; a first word that isn't keeps the old hold (never
+/// an early STALE TURN). Logs `SHORT SCRIPTED LINE`.
+const bool _playShortScriptedLinesImmediately = false;
+
 /// C20: "call / text / email the customer" gets a short "I can't" reply.
 const bool _unsupportedActionReplies = true;
 
@@ -1080,7 +1109,8 @@ final String kVoiceFlagsSummary =
     'jobDetailsReplyCacheable=$_jobDetailsReplyCacheable '
     'kbCatchAllTimeoutSaysOutOfScope=$_kbCatchAllTimeoutSaysOutOfScope '
     'jobFactsAnswers=$_jobFactsAnswers estimateNotLoadedHonestReply=$_estimateNotLoadedHonestReply '
-    'offTopicFastRefusal=$_offTopicFastRefusal '
+    'offTopicFastRefusal=$_offTopicFastRefusal cacheFixedReplyLines=$_cacheFixedReplyLines '
+    'jobFactClipPrewarm=$_jobFactClipPrewarm playShortScriptedLinesImmediately=$_playShortScriptedLinesImmediately '
     'unsupportedActionReplies=$_unsupportedActionReplies kbMissSaysOutOfScope=$_kbMissSaysOutOfScope '
     'cameraNarrationAsPhotoNote=$_cameraNarrationAsPhotoNote shortCameraOpenReply=$_shortCameraOpenReply '
     'cachedConfirmationClips=$_useCachedConfirmationClips prefetchJobData=$_prefetchJobDataForVoice '
@@ -4526,7 +4556,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   bool _playCachedConfirmation(String text, {required String reason}) {
     final jobFactKind = jobFactKindForReason(reason);
     if (jobFactKind != null) return _playCachedJobFact(text, kind: jobFactKind, reason: reason);
-    if (!_useCachedConfirmationClips || !isCacheableConfirmation(reason)) return false;
+    if (!_useCachedConfirmationClips ||
+        !isCacheableReplyLine(reason, text, includeFixedLines: _cacheFixedReplyLines)) {
+      return false;
+    }
     final pcm = confirmationClips.pcmFor(text);
     if (pcm == null) {
       _log_('CONFIRMATION CLIP: none cached yet for "$text" — Gemini speaks it this time (recorded if it plays cleanly)');
@@ -4569,6 +4602,256 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       'JOB FACT CACHED miss job=${miss.jobId} kind=${miss.kind.name} '
       'ms_to_first_audio=${DateTime.now().difference(miss.at).inMilliseconds} (Gemini spoke it; kept for the next '
       'ask if it plays cleanly)',
+    );
+  }
+
+  // --- Build 175 second pass: job-fact prewarm (see [_jobFactClipPrewarm]) --
+
+  /// The prewarm line Gemini is speaking right now (never played): its
+  /// audio and transcript are collected here instead of reaching the normal
+  /// turn handling. [cancelled]: the technician spoke / the app needed the
+  /// session — the rest of this turn is still swallowed up to its boundary,
+  /// but nothing is stored.
+  ({
+    JobFactKind kind,
+    String text,
+    String jobId,
+    DateTime startedAt,
+    BytesBuilder bytes,
+    StringBuffer transcript,
+    bool cancelled,
+  })? _jobFactPrewarmTurn;
+  Timer? _jobFactPrewarmTicker;
+  Timer? _jobFactPrewarmTurnSafety;
+  DateTime? _jobFactPrewarmTickerStartedAt;
+  final Set<JobFactKind> _jobFactPrewarmAttempted = {};
+  final Set<JobFactKind> _jobFactPrewarmRetried = {};
+  int _jobFactPrewarmAudioMs = 0;
+
+  /// How long the session must have been quiet (no speech, no playback,
+  /// nothing owed) before a prewarm line is sent.
+  static const Duration _jobFactPrewarmQuiet = Duration(milliseconds: 2500);
+
+  /// Prewarm gives up this long after setup (job data never loaded, or the
+  /// session was never quiet).
+  static const Duration _jobFactPrewarmWindow = Duration(seconds: 90);
+
+  /// A prewarm turn that never reaches a boundary is dropped after this.
+  static const Duration _jobFactPrewarmTurnMax = Duration(seconds: 20);
+
+  void _scheduleJobFactPrewarm() {
+    if (!_jobFactClipPrewarm || !_jobFactAudioCache || widget.jobId == null) return;
+    _jobFactPrewarmTicker?.cancel();
+    _jobFactPrewarmTickerStartedAt = DateTime.now();
+    _jobFactPrewarmTicker = Timer.periodic(const Duration(milliseconds: 500), (_) => _jobFactPrewarmTick());
+  }
+
+  void _stopJobFactPrewarm() {
+    _jobFactPrewarmTicker?.cancel();
+    _jobFactPrewarmTicker = null;
+    _jobFactPrewarmTurnSafety?.cancel();
+    _jobFactPrewarmTurnSafety = null;
+    _jobFactPrewarmTurn = null;
+  }
+
+  /// Nothing in flight, nothing owed, nothing playing, nobody speaking.
+  bool get _sessionQuietForPrewarm {
+    final now = DateTime.now();
+    final lastSpeech = _lastSpeechActivityAt;
+    final playbackEnd = _expectedPlaybackEndAt;
+    return _setupComplete &&
+        !_sessionClosing &&
+        _channel != null &&
+        !_isSpeaking &&
+        _turnComplete &&
+        !_scriptedResponsePending &&
+        _awaitingScriptedTurnWords == null &&
+        _inFlightFunctionCalls == 0 &&
+        _geminiIntentCheck == null &&
+        _photoNote == null &&
+        _screenTask == _ScreenTask.none &&
+        !_outgoingAudioPaused &&
+        (lastSpeech == null || now.difference(lastSpeech) >= _jobFactPrewarmQuiet) &&
+        (playbackEnd == null || now.difference(playbackEnd) >= _jobFactPrewarmQuiet) &&
+        (_setupCompleteAt == null || now.difference(_setupCompleteAt!) >= _jobFactPrewarmQuiet);
+  }
+
+  void _jobFactPrewarmTick() {
+    final jobId = widget.jobId;
+    final startedAt = _jobFactPrewarmTickerStartedAt;
+    if (jobId == null || startedAt == null || _sessionClosing) {
+      _stopJobFactPrewarm();
+      return;
+    }
+    if (_jobFactPrewarmTurn != null) return;
+    if (DateTime.now().difference(startedAt) > _jobFactPrewarmWindow) {
+      _log_('JOB FACT PREWARM finished: window over (${_jobFactPrewarmWindow.inSeconds}s) — '
+          'attempted=${_jobFactPrewarmAttempted.map((k) => k.name).join(',')} audio_ms_total=$_jobFactPrewarmAudioMs');
+      _stopJobFactPrewarm();
+      return;
+    }
+    if (!_sessionQuietForPrewarm) return;
+    _jobFactClips.bindJob(jobId);
+    for (final kind in const [JobFactKind.address, JobFactKind.customerName, JobFactKind.estimateSummary]) {
+      if (_jobFactPrewarmAttempted.contains(kind)) continue;
+      final text = _jobFactPrewarmText(kind, jobId);
+      if (text == null) continue; // data not loaded yet — try again next tick
+      _jobFactPrewarmAttempted.add(kind);
+      if (_jobFactClips.pcmFor(jobId, kind, text) != null) continue;
+      _startJobFactPrewarmLine(kind, text, jobId);
+      return;
+    }
+    if (_jobFactPrewarmAttempted.length == 3) {
+      _log_('JOB FACT PREWARM finished: all lines attempted (audio_ms_total=$_jobFactPrewarmAudioMs, '
+          '~${(_jobFactPrewarmAudioMs / 40).round()} output audio tokens)');
+      _stopJobFactPrewarm();
+    }
+  }
+
+  /// The exact line [_jobFactReply] would speak, or null while it isn't
+  /// loaded (an estimate that isn't in memory is never prewarmed — its
+  /// eventual answer would be a different line).
+  String? _jobFactPrewarmText(JobFactKind kind, String jobId) {
+    if (kind == JobFactKind.estimateSummary) {
+      if (!ref.exists(jobEstimateProvider(jobId))) return null;
+      final estimate = ref.read(jobEstimateProvider(jobId));
+      if (!estimate.hasValue || estimate.isLoading || estimate.valueOrNull == null) return null;
+    } else if (ref.read(jobByIdProvider(jobId)) == null) {
+      return null;
+    }
+    return _jobFactReply(kind, jobId);
+  }
+
+  void _startJobFactPrewarmLine(JobFactKind kind, String text, String jobId) {
+    final channel = _channel;
+    if (channel == null) return;
+    final scrubbed = scrubInternalLabels(text).text;
+    _jobFactPrewarmTurn = (
+      kind: kind,
+      text: scrubbed,
+      jobId: jobId,
+      startedAt: DateTime.now(),
+      bytes: BytesBuilder(copy: false),
+      transcript: StringBuffer(),
+      cancelled: false,
+    );
+    _jobFactPrewarmTurnSafety?.cancel();
+    _jobFactPrewarmTurnSafety = Timer(_jobFactPrewarmTurnMax, () {
+      final turn = _jobFactPrewarmTurn;
+      if (turn == null) return;
+      _jobFactPrewarmTurn = null;
+      _log_('JOB FACT PREWARM cancelled kind=${turn.kind.name} ms=${_jobFactPrewarmTurnMax.inMilliseconds} '
+          '(no turn boundary — dropped)');
+    });
+    final instruction =
+        'Say exactly and only the following, with no additions, no preamble, and no extra commentary: '
+        "'$scrubbed'";
+    channel.sink.add(
+      jsonEncode({
+        'clientContent': {
+          'turns': [
+            {
+              'role': 'user',
+              'parts': [
+                {'text': instruction},
+              ],
+            },
+          ],
+          'turnComplete': true,
+        },
+      }),
+    );
+    _noteClientContentSent('job_fact_prewarm:${kind.name}');
+    _log_('JOB FACT PREWARM started kind=${kind.name} text_chars=${scrubbed.length} '
+        '(muted, never played; cancelled the moment the technician speaks)');
+  }
+
+  /// The technician started speaking, or the app needs the session: the
+  /// prewarm line in flight is abandoned at once (its turn is still
+  /// swallowed up to its boundary, nothing stored). The ticker carries on —
+  /// a later line only starts after [_jobFactPrewarmQuiet] of quiet — and
+  /// the abandoned line gets one more try.
+  void _cancelJobFactPrewarm(String why) {
+    final turn = _jobFactPrewarmTurn;
+    if (turn == null || turn.cancelled) return;
+    if (_jobFactPrewarmRetried.add(turn.kind)) _jobFactPrewarmAttempted.remove(turn.kind);
+    _jobFactPrewarmTurn = (
+      kind: turn.kind,
+      text: turn.text,
+      jobId: turn.jobId,
+      startedAt: turn.startedAt,
+      bytes: turn.bytes,
+      transcript: turn.transcript,
+      cancelled: true,
+    );
+    _log_('JOB FACT PREWARM cancelled kind=${turn.kind.name} '
+        'ms=${DateTime.now().difference(turn.startedAt).inMilliseconds} ($why)');
+  }
+
+  /// A server toolCall while a prewarm turn is out: never dispatched.
+  void _refuseJobFactPrewarmToolCall(Map<String, dynamic> toolCall) {
+    final calls = (toolCall['functionCalls'] as List<dynamic>? ?? const []).cast<Map<String, dynamic>>();
+    _log_('JOB FACT PREWARM: Gemini called ${calls.map((c) => c['name']).join(', ')} during a prewarm line — '
+        'not dispatched');
+    _channel?.sink.add(
+      jsonEncode({
+        'toolResponse': {
+          'functionResponses': [
+            for (final call in calls)
+              {
+                'id': call['id'],
+                'name': call['name'],
+                'response': {'status': 'not_requested', 'message': 'Nothing was asked. Do nothing.'},
+              },
+          ],
+        },
+      }),
+    );
+  }
+
+  /// Swallows one server message of the prewarm turn (audio + transcript
+  /// collected, nothing played or audited); at its boundary stores the clip
+  /// if it is the line word for word.
+  void _consumeJobFactPrewarmContent(Map<String, dynamic> serverContent) {
+    final turn = _jobFactPrewarmTurn;
+    if (turn == null) return;
+    final parts = (serverContent['modelTurn'] as Map<String, dynamic>?)?['parts'] as List<dynamic>?;
+    for (final part in parts ?? const []) {
+      final data = ((part as Map<String, dynamic>)['inlineData'] as Map<String, dynamic>?)?['data'] as String?;
+      if (data != null && data.isNotEmpty && !turn.cancelled) turn.bytes.add(base64Decode(data));
+    }
+    final said = (serverContent['outputTranscription'] as Map<String, dynamic>?)?['text'] as String?;
+    if (said != null) turn.transcript.write(said);
+    final interrupted = serverContent['interrupted'] == true;
+    if (!interrupted && serverContent['turnComplete'] != true) return;
+
+    _jobFactPrewarmTurn = null;
+    _jobFactPrewarmTurnSafety?.cancel();
+    _jobFactPrewarmTurnSafety = null;
+    // Whatever was waiting on this (stale) turn's boundary — exactly what
+    // the normal boundary handling does for a turn it never played.
+    _clearDeterministicAudioSuppression('job fact prewarm turn boundary');
+    _onTurnBoundaryWhileAwaitingScript(interrupted: true);
+    final ms = DateTime.now().difference(turn.startedAt).inMilliseconds;
+    if (turn.cancelled || interrupted) {
+      _log_('JOB FACT PREWARM cancelled kind=${turn.kind.name} ms=$ms '
+          '(${turn.cancelled ? 'abandoned earlier' : 'server interrupted the turn'}; nothing stored)');
+      return;
+    }
+    final pcm = turn.bytes.takeBytes();
+    final audioMs = jobFactClipDuration(pcm).inMilliseconds;
+    _jobFactPrewarmAudioMs += audioMs;
+    final heard = turn.transcript.toString();
+    final cost = 'cost≈${(audioMs / 40).round()} output audio tokens + ~${(turn.text.length + 110) ~/ 4} input tokens';
+    if (!confirmationTranscriptMatches(heard, turn.text)) {
+      _log_('JOB FACT PREWARM not stored kind=${turn.kind.name} ms=$ms — Gemini said "$heard", not exactly '
+          '"${turn.text}" ($cost)');
+      return;
+    }
+    final refused = _jobFactClips.store(turn.jobId, turn.kind, turn.text, pcm);
+    _log_(
+      'JOB FACT PREWARM ${refused == null ? 'stored' : 'not stored ($refused)'} kind=${turn.kind.name} ms=$ms '
+      'clip=${pcm.length}B/${audioMs}ms ($cost; ${_jobFactClips.count} clip(s) cached)',
     );
   }
 
@@ -4658,7 +4941,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
     if (!_useCachedConfirmationClips) return;
-    if (!isCacheableConfirmation(_awaitingScriptedTurnReason) || confirmationClips.pcmFor(text) != null) return;
+    if (!isCacheableReplyLine(_awaitingScriptedTurnReason, text, includeFixedLines: _cacheFixedReplyLines) ||
+        confirmationClips.pcmFor(text) != null) {
+      return;
+    }
     _confirmationCapture = (
       text: text,
       turnId: _currentResponseTurnId,
@@ -5407,6 +5693,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // like [_lastSpeechActivityAt] below it — marks when THIS burst began,
       // not refreshed on every chunk while already speaking.
       if (!_isSpeaking) {
+        _cancelJobFactPrewarm('technician started speaking');
         _speechBurstStartedAt = now;
         _speechBurstReachedGemini = !_outgoingAudioPaused;
       }
@@ -6132,6 +6419,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         // just below), never as content inside `setupComplete` itself.
         _log_('setupComplete received from server — raw payload: ${decoded['setupComplete']} — starting mic stream now');
         unawaited(_startMicStreaming());
+        _scheduleJobFactPrewarm();
         return;
       }
 
@@ -6165,6 +6453,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       }
       if (decoded.containsKey('goAway')) {
         _log_('goAway received — server will close the connection soon: ${decoded['goAway']}');
+      }
+      // Build 175 second pass — a call made inside a job-fact prewarm
+      // turn is never dispatched (see [_jobFactClipPrewarm]).
+      if (_jobFactPrewarmTurn != null && decoded.containsKey('toolCall')) {
+        _refuseJobFactPrewarmToolCall(decoded['toolCall'] as Map<String, dynamic>);
+        return;
       }
       if (decoded.containsKey('toolCall')) {
         _log_('toolCall received: ${decoded['toolCall']}');
@@ -6208,6 +6502,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       final inputTranscriptionText = inputTranscription?['text'] as String?;
       if (inputTranscriptionText != null && inputTranscriptionText.isNotEmpty) {
         _onInputTranscription(inputTranscriptionText);
+      }
+
+      // Build 175 second pass — a job-fact prewarm turn's audio/transcript
+      // never reaches playback, TURN IDENTITY or the audits.
+      if (_jobFactPrewarmTurn != null) {
+        _consumeJobFactPrewarmContent(serverContent);
+        return;
       }
 
       final modelTurn = serverContent['modelTurn'] as Map<String, dynamic>?;
@@ -8995,6 +9296,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       );
     }
 
+    _cancelJobFactPrewarm('gemini intent check');
     final id = 'ic${++_geminiIntentCheckCounter}';
     final contextLine = context == 'capture_photo'
         ? 'Right now the camera is open with a live preview, ready to shoot: if they want a picture taken, in any '
@@ -9643,7 +9945,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (script == null || _currentTurnKnownStale) return;
     _scriptIdentityCandidateText = '$_scriptIdentityCandidateText $fragment'.trim();
     final words = _normalizeForEchoCompare(_scriptIdentityCandidateText).split(' ').where((w) => w.isNotEmpty).toList();
-    if (words.length < 2) return; // too little to judge yet
+    if (words.length < 2) {
+      // too little to judge yet — except, with [_playShortScriptedLinesImmediately],
+      // a 1–2 word script whose opening word just arrived.
+      if (!_playShortScriptedLinesImmediately || !shortScriptedLineOpened(words, script)) return;
+      _log_('SHORT SCRIPTED LINE: "${words.first}" opens the ${script.length}-word line '
+          '"$_awaitingScriptedTurnText" — judged on one word instead of holding to the end of the turn');
+    }
     final scriptWords = script.toSet();
     final ratio = words.where(scriptWords.contains).length / words.length;
     if (ratio >= _scriptIdentityMatchRatio) {
@@ -14174,6 +14482,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _pipelineLog('reply_requested', 'reason=$reason — NOT SENT: session is closing (left job scope) text="$text"');
       return;
     }
+    _cancelJobFactPrewarm('the app is answering ($reason)');
     final channel = _channel;
     _pipelineLog(
       'reply_requested',
@@ -14834,6 +15143,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _confirmationCapture = null;
     // Build 174 — job-fact clips never outlive the session.
     _jobFactClips.clear();
+    _stopJobFactPrewarm();
     _pendingJobFactMiss = null;
     // CONFIRMED CRASH ("_lifecycleState != _ElementLifecycle.defunct") — the
     // same class of bug fixed several times elsewhere in this codebase (see

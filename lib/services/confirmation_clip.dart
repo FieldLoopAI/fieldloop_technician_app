@@ -20,6 +20,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'job_facts.dart' show outOfScopeReply;
 import 'wake_greeting_clip.dart';
 
 /// The `_informGeminiToSpeakVerbatim` reasons whose lines are fixed
@@ -38,6 +39,49 @@ const Set<String> cacheableConfirmationReasons = {
 };
 
 bool isCacheableConfirmation(String reason) => cacheableConfirmationReasons.contains(reason);
+
+/// Build 175 second pass (Step 3) — more lines Gemini speaks identically
+/// every time, cached the same way. Unlike [cacheableConfirmationReasons]
+/// these are keyed by reason AND exact text: the same reason can also
+/// carry a variable line (an error message, a narration read-back, a KB
+/// answer), and only the fixed wording listed here may become a clip — so
+/// the on-disk clip set stays bounded. The save rules are unchanged (clean
+/// turn, exact transcript, keyed by text).
+///
+/// Measured in b174 (7 Oct): capture_photo's line reached first audio
+/// ~0.8s after the request (14:42:53.162 -> 53.961), retake_photo's ~0.9s
+/// (14:43:04.589 -> 05.500), "Sorry, I can't make calls." went through
+/// Gemini, and "I can only help with this job." is said on every
+/// out-of-scope question.
+const Map<String, Set<String>> cacheableFixedReplyLines = {
+  'deterministic capture_photo': {"Got it — I've taken the photo. Keep it, or retake it?"},
+  'deterministic retake_photo': {"I've discarded that photo — go ahead and take another one when you're ready."},
+  'deterministic confirm_photo_upload': {
+    'Got it — keeping that photo. Want to add a note about this photo?',
+    'Got it — keeping that photo.',
+  },
+  'deterministic site_condition': {"I've saved that note."},
+  'deterministic get_last_photo': {
+    "Here's the last photo taken on this job.",
+    'No photos have been taken on this job yet.',
+  },
+  'unsupported_action call': {"Sorry, I can't make calls."},
+  'unsupported_action message': {"Sorry, I can't send messages."},
+  // KB miss (early match or catch-all), catch-all timeout/error, and the
+  // C19 fast refusal — the fixed out-of-scope line only, never a KB answer.
+  'deterministic get_kb_answer': {outOfScopeReply},
+  'deterministic get_kb_answer error': {outOfScopeReply},
+  'out_of_scope_fast': {outOfScopeReply},
+  'camera_narration_noted': {'Noted.'},
+  'photo_note_saved': {"I've uploaded the photo with your note."},
+};
+
+/// Whether the line [text] spoken for [reason] may be played from / saved
+/// as a clip: every [cacheableConfirmationReasons] line, plus — with
+/// [includeFixedLines] — the exact [cacheableFixedReplyLines].
+bool isCacheableReplyLine(String reason, String text, {required bool includeFixedLines}) =>
+    isCacheableConfirmation(reason) ||
+    (includeFixedLines && (cacheableFixedReplyLines[reason]?.contains(text) ?? false));
 
 String _normalize(String text) =>
     text.toLowerCase().replaceAll(RegExp(r"[^a-z0-9' ]"), ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
@@ -58,6 +102,14 @@ bool confirmationTranscriptTruncated(String transcript, String script) {
   final full = _normalize(script);
   return heard.isNotEmpty && heard != full && full.startsWith(heard);
 }
+
+/// Build 175 second pass — `_playShortScriptedLinesImmediately`: whether
+/// TURN IDENTITY may judge a 1–2 word scripted line ([script], normalized
+/// words) on its first transcript word ([heard]): only when exactly one
+/// word has arrived and it is one of the script's opening words. Anything
+/// else keeps the normal hold (never an early STALE TURN on one word).
+bool shortScriptedLineOpened(List<String> heard, List<String> script) =>
+    script.isNotEmpty && script.length <= 2 && heard.length == 1 && script.take(2).contains(heard.first);
 
 /// Build 175 — Job Details confirmation ("go back to main/home screen").
 ///
