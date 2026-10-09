@@ -83,7 +83,10 @@ void main() {
   group('build 175 second pass — new flags in the BUILD line', () {
     test('Step 3 defaults: fixed lines on, prewarm and short lines OFF', () {
       expect(screenSource, contains('const bool _cacheFixedReplyLines = true;'));
-      expect(screenSource, contains('const bool _jobFactClipPrewarm = false;'));
+      // Build 176 Step 6: switchable per APK, still false unless built with
+      // --dart-define=JOB_FACT_CLIP_PREWARM=true (bool.fromEnvironment's
+      // default is false; the BUILD line test checks the runtime value).
+      expect(screenSource, contains("const bool _jobFactClipPrewarm = bool.fromEnvironment('JOB_FACT_CLIP_PREWARM');"));
       expect(screenSource, contains('const bool _playShortScriptedLinesImmediately = false;'));
     });
   });
