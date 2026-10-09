@@ -43,6 +43,7 @@ import '../services/continuation_answer.dart';
 import '../services/conversational_utterance.dart';
 import '../services/echo_override_policy.dart';
 import '../services/echo_sequence_matcher.dart';
+import '../services/garbled_transcript.dart';
 import '../services/gemini_function_dispatcher.dart';
 import '../services/gemini_outbound_guard.dart';
 import '../services/job_fact_clip_cache.dart';
@@ -1100,6 +1101,22 @@ const bool _negationWordOrderFree = true;
 /// false = build 175's narration.
 const bool _cameraRequestNarrationAnyForm = true;
 
+/// Build 176 Step 5: when the fuzzy matcher found NO MATCH and the Gemini
+/// intent check answered "none" (or nothing within 1.8s), a short
+/// transcript (<= 8 words) with no job/trade word that is not shaped like a
+/// question ("Can you got a sort that for me?", b175) gets the existing
+/// "Sorry, can you say that again?" line at once instead of the KB
+/// catch-all and its 8s wait. Real questions still reach the KB
+/// (`garbled_transcript.dart`). Logs `GARBLED QUICK REPEAT decision=…`.
+/// false = KB catch-all as in build 175.
+const bool _garbledQuickRepeat = true;
+
+/// Build 176 Step 5: "What's the name of customer?" / "name of the client"
+/// -> the existing customer-name job fact (`customerNamePhraseVariantsB176`).
+/// "Get a shot of that" already opened the camera in build 175 (exact "get
+/// a shot"), so it needed no change. false = build 175's phrase list.
+const bool _jobFactPhraseVariants = true;
+
 /// Bare pauses — "must do nothing at all" (Bob). Whole-utterance matches
 /// only, like [_nonInformationalFillerPhrases]; see [_cameraCancelCuesExtended].
 const List<String> _holdOnFillerPhrases = [
@@ -1146,7 +1163,8 @@ final String kVoiceFlagsSummary =
     'silentOnMissingTranscript=$silentOnMissingTranscript '
     'transcriptTimeoutMs=${transcriptTimeoutFallbackAfter.inMilliseconds} '
     // Build 176 — appended last so every build 175 field reads as before.
-    'negationWordOrderFree=$_negationWordOrderFree cameraRequestNarrationAnyForm=$_cameraRequestNarrationAnyForm';
+    'negationWordOrderFree=$_negationWordOrderFree cameraRequestNarrationAnyForm=$_cameraRequestNarrationAnyForm '
+    'garbledQuickRepeat=$_garbledQuickRepeat jobFactPhraseVariants=$_jobFactPhraseVariants';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
@@ -9619,10 +9637,42 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _respondToWeakIntentMatch(check.transcript, check.decision);
       return;
     }
+    // Build 176 Step 5 — fuzzy NO MATCH and the intent check answered
+    // nothing: a short garbled transcript gets the existing "say that
+    // again" line now instead of waiting on the KB (see [_garbledQuickRepeat]).
+    if (trigger == null && _maybeAskToRepeatGarbled(check.transcript, geminiIntent: geminiIntent, via: source)) {
+      logOutcome('garbled_quick_repeat');
+      return;
+    }
     if (trigger == null) logOutcome('fallback_catch_all');
     // Job Detail -> KB catch-all as before; anywhere else the KB GATE turns
     // it into a clarification question.
     _maybeFallBackToKbAnswerCatchAll();
+  }
+
+  /// Build 176 Step 5 — see [_garbledQuickRepeat]. Only reached when the
+  /// fuzzy matcher said NO MATCH and the Gemini intent check said "none"
+  /// (or did not answer in time). True when it answered.
+  bool _maybeAskToRepeatGarbled(String transcript, {required String geminiIntent, required String via}) {
+    if (!_garbledQuickRepeat) return false;
+    if (_utteranceAlreadyResolvedByTrigger || _guardFailedReplySpokenThisUtterance) return false;
+    // Only where the catch-all would call the KB (Job Detail); elsewhere the
+    // KB GATE's CLARIFY FALLBACK already answers at once, unchanged.
+    if (!_kbGateScreen().kbFallbackEnabled) return false;
+    final rejection = garbledShortRejection(transcript);
+    if (rejection != null) {
+      _log_('GARBLED QUICK REPEAT: decision=to_kb heard="$transcript" ($rejection) — KB catch-all as before');
+      return false;
+    }
+    final reply = _clarificationReplies.first;
+    _log_(
+      'GARBLED QUICK REPEAT: decision=repeat heard="$transcript" geminiIntent=$geminiIntent via=$via '
+      'reply="$reply" (no KB call)',
+    );
+    _pipelineLog('garbled_quick_repeat', 'heard="$transcript"');
+    _guardFailedReplySpokenThisUtterance = true;
+    _informGeminiToSpeakVerbatim(reply, reason: 'garbled_quick_repeat');
+    return true;
   }
 
   /// PART F item 4 (client-confirmed regression, twice over: "Is today
@@ -11070,7 +11120,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (jobId == null) return;
     if (_utteranceAlreadyResolvedByTrigger || _jobFactResolvedForCurrentUtterance) return;
     _jobFactBuffer = '$_jobFactBuffer $textChunk'.trim();
-    final hit = matchJobFactQuestion(_jobFactBuffer);
+    final hit = matchJobFactQuestion(_jobFactBuffer, b176Variants: _jobFactPhraseVariants);
     if (hit == null) return;
     final heard = _jobFactBuffer;
     _jobFactResolvedForCurrentUtterance = true;

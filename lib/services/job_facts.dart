@@ -40,6 +40,14 @@ const List<String> customerNamePhrases = [
   'who are we working for',
 ];
 
+/// Build 176 Step 5 — "What's the name of customer?" (no "the" before
+/// customer) missed [customerNamePhrases]. Behind `_jobFactPhraseVariants`.
+const List<String> customerNamePhraseVariantsB176 = [
+  'name of customer',
+  'name of the client',
+  'name of client',
+];
+
 const List<String> addressPhrases = [
   'what s the address',
   'whats the address',
@@ -91,11 +99,13 @@ const List<String> estimateSummaryPhrases = [
 /// Checked in a fixed order; a screen question ("where are we on this
 /// screen?") is never taken as an address question — that stays with
 /// get_current_screen.
-({JobFactKind kind, TriggerPhraseMatch match})? matchJobFactQuestion(String text) {
-  for (final (kind, phrases) in const [
+///
+/// [b176Variants]: also [customerNamePhraseVariantsB176] (build 176 Step 5).
+({JobFactKind kind, TriggerPhraseMatch match})? matchJobFactQuestion(String text, {bool b176Variants = true}) {
+  for (final (kind, phrases) in [
     (JobFactKind.timeOnSite, timeOnSitePhrases),
     (JobFactKind.estimateSummary, estimateSummaryPhrases),
-    (JobFactKind.customerName, customerNamePhrases),
+    (JobFactKind.customerName, [...customerNamePhrases, if (b176Variants) ...customerNamePhraseVariantsB176]),
     (JobFactKind.address, addressPhrases),
   ]) {
     final match = matchAnyTriggerPhrase(text, phrases);
