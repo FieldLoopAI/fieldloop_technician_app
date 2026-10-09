@@ -1131,6 +1131,11 @@ final String kVoiceFlagsSummary =
 /// connectivity proof's stop-timing, not a real VAD.
 const double _speechRmsThreshold = 500;
 
+/// Build 176 Step 1 — measurement-only mic level for the TURN TIMING
+/// speech-end ESTIMATE when [_speechRmsThreshold]'s edge never fires
+/// (b175 quiet speech: avg RMS 108 / peak 436). Drives nothing else.
+const int _estimatedSpeechEndRms = 300;
+
 /// How long the input has to stay below [_speechRmsThreshold] before we
 /// consider the user to have stopped speaking (debounces brief gaps
 /// between words so we don't restart the stopwatch mid-sentence).
@@ -3256,6 +3261,18 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// latency is logged. See the LATENCY computation in [_onResponseAudioChunk].
   DateTime? _latencySpeechEndAt;
   DateTime? _latencyTranscriptAt;
+
+  /// Build 176 Step 1 (TURN TIMING only) — the last mic chunk Gemini
+  /// received at or above [_estimatedSpeechEndRms]; the speech-end estimate
+  /// for a turn whose RMS-500 edge never fired. Read nowhere else.
+  DateTime? _lastVoiceLikeMicChunkAt;
+
+  /// Build 176 Step 1 — the `reason` of this utterance's first non-filler
+  /// reply request (reply kind for TURN TIMING), the utterance a TURN
+  /// TIMING line was already logged for, and how many were estimated.
+  String? _turnReplyReason;
+  int? _turnTimingLoggedForSeq;
+  int _sessionEstimatedTurns = 0;
 
   /// See [_speechMaxContinuousDuration]'s doc comment. Set only on the
   /// false->true edge of [_isSpeaking] (mirrors [_lastSpeechActivityAt]'s own
@@ -5450,6 +5467,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _latencySpeechEndAt = null;
     _latencyTranscriptAt = null;
     _turnActionDoneAt = null;
+    _turnReplyReason = null;
     _finalizedCurrentUtterance = false;
     _lateTranscriptFinalizeTimer?.cancel();
     _lateTranscriptFinalizeTimer = null;
@@ -5638,6 +5656,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // Read by the OUTGOING AUDIO summary in [_onMicChunk] — reuses this RMS
     // rather than computing it a second time per chunk.
     _lastMicChunkRms = amplitude;
+    if (amplitude >= _estimatedSpeechEndRms && !_outgoingAudioPaused) _lastVoiceLikeMicChunkAt = DateTime.now();
 
     if (amplitude > _speechRmsThreshold) {
       final now = DateTime.now();
@@ -5851,14 +5870,64 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   }
 
   /// Called with each counted LATENCY figure.
-  void _recordTurnLatency(Duration latency) {
+  void _recordTurnLatency(Duration latency, {bool estimated = false}) {
     _cancelResponseWatchdog();
     _sessionLatenciesMs.add(latency.inMilliseconds);
     if (latency >= _deadStretchThreshold && _deadStretchCountedForSeq != _utteranceSeq) {
       _deadStretchCountedForSeq = _utteranceSeq;
       _sessionDeadStretches++;
-      _log_('DEAD STRETCH: response arrived ${latency.inMilliseconds}ms after the technician stopped speaking (u=$_utteranceSeq)');
+      _log_(
+        'DEAD STRETCH: response arrived ${latency.inMilliseconds}ms after the technician stopped speaking '
+        '(u=$_utteranceSeq)${estimated ? ' (estimated speech end)' : ''}',
+      );
     }
+  }
+
+  /// Build 176 Step 1 — the TURN TIMING reply kind for this utterance.
+  String _currentTurnReplyKind(DateTime? actionAt) => TurnReplyKind.classify(
+    fromClip: actionAt != null && _lastReplyFromClip,
+    appReplyReason: actionAt == null ? null : _turnReplyReason,
+  );
+
+  /// Build 176 Step 1 — LOGGING ONLY: the TURN TIMING / LATENCY lines for a
+  /// turn whose true speech-end edge never fired (see [estimateSpeechEnd]).
+  /// Called on the reply's first audio chunk; never changes routing, VAD,
+  /// timers or audio.
+  void _logEstimatedTurnTiming() {
+    final transcriptAt = _latencyTranscriptAt;
+    final estimate = estimateSpeechEnd(
+      transcriptAt: transcriptAt,
+      lastVoiceLikeChunkAt: _lastVoiceLikeMicChunkAt,
+      maxGap: _lateTranscriptMaxWait,
+      voiceLikeRms: _estimatedSpeechEndRms,
+    );
+    if (transcriptAt == null || estimate == null) return;
+    final now = DateTime.now();
+    final latency = now.difference(estimate.at);
+    final actionAt = _turnActionDoneAt;
+    _log_(
+      'LATENCY (stopped speaking -> first response byte): ${latency.inMilliseconds}ms '
+      '(from estimated speech end: ${estimate.source}; the RMS ${_speechRmsThreshold.toStringAsFixed(0)} edge never fired)',
+    );
+    _recordTurnLatency(latency, estimated: true);
+    _sessionEstimatedTurns++;
+    final timing = TurnTiming(
+      // A transcript-arrival estimate has no real speech-end split.
+      speechEndToTranscriptMs: estimate.at == transcriptAt ? null : transcriptAt.difference(estimate.at).inMilliseconds,
+      transcriptToActionMs: actionAt != null && !actionAt.isBefore(transcriptAt)
+          ? actionAt.difference(transcriptAt).inMilliseconds
+          : null,
+      actionToFirstAudioMs: actionAt == null ? null : now.difference(actionAt).inMilliseconds,
+      totalMs: latency.inMilliseconds,
+      replyFromClip: actionAt != null && _lastReplyFromClip,
+      replyKind: _currentTurnReplyKind(actionAt),
+      estimatedSpeechEnd: estimate.source,
+    );
+    _sessionTurnTimings.add(timing);
+    _turnTimingLoggedForSeq = _utteranceSeq;
+    _log_(timing.describe());
+    _latencySpeechEndAt = null;
+    _latencyTranscriptAt = null;
   }
 
   void _logLatencySummaryOnce() {
@@ -5866,7 +5935,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _latencySummaryLogged = true;
     _cancelResponseWatchdog();
     debugPrint(
-      'GEMINI LIVE TEST: ${describeLatencySummary(_sessionLatenciesMs, deadStretches: _sessionDeadStretches, hangs: _sessionHangs)}',
+      'GEMINI LIVE TEST: ${describeLatencySummary(_sessionLatenciesMs, deadStretches: _sessionDeadStretches, hangs: _sessionHangs, estimated: _sessionEstimatedTurns)}',
     );
     // A late transcript still waiting on its outcome is written now (plain
     // debugPrint — this can run from dispose, where setState is unsafe).
@@ -14541,6 +14610,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       }
     }
     if (!isFiller) _turnActionDoneAt ??= DateTime.now();
+    if (!isFiller) _turnReplyReason ??= reason;
     if (!isFiller && !isResend && _pendingLateTranscript != null) _resolveLateTranscript(reason.replaceAll(' ', '_'));
     // Change 3 — a fixed confirmation with a saved clip plays locally; no
     // "say exactly" turn is sent (see [_playCachedConfirmation]).
@@ -14869,7 +14939,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
 
     final stoppedAt = _speechStoppedAt;
-    if (stoppedAt != null) {
+    if (stoppedAt != null && _turnTimingLoggedForSeq == _utteranceSeq && _latencyTranscriptAt == null) {
+      // Build 176 Step 1 — this utterance was already timed from an
+      // estimated speech end (below); an edge that only closed after its
+      // reply started is not a second turn.
+      _speechStoppedAt = null;
+      _latencySpeechEndAt = null;
+      _log_('TURN TIMING: u=$_utteranceSeq already timed (estimated speech end) — later speech edge not timed again');
+    } else if (stoppedAt != null) {
       _speechStoppedAt = null;
       final now = DateTime.now();
       // MEASUREMENT ONLY (nothing here affects triggers, audio or timing).
@@ -14930,16 +15007,29 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           actionToFirstAudioMs: actionAt == null ? null : now.difference(actionAt).inMilliseconds,
           totalMs: latency.inMilliseconds,
           replyFromClip: actionAt != null && _lastReplyFromClip,
+          replyKind: _currentTurnReplyKind(actionAt),
         );
         _sessionTurnTimings.add(timing);
+        _turnTimingLoggedForSeq = _utteranceSeq;
         _log_(timing.describe());
       }
       _latencySpeechEndAt = null;
       _latencyTranscriptAt = null;
       if (mounted) setState(() {});
+    } else if (_latencyTranscriptAt != null &&
+        !(_systemInitiatedTurn != null && _latencyTranscriptAt!.isBefore(_systemInitiatedTurn!.requestedAt))) {
+      // Build 176 Step 1 — LOGGING ONLY. b175: TURN TIMING was missing for
+      // ~73 of 83 turns because quiet speech never crossed the RMS-500 edge,
+      // so [_speechStoppedAt] stayed null and the block above was skipped.
+      // A transcript for this turn exists, so it is timed from the best
+      // available estimate instead, and labelled as such.
+      _logEstimatedTurnTiming();
     } else if (_systemInitiatedTurn != null) {
       // Nothing was being timed: the app-initiated line just plays.
       _systemInitiatedTurn = null;
+      // Build 176 Step 1 — an untimed transcript from before this app line
+      // answers nothing here; drop it so a later chunk can't time it.
+      _latencyTranscriptAt = null;
     }
 
     _captureGreetingChunk(pcmBytes);

@@ -18,16 +18,21 @@ int? nearestRankPercentile(List<int> values, double p) {
 }
 
 /// One-line summary for the log.
-String describeLatencySummary(List<int> latenciesMs, {required int deadStretches, required int hangs}) {
+///
+/// [estimated] (build 176 Step 1): how many of [latenciesMs] were timed
+/// from an ESTIMATED speech end (see [estimateSpeechEnd]) — appended only
+/// when given, so the line is otherwise unchanged.
+String describeLatencySummary(List<int> latenciesMs, {required int deadStretches, required int hangs, int? estimated}) {
+  final est = estimated == null ? '' : ' estimated_speech_end=$estimated/${latenciesMs.length}';
   if (latenciesMs.isEmpty) {
     return 'LATENCY SUMMARY: n=0 (no timed technician turns this session) deadStretches(>=3s)=$deadStretches '
-        'hangs=$hangs';
+        'hangs=$hangs$est';
   }
   final p50 = nearestRankPercentile(latenciesMs, 50);
   final p90 = nearestRankPercentile(latenciesMs, 90);
   final max = latenciesMs.reduce((a, b) => a > b ? a : b);
   return 'LATENCY SUMMARY: n=${latenciesMs.length} p50=${p50}ms p90=${p90}ms max=${max}ms '
-      'deadStretches(>=3s)=$deadStretches hangs=$hangs (all values: ${latenciesMs.join(', ')})';
+      'deadStretches(>=3s)=$deadStretches hangs=$hangs$est (all values: ${latenciesMs.join(', ')})';
 }
 
 /// Change 5 — one turn's split, logged as `TURN TIMING` next to the
@@ -40,6 +45,8 @@ class TurnTiming {
     this.actionToFirstAudioMs,
     required this.totalMs,
     required this.replyFromClip,
+    this.replyKind,
+    this.estimatedSpeechEnd,
   });
 
   final int? speechEndToTranscriptMs;
@@ -48,12 +55,65 @@ class TurnTiming {
   final int totalMs;
   final bool replyFromClip;
 
+  /// Build 176 Step 1 — one of [TurnReplyKind]'s labels; `null` keeps the
+  /// older `reply=cached clip|gemini` wording.
+  final String? replyKind;
+
+  /// Build 176 Step 1 — set when no true speech-end edge existed and the
+  /// turn was timed from [estimateSpeechEnd]'s estimate; names its source.
+  final String? estimatedSpeechEnd;
+
+  bool get isEstimated => estimatedSpeechEnd != null;
+
   String describe() {
     String ms(int? v) => v == null ? 'n/a' : '${v}ms';
     return 'TURN TIMING: speech end -> transcript ${ms(speechEndToTranscriptMs)}, transcript -> action done '
         '${ms(transcriptToActionMs)}, action done -> first audio ${ms(actionToFirstAudioMs)}, total ${totalMs}ms '
-        '(reply=${replyFromClip ? 'cached clip' : 'gemini'})';
+        '(reply=${replyKind ?? (replyFromClip ? 'cached clip' : 'gemini')})'
+        '${estimatedSpeechEnd == null ? '' : ' (estimated speech end: $estimatedSpeechEnd)'}';
   }
+}
+
+/// Build 176 Step 1 — the reply-kind labels a `TURN TIMING` line carries.
+abstract final class TurnReplyKind {
+  static const clip = 'cached clip';
+  static const liveGemini = 'live gemini';
+  static const deterministic = 'deterministic';
+  static const refusal = 'refusal';
+
+  /// [fromClip]: the reply played from a saved clip; [appReplyReason]: the
+  /// `reason` of the app's own first (non-filler) reply request this turn,
+  /// `null` when the app asked for none (Gemini answered on its own).
+  static String classify({required bool fromClip, String? appReplyReason}) {
+    if (fromClip) return clip;
+    if (appReplyReason == null) return liveGemini;
+    final r = appReplyReason.toLowerCase();
+    if (r.contains('out_of_scope') || r.contains('out of scope') || r.contains('refus')) return refusal;
+    return deterministic;
+  }
+}
+
+/// Build 176 Step 1 — the speech end a turn is timed from when the mic's
+/// RMS-500 edge never fired (b175: 73 of 83 turns; quiet speech at avg RMS
+/// ~110 / peak ~440 never crosses 500). Logging only.
+///
+/// Prefers the last mic chunk Gemini received at or above the lower,
+/// measurement-only level ([lastVoiceLikeChunkAt]) when it falls inside
+/// `[transcriptAt - maxGap, transcriptAt]`; otherwise the transcript's own
+/// arrival (a lower bound — the real speech end was earlier). `null` when
+/// there is no transcript to anchor on.
+({DateTime at, String source})? estimateSpeechEnd({
+  required DateTime? transcriptAt,
+  DateTime? lastVoiceLikeChunkAt,
+  Duration maxGap = const Duration(seconds: 8),
+  int voiceLikeRms = 300,
+}) {
+  if (transcriptAt == null) return null;
+  final chunk = lastVoiceLikeChunkAt;
+  if (chunk != null && !chunk.isAfter(transcriptAt) && transcriptAt.difference(chunk) <= maxGap) {
+    return (at: chunk, source: 'last mic chunk at RMS >= $voiceLikeRms');
+  }
+  return (at: transcriptAt, source: 'transcript arrival, a lower bound');
 }
 
 /// `TURN TIMING SUMMARY` — p50/p90 of each part, logged at session end
@@ -76,11 +136,23 @@ String describeTurnTimingSummary(List<TurnTiming> turns, {int? lateTranscripts, 
   }
 
   final clips = turns.where((t) => t.replyFromClip).length;
+  // Build 176 Step 1 — only when a turn carries a reply kind or an
+  // estimated speech end, so older lines read exactly as before.
+  final estimated = turns.where((t) => t.isEstimated).length;
+  final kinds = <String, int>{};
+  for (final t in turns) {
+    final k = t.replyKind;
+    if (k != null) kinds[k] = (kinds[k] ?? 0) + 1;
+  }
+  final b176 = estimated == 0 && kinds.isEmpty
+      ? ''
+      : '; estimated_speech_end=$estimated/${turns.length}'
+            '${kinds.isEmpty ? '' : '; reply kinds: ${kinds.entries.map((e) => '${e.key}=${e.value}').join(', ')}'}';
   return 'TURN TIMING SUMMARY: n=${turns.length}; '
       '${part('speechEnd->transcript', turns.map((t) => t.speechEndToTranscriptMs))}; '
       '${part('transcript->action', turns.map((t) => t.transcriptToActionMs))}; '
       '${part('action->firstAudio', turns.map((t) => t.actionToFirstAudioMs))}; '
-      '${part('total', turns.map((t) => t.totalMs))}; replies from cached clip: $clips/${turns.length}$extra';
+      '${part('total', turns.map((t) => t.totalMs))}; replies from cached clip: $clips/${turns.length}$b176$extra';
 }
 
 /// Step 5 (build 175 second pass) — whether a speech-end edge must be
