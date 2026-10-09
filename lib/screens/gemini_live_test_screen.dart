@@ -49,6 +49,7 @@ import '../services/gemini_outbound_guard.dart';
 import '../services/job_fact_clip_cache.dart';
 import '../services/job_facts.dart';
 import '../services/latency_stats.dart';
+import '../services/mic_gain.dart';
 import '../services/navigation_destination.dart';
 import '../services/pending_call_fillers.dart';
 import '../services/photo_decision_classifier.dart';
@@ -1019,7 +1020,10 @@ const bool _cacheFixedReplyLines = true;
 /// technician speaks or the app needs to answer (one retry per line). Logs
 /// `JOB FACT PREWARM started|stored|not stored|cancelled kind=… ms=…` with
 /// the audio-token cost. Risks: see the build 175 second-pass report.
-const bool _jobFactClipPrewarm = false;
+/// Build 176 Step 6: still OFF by default; a separate test APK turns it on
+/// with `--dart-define=JOB_FACT_CLIP_PREWARM=true` (shown in the BUILD line
+/// as `jobFactClipPrewarm=true`).
+const bool _jobFactClipPrewarm = bool.fromEnvironment('JOB_FACT_CLIP_PREWARM');
 
 /// Build 175 second pass, Step 3 — DEFAULT OFF. TURN IDENTITY holds a
 /// scripted line's audio until its transcript has 2+ words, so a 1–2 word
@@ -1164,12 +1168,12 @@ final String kVoiceFlagsSummary =
     'transcriptTimeoutMs=${transcriptTimeoutFallbackAfter.inMilliseconds} '
     // Build 176 — appended last so every build 175 field reads as before.
     'negationWordOrderFree=$_negationWordOrderFree cameraRequestNarrationAnyForm=$_cameraRequestNarrationAnyForm '
-    'garbledQuickRepeat=$_garbledQuickRepeat jobFactPhraseVariants=$_jobFactPhraseVariants';
+    'garbledQuickRepeat=$_garbledQuickRepeat jobFactPhraseVariants=$_jobFactPhraseVariants ${describeMicKnobs()}';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
 /// connectivity proof's stop-timing, not a real VAD.
-const double _speechRmsThreshold = 500;
+const double _speechRmsThreshold = kSpeechEdgeRms; // 500 unless --dart-define=SPEECH_EDGE_RMS (build 176 Step 7)
 
 /// Build 176 Step 1 — measurement-only mic level for the TURN TIMING
 /// speech-end ESTIMATE when [_speechRmsThreshold]'s edge never fires
@@ -5273,7 +5277,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }());
   }
 
-  void _onRawMicChunk(Uint8List chunk) {
+  void _onRawMicChunk(Uint8List raw) {
+    // Build 176 Step 7 — OFF unless built with --dart-define=MIC_GAIN; at
+    // the default 1.0 this returns [raw] itself (no copy, no change).
+    final chunk = applyMicGain(raw, kMicGain);
     _micFirstChunkAt ??= DateTime.now();
     _micBytesCaptured += chunk.length;
     _maybeLogWakeToMicLive(chunk);
