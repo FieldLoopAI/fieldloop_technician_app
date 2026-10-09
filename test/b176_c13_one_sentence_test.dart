@@ -49,7 +49,7 @@ void main() {
 
   group('camera live: capture_photo fires and the description is kept too', () {
     variants.forEach((label, text) {
-      test('$label', () {
+      test(label, () {
         // "Capture this" fires capture_photo with the camera live through
         // the screen's private _looksLikeCapturePhotoConfirmation (b175
         // 15:04:17.044 "matched_firing: trigger=capture_photo"); the note is
