@@ -62,3 +62,41 @@ String? cameraRequestTrailingNarration(String text, {required List<String> reque
   if (cameraNarrationRejection(description, cameraLive: true) != null) return null;
   return description;
 }
+
+/// Build 176 Step 3 — words a description said straight after a camera
+/// request (no comma, dash or period between them) starts with: "Capture
+/// this there's water damage here". Anything else ("Take a photo OF the
+/// water damage") stays one clause and keeps no note, as before.
+const Set<String> _unpunctuatedDescriptionOpeners = {
+  'there', 'it', 'this', 'that', 'looks', 'we', 'see', 'the', 'theres', 'its', 'thats',
+};
+
+/// Lead-ins allowed before the request ("Can you capture this …").
+final RegExp _requestLeadIn = RegExp(r'^\W*(?:(?:okay|ok|so|please|can you|could you|now)\W+)*', caseSensitive: false);
+
+/// Build 176 Step 3 — [cameraRequestTrailingNarration], plus the
+/// unpunctuated form ASR sometimes returns ("Capture this there's water
+/// damage here"): when the utterance STARTS with one of [requestPhrases]
+/// and what follows begins like a description, that remainder is the note
+/// (same [cameraNarrationRejection] check). The punctuated forms are
+/// answered by [cameraRequestTrailingNarration] exactly as before.
+String? cameraRequestNarrationAnyPunctuation(String text, {required List<String> requestPhrases}) {
+  final punctuated = cameraRequestTrailingNarration(text, requestPhrases: requestPhrases);
+  if (punctuated != null) return punctuated;
+  final leadIn = _requestLeadIn.firstMatch(text)?.end ?? 0;
+  final rest = text.substring(leadIn);
+  final phrases = [...requestPhrases]..sort((a, b) => b.length.compareTo(a.length));
+  for (final phrase in phrases) {
+    final words = tokenizeTriggerText(phrase);
+    if (words.isEmpty) continue;
+    final m = RegExp('^${words.map(RegExp.escape).join(r"[\s']+")}\\b', caseSensitive: false).firstMatch(rest);
+    if (m == null) continue;
+    final description = rest.substring(m.end).replaceFirst(RegExp(r'^[\s,;:.!?–—-]+'), '').trim();
+    if (description.isEmpty) return null;
+    final first = tokenizeTriggerText(description).first;
+    if (!_unpunctuatedDescriptionOpeners.contains(first)) return null;
+    if (cameraNarrationRejection(description, cameraLive: true) != null) return null;
+    return description.replaceFirst(RegExp(r'[.!\s]+$'), '');
+  }
+  return null;
+}

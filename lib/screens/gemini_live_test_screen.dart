@@ -1091,6 +1091,15 @@ const bool _cameraRequestNarration = true;
 /// 175's guard only.
 const bool _negationWordOrderFree = true;
 
+/// Build 176 Step 3 (C13 one sentence): [_cameraRequestNarration] also
+/// keeps the description when ASR drops the comma/dash ("Capture this
+/// there's water damage here") and when the camera is already live
+/// (capture_photo fired and the description used to be dropped). Logs
+/// `CAMERA NARRATION NOTED (from the capture request)`. The shutter is NOT
+/// fired automatically after open_camera — see the build 176 report.
+/// false = build 175's narration.
+const bool _cameraRequestNarrationAnyForm = true;
+
 /// Bare pauses — "must do nothing at all" (Bob). Whole-utterance matches
 /// only, like [_nonInformationalFillerPhrases]; see [_cameraCancelCuesExtended].
 const List<String> _holdOnFillerPhrases = [
@@ -1137,7 +1146,7 @@ final String kVoiceFlagsSummary =
     'silentOnMissingTranscript=$silentOnMissingTranscript '
     'transcriptTimeoutMs=${transcriptTimeoutFallbackAfter.inMilliseconds} '
     // Build 176 — appended last so every build 175 field reads as before.
-    'negationWordOrderFree=$_negationWordOrderFree';
+    'negationWordOrderFree=$_negationWordOrderFree cameraRequestNarrationAnyForm=$_cameraRequestNarrationAnyForm';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
@@ -8573,6 +8582,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// [_cameraRequestNarration].
   ({int utteranceSeq, String text})? _openCameraRequest;
 
+  /// Build 176 Step 3 — the utterance that asked for the current
+  /// capture_photo (camera already live); see [_cameraRequestNarrationAnyForm].
+  ({int utteranceSeq, String text})? _captureRequest;
+
   /// Whether the current speech burst's audio was actually being sent to
   /// Gemini when it started (outgoing mic not paused for playback) — only
   /// then can a transcript for it ever arrive, so only then is it worth
@@ -8913,6 +8926,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (name == 'open_camera') {
       _openCameraDispatchedAt = startedAt;
       _openCameraRequest = (utteranceSeq: _utteranceSeq, text: _utteranceHeardText.trim());
+    }
+    if (name == 'capture_photo' && _cameraRequestNarrationAnyForm) {
+      _captureRequest = (utteranceSeq: _utteranceSeq, text: _utteranceHeardText.trim());
     }
     _pipelineLog('dispatch_start','function=$name source=$source mounted=$mounted $_utteranceStateSummary; ${_registrySnapshot()}');
     try {
@@ -11004,11 +11020,43 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         ? request.text
         : (request.utteranceSeq == _utteranceSeq ? _utteranceHeardText.trim() : '');
     if (text.isEmpty) return;
-    final description = cameraRequestTrailingNarration(text, requestPhrases: _openCameraIndicatorPhrases);
+    final description = _cameraRequestNarrationAnyForm
+        ? cameraRequestNarrationAnyPunctuation(text, requestPhrases: _openCameraIndicatorPhrases)
+        : cameraRequestTrailingNarration(text, requestPhrases: _openCameraIndicatorPhrases);
     if (description == null) return;
     _pendingCameraNarration = description;
     _log_(
       'CAMERA NARRATION NOTED (from the camera request): "$description" from "$text" kept as the pending photo '
+      'note — offered for saving when this photo is kept; no other action taken',
+    );
+  }
+
+  /// Build 176 Step 3 — the capture_photo twin of
+  /// [_noteCameraRequestNarration]: "Capture this, there's water damage
+  /// here." with the camera already live took the photo and dropped the
+  /// description. Called once capture_photo has succeeded; fires nothing,
+  /// says nothing — the keep step reads the note back for a yes/no.
+  void _noteCaptureRequestNarration() {
+    final request = _captureRequest;
+    _captureRequest = null;
+    if (!_cameraRequestNarrationAnyForm || !_cameraRequestNarration || !_cameraNarrationAsPhotoNote || request == null) {
+      return;
+    }
+    final text = request.text.isNotEmpty
+        ? request.text
+        : (request.utteranceSeq == _utteranceSeq ? _utteranceHeardText.trim() : '');
+    if (text.isEmpty) return;
+    final description = cameraRequestNarrationAnyPunctuation(
+      text,
+      requestPhrases: [..._capturePhotoIndicatorPhrases, ..._openCameraIndicatorPhrases],
+    );
+    if (description == null) return;
+    final previous = _pendingCameraNarration;
+    _pendingCameraNarration = previous == null
+        ? description
+        : '${previous.replaceFirst(RegExp(r'[.!\s]+$'), '')}. $description';
+    _log_(
+      'CAMERA NARRATION NOTED (from the capture request): "$description" from "$text" kept as the pending photo '
       'note — offered for saving when this photo is kept; no other action taken',
     );
   }
@@ -13420,6 +13468,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _pendingCameraNarration = null;
     }
     if (name == 'open_camera') _noteCameraRequestNarration();
+    if (name == 'capture_photo') _noteCaptureRequestNarration();
     if (name == 'confirm_photo_upload') {
       _enterPhotoNote(keptId: responsePayload['kept_id'] as int?, jobId: responsePayload['job_id'] as String?);
     } else {
