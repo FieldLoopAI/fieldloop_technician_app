@@ -165,3 +165,135 @@ String? standaloneCameraCancel(String text, {bool extendedCues = true}) {
   if (matchLooseCameraRequest(text) == null) return null; // no camera/photo word at all
   return cameraActionNegation(text, extendedCues: extendedCues);
 }
+
+// --- Build 176 Step 2: word-order independent camera negation -----------
+//
+// b175 15:00:11 "Actually, I don't want to photo take now." with the camera
+// live was kept as a photo note ("Noted."): [cameraActionNegation] only
+// looks for a camera VERB after "do not" across filler, and "photo" (a noun)
+// stopped that scan. [negatedCameraMention] takes the cue and the camera
+// word in ANY order, and lets a real command said AFTER the cancellation
+// ("Forget the photo, take a picture of the roof") through.
+
+/// Camera nouns — always a camera word.
+const Set<String> _b176CameraNouns = {
+  'photo', 'photos', 'picture', 'pictures', 'pic', 'pics', 'shot', 'shots', 'camera', 'snapshot', 'image',
+};
+
+/// Camera verbs — the action a real command would ask for.
+const Set<String> _b176CameraVerbs = {
+  'take', 'taking', 'capture', 'snap', 'shoot', 'retake', 'reshoot', 'redo', 'grab', 'get', 'open',
+};
+
+/// Verbs that count as a camera word on their own (no noun) only while
+/// the camera is up ("I don't want to take one" with the preview live);
+/// elsewhere "take"/"capture" are too general ("don't take that off").
+const Set<String> _b176ContextVerbs = {'take', 'taking', 'capture', 'snap', 'shoot', 'retake'};
+
+/// Words a negation may reach across to the camera word it negates.
+const Set<String> _b176NegationReach = {
+  ..._negationFiller, 'a', 'an', 'the', 'this', 'that', 'one', 'another', 'now', 'right', 'yet', 'rather',
+  'photo', 'picture', 'pic', 'shot', 'camera',
+};
+
+/// Words before "not" that make it a description, not a cancellation
+/// ("this photo did not come out right").
+const Set<String> _b176DescriptiveBeforeNot = {'did', 'does', 'is', 'was', 'are', 'were', 'has', 'had', 's'};
+
+/// Cancel phrases (whole words, after [normalizeNegationText]).
+const List<List<String>> _b176CancelPhrases = [
+  ['never', 'mind'],
+  ['nevermind'],
+  ['forget'],
+  ['hold', 'on'],
+  ['changed', 'my', 'mind'],
+  ['change', 'my', 'mind'],
+  ['cancel'],
+  ['stop'],
+  ['no', 'longer'],
+];
+
+/// The cue when [text] cancels or refuses a camera action in any word
+/// order — "Photo, I don't want to take one.", "Take a photo, no, forget
+/// it.", "Not now, the photo can wait." — and nothing after the
+/// cancellation asks for one again; `null` otherwise. Never blocks
+/// without a camera word, or a sentence with only a descriptive "not"
+/// ("No, that photo didn't come out right, let's retake it"), or a bare
+/// "No, ..." ("No, this photo is dark."). [cameraUp]: the preview or a
+/// captured photo is showing, so a bare "take"/"capture" is a camera word.
+String? negatedCameraMention(String text, {bool cameraUp = false}) {
+  final (:words, :boundaries) = normalizeNegationText(text);
+  if (words.isEmpty) return null;
+  bool isNoun(int i) => _b176CameraNouns.contains(words[i]);
+  bool isCameraWord(int i) => isNoun(i) || (cameraUp && _b176ContextVerbs.contains(words[i]));
+  if (![for (var i = 0; i < words.length; i++) i].any(isCameraWord)) return null;
+  bool isVerb(int i) => _b176CameraVerbs.contains(words[i]);
+  bool phraseAt(List<String> p, int i) {
+    if (i + p.length > words.length) return false;
+    for (var k = 0; k < p.length; k++) {
+      if (words[i + k] != p[k]) return false;
+    }
+    return true;
+  }
+
+  // Each cue: where it starts and ends, and — for a negation ("do not",
+  // "never", "rather not") — the verbs it covers in its own clause.
+  String? firstCue;
+  var lastCueEnd = -1;
+  final covered = <int>{};
+  for (var i = 0; i < words.length; i++) {
+    String? cue;
+    var end = i;
+    var negation = false;
+    // "do not forget to take a photo" is a request, not a cancel.
+    final doNotForget = phraseAt(const ['do', 'not', 'forget'], i);
+    if (doNotForget) {
+      i += 2;
+      continue;
+    }
+    for (final p in _b176CancelPhrases) {
+      if (phraseAt(p, i)) {
+        cue = p.join(' ');
+        end = i + p.length - 1;
+        break;
+      }
+    }
+    if (cue == null) {
+      if (words[i] == 'never') {
+        cue = 'never';
+        negation = true;
+      } else if (words[i] == 'not' && (i == 0 || !_b176DescriptiveBeforeNot.contains(words[i - 1]))) {
+        cue = i > 0 && words[i - 1] == 'do' ? 'do not' : (i > 0 && words[i - 1] == 'will' ? 'will not' : 'not');
+        negation = true;
+        // A bare "not" ("I'm not sure the photo is good") is a cue only when
+        // it reaches a camera word, or is "not now / not yet".
+        if (cue == 'not') {
+          final next = i + 1 < words.length ? words[i + 1] : null;
+          var reaches = next == 'now' || next == 'yet' || (i > 0 && (words[i - 1] == 'rather' || words[i - 1] == 'd'));
+          for (var j = i + 1; !reaches && j < words.length && j <= i + 3 && !boundaries[j]; j++) {
+            if (isCameraWord(j) || isVerb(j)) reaches = true;
+            if (!_b176NegationReach.contains(words[j])) break;
+          }
+          if (!reaches) cue = null;
+        }
+      }
+    }
+    if (cue == null) continue;
+    firstCue ??= cue;
+    if (end > lastCueEnd) lastCueEnd = end;
+    if (negation) {
+      for (var j = i + 1, gap = 0; j < words.length && !boundaries[j] && gap <= 4; j++, gap++) {
+        if (isVerb(j)) covered.add(j);
+        if (!_b176NegationReach.contains(words[j]) && !isVerb(j)) break;
+      }
+    }
+    i = end;
+  }
+  if (firstCue == null) return null;
+  // A camera verb after the last cue that no negation covers is a real
+  // command said after the cancellation — not blocked here.
+  for (var j = lastCueEnd + 1; j < words.length; j++) {
+    if (isVerb(j) && !covered.contains(j)) return null;
+  }
+  return firstCue;
+}

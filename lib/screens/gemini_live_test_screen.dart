@@ -1080,6 +1080,17 @@ const bool _cameraCancelCuesExtended = true;
 /// camera request)`. false = the description is dropped, as before.
 const bool _cameraRequestNarration = true;
 
+/// Build 176 Step 2: a cancellation cue (don't, not, never, forget, hold
+/// on, cancel, never mind, changed my mind, no longer, stop) together with
+/// a camera word in ANY order ("Actually, I don't want to photo take
+/// now.", b175 15:00:11, was saved as a note) blocks every camera action
+/// and is answered "Okay." at utterance end, before the KB early match,
+/// site note and C13 narration — unless a camera command follows the
+/// cancellation ("Forget the photo, take a picture of the roof").
+/// `negatedCameraMention` in `camera_negation_guard.dart`. false = build
+/// 175's guard only.
+const bool _negationWordOrderFree = true;
+
 /// Bare pauses — "must do nothing at all" (Bob). Whole-utterance matches
 /// only, like [_nonInformationalFillerPhrases]; see [_cameraCancelCuesExtended].
 const List<String> _holdOnFillerPhrases = [
@@ -1124,7 +1135,9 @@ final String kVoiceFlagsSummary =
     'cameraNarrationAsPhotoNote=$_cameraNarrationAsPhotoNote shortCameraOpenReply=$_shortCameraOpenReply '
     'cachedConfirmationClips=$_useCachedConfirmationClips prefetchJobData=$_prefetchJobDataForVoice '
     'silentOnMissingTranscript=$silentOnMissingTranscript '
-    'transcriptTimeoutMs=${transcriptTimeoutFallbackAfter.inMilliseconds}';
+    'transcriptTimeoutMs=${transcriptTimeoutFallbackAfter.inMilliseconds} '
+    // Build 176 — appended last so every build 175 field reads as before.
+    'negationWordOrderFree=$_negationWordOrderFree';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
@@ -8464,6 +8477,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _finalizedCurrentUtterance = true;
       return;
     }
+    // Build 176 Step 2 — a negated camera sentence in any word order is
+    // never a KB question, a site note or a photo note (C13 narration).
+    if (_maybeBlockNegatedCameraSentence(heardSoFar)) {
+      _finalizedCurrentUtterance = true;
+      return;
+    }
     _maybeTriggerDeterministic(
       _deterministicTriggers['get_kb_answer']!,
       '',
@@ -10886,6 +10905,19 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       text = utterance;
       cue = cameraActionNegation(text, extendedCues: _cameraCancelCuesExtended);
     }
+    // Build 176 Step 2 — any word order (see [_negationWordOrderFree]).
+    if (cue == null && _negationWordOrderFree) {
+      final cameraUp = _screenTask == _ScreenTask.cameraLive || _screenTask == _ScreenTask.cameraCaptured;
+      for (final candidate in {heard.trim(), utterance}) {
+        if (candidate.isEmpty) continue;
+        final hit = negatedCameraMention(candidate, cameraUp: cameraUp);
+        if (hit != null) {
+          text = candidate;
+          cue = '$hit (any order)';
+          break;
+        }
+      }
+    }
     if (cue == null) return false;
     _pipelineLog('matched_not_fired', 'trigger=$action reason=negation ("$cue")');
     if (_cameraNegationBlockedThisUtterance) {
@@ -10896,6 +10928,29 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _log_('NEGATION GUARD blocked intent=$action transcript="$text" (cue="$cue", screen=${_screenTask.name})');
     _clearAllTriggerBuffersAfterSuccess('negation guard blocked $action');
     _informGeminiToSpeakVerbatim(_negationGuardReply, reason: 'negation_guard');
+    return true;
+  }
+
+  /// Build 176 Step 2 — see [_negationWordOrderFree]. Only for an utterance
+  /// nothing has claimed yet (a per-chunk block keeps its own build 175
+  /// path). Fires nothing; answers "Okay." via [_blockNegatedCameraAction].
+  bool _maybeBlockNegatedCameraSentence(String heard) {
+    if (!_negationGuardEnabled || !_negationWordOrderFree || widget.jobId == null || heard.isEmpty) return false;
+    if (_cameraNegationBlockedThisUtterance ||
+        _utteranceAlreadyResolvedByTrigger ||
+        _anyTriggerCommittedThisUtterance ||
+        _guardFailedReplySpokenThisUtterance) {
+      return false;
+    }
+    final cameraUp = _screenTask == _ScreenTask.cameraLive || _screenTask == _ScreenTask.cameraCaptured;
+    if (negatedCameraMention(heard, cameraUp: cameraUp) == null) return false;
+    final action = switch (_screenTask) {
+      _ScreenTask.cameraLive => 'capture_photo',
+      _ScreenTask.cameraCaptured => 'retake_photo',
+      _ => 'open_camera',
+    };
+    if (!_blockNegatedCameraAction(action, heard)) return false;
+    _pipelineLog('negation_any_order', 'action=$action — answered "$_negationGuardReply", no note, no KB');
     return true;
   }
 
