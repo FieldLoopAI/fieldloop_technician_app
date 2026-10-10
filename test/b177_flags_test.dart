@@ -5,7 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 /// the build 177 flags are appended after `speechEdgeRms=500`.
 void main() {
   const b176Tail = 'jobFactPhraseVariants=true micGain=off speechEdgeRms=500';
-  const b177Flags = 'cachedClipWaitForPlayer=true';
+  const b177Flags = 'cachedClipWaitForPlayer=true jobFactClipKeepAcrossSessions=true';
 
   test('build 177 flags come right after the build 176 ones, with their defaults', () {
     final at = kVoiceFlagsSummary.indexOf(b176Tail);

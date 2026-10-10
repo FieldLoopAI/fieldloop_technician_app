@@ -1132,6 +1132,20 @@ const bool _jobFactPhraseVariants = true;
 /// (`cached_clip_player_wait.dart`). false = build 176's immediate fallback.
 const bool _cachedClipWaitForPlayer = true;
 
+/// Build 177 Step 3: job-fact clips (address, customer name, estimate) are
+/// kept across wake sessions for the SAME job instead of being cleared at
+/// session end — b176: 16 JOB FACT CACHED lines, 0 hits, every first ask per
+/// session through live Gemini (2.7–3.5s). Same bounds (8 clips, 3MB), same
+/// exact-answer-text key, so changed data simply misses; time on site is
+/// never cached. A different job clears them (`bindJob`); an app restart
+/// starts empty (memory only). Logs `JOB FACT CACHED kept from an earlier
+/// session` at session open. false = cleared at every session end (b176).
+const bool _jobFactClipKeepAcrossSessions = true;
+
+/// The job-fact clip cache that outlives a session (the screen State is
+/// rebuilt for every wake session) — see [_jobFactClipKeepAcrossSessions].
+final JobFactClipCache _appLifetimeJobFactClips = JobFactClipCache(sizeLimitFromText: _jobFactClipLengthFromText);
+
 /// Bare pauses — "must do nothing at all" (Bob). Whole-utterance matches
 /// only, like [_nonInformationalFillerPhrases]; see [_cameraCancelCuesExtended].
 const List<String> _holdOnFillerPhrases = [
@@ -1181,7 +1195,8 @@ final String kVoiceFlagsSummary =
     'negationWordOrderFree=$_negationWordOrderFree cameraRequestNarrationAnyForm=$_cameraRequestNarrationAnyForm '
     'garbledQuickRepeat=$_garbledQuickRepeat jobFactPhraseVariants=$_jobFactPhraseVariants ${describeMicKnobs()} '
     // Build 177 — appended last so every build 176 field reads as before.
-    'cachedClipWaitForPlayer=$_cachedClipWaitForPlayer';
+    'cachedClipWaitForPlayer=$_cachedClipWaitForPlayer '
+    'jobFactClipKeepAcrossSessions=$_jobFactClipKeepAcrossSessions';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
@@ -3843,8 +3858,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // providers then stay current via Realtime + in-app updates), so the
     // voice commands for them don't wait ~1.1–1.2s on a fetch later.
     final prefetchJobId = widget.jobId;
-    // Build 174 — job-fact clips are scoped to this session's job.
+    // Build 174 — job-fact clips are scoped to this session's job (build
+    // 177: a different job clears the clips kept from an earlier session).
     _jobFactClips.bindJob(prefetchJobId);
+    if (_jobFactClipKeepAcrossSessions && _jobFactClips.count > 0) {
+      debugPrint(
+        'JOB FACT CACHED kept from an earlier session: ${_jobFactClips.count} clip(s), ${_jobFactClips.bytes} bytes '
+        'for job $prefetchJobId (keyed by exact answer text)',
+      );
+    }
     if (_prefetchJobDataForVoice && prefetchJobId != null) {
       ref.read(jobEstimateProvider(prefetchJobId));
       ref.read(jobChangeOrdersProvider(prefetchJobId));
@@ -4653,7 +4675,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
   // --- Build 174: job-fact clips (see [_jobFactAudioCache]) -------------
 
-  final JobFactClipCache _jobFactClips = JobFactClipCache(sizeLimitFromText: _jobFactClipLengthFromText);
+  /// Build 177 Step 3: the app-lifetime cache when [_jobFactClipKeepAcrossSessions]
+  /// is on (this State is rebuilt for every wake session), else one per session.
+  final JobFactClipCache _jobFactClips = _jobFactClipKeepAcrossSessions
+      ? _appLifetimeJobFactClips
+      : JobFactClipCache(sizeLimitFromText: _jobFactClipLengthFromText);
 
   /// A miss waiting for Gemini's first audio byte, so its
   /// `JOB FACT CACHED miss` line can say how long that took.
@@ -15517,8 +15543,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _logLatencySummaryOnce();
     _appOwnsCurrentReply = false;
     _confirmationCapture = null;
-    // Build 174 — job-fact clips never outlive the session.
-    _jobFactClips.clear();
+    // Build 174 — job-fact clips never outlive the session (build 177: unless
+    // [_jobFactClipKeepAcrossSessions] — then a job change or app restart clears them).
+    if (!_jobFactClipKeepAcrossSessions) _jobFactClips.clear();
     _stopJobFactPrewarm();
     _pendingJobFactMiss = null;
     // CONFIRMED CRASH ("_lifecycleState != _ElementLifecycle.defunct") — the
