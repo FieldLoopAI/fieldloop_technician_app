@@ -33,6 +33,7 @@ import '../providers/visit_provider.dart' show openVisitProvider;
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/app_navigator_key.dart';
 import '../routing/job_detail_route.dart';
+import '../services/cached_clip_player_wait.dart';
 import '../services/camera_narration.dart';
 import '../services/camera_negation_guard.dart';
 import '../services/camera_request_matcher.dart';
@@ -1121,6 +1122,16 @@ const bool _garbledQuickRepeat = true;
 /// a shot"), so it needed no change. false = build 175's phrase list.
 const bool _jobFactPhraseVariants = true;
 
+/// Build 177 Step 2: a cached clip whose ONLY blocker is the audio player
+/// re-initialising (b176: 8 of 9 skipped clips — the utterance's own
+/// preemptive-mute interrupt marks the player not ready a few ms before the
+/// reply asks for the clip) waits up to 150ms for the player, then plays;
+/// still not ready -> Gemini speaks it, as before. Other audio playing or a
+/// camera native call still falls back at once. Exact-transcript clip rule
+/// unchanged. Logs `CACHED CLIP WAIT outcome=… waited_ms=…`
+/// (`cached_clip_player_wait.dart`). false = build 176's immediate fallback.
+const bool _cachedClipWaitForPlayer = true;
+
 /// Bare pauses — "must do nothing at all" (Bob). Whole-utterance matches
 /// only, like [_nonInformationalFillerPhrases]; see [_cameraCancelCuesExtended].
 const List<String> _holdOnFillerPhrases = [
@@ -1168,7 +1179,9 @@ final String kVoiceFlagsSummary =
     'transcriptTimeoutMs=${transcriptTimeoutFallbackAfter.inMilliseconds} '
     // Build 176 — appended last so every build 175 field reads as before.
     'negationWordOrderFree=$_negationWordOrderFree cameraRequestNarrationAnyForm=$_cameraRequestNarrationAnyForm '
-    'garbledQuickRepeat=$_garbledQuickRepeat jobFactPhraseVariants=$_jobFactPhraseVariants ${describeMicKnobs()}';
+    'garbledQuickRepeat=$_garbledQuickRepeat jobFactPhraseVariants=$_jobFactPhraseVariants ${describeMicKnobs()} '
+    // Build 177 — appended last so every build 176 field reads as before.
+    'cachedClipWaitForPlayer=$_cachedClipWaitForPlayer';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
@@ -4929,15 +4942,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// unsafe right now; false = the caller uses the Gemini path.
   bool _playClipPcm(Uint8List pcm, {required String text, required String reason}) {
     final now = DateTime.now();
-    final String? blocker = !_pcmReady
-        ? 'audio player re-initialising'
-        : _cameraNativeCallInProgress
-        ? 'camera native call in progress'
-        : (_expectedPlaybackEndAt?.isAfter(now) ?? false)
-        ? 'other audio still playing'
-        : null;
+    final blocker = _currentClipBlocker(now);
     if (blocker != null) {
-      _log_('CONFIRMATION CLIP: cached clip for "$text" not used ($blocker) — Gemini speaks it instead');
+      _log_(
+        'CONFIRMATION CLIP: cached clip for "$text" not used (${describeClipBlocker(blocker)}) — Gemini speaks it '
+        'instead',
+      );
       return false;
     }
     final chunks = splitPcmForPlayback(pcm);
@@ -4963,6 +4973,70 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _turnComplete = true;
     _recordAppSpokenLine(text, expectedEnd: now.add(Duration(milliseconds: clipMs)));
     return true;
+  }
+
+  /// What stops a clip playing right now — build 176's three checks.
+  ClipPlayBlocker? _currentClipBlocker(DateTime now) => clipPlayBlocker(
+    playerReady: _pcmReady,
+    cameraNativeCallInProgress: _cameraNativeCallInProgress,
+    otherAudioPlaying: _expectedPlaybackEndAt?.isAfter(now) ?? false,
+  );
+
+  /// The saved clip [_playCachedConfirmation] would play for [text], looked
+  /// up with the same rules but without logging or miss bookkeeping.
+  Uint8List? _cachedClipFor(String text, String reason) {
+    final kind = jobFactKindForReason(reason);
+    if (kind != null) {
+      final jobId = widget.jobId;
+      if (!_jobFactAudioCache || jobId == null || !isCacheableJobFact(kind)) return null;
+      return _jobFactClips.pcmFor(jobId, kind, text);
+    }
+    if (!_useCachedConfirmationClips || !isCacheableReplyLine(reason, text, includeFixedLines: _cacheFixedReplyLines)) {
+      return null;
+    }
+    return confirmationClips.pcmFor(text);
+  }
+
+  /// Bumped by every non-filler reply request: a clip still waiting for the
+  /// player ([_cachedClipWaitForPlayer]) is dropped when a newer reply
+  /// replaces it — just as a newer "say exactly" turn replaces an older one.
+  int _clipWaitGeneration = 0;
+
+  /// Build 177 Step 2: [text]'s clip exists and the player is only
+  /// re-initialising — wait (at most [cachedClipPlayerMaxWait]) and play it,
+  /// else hand the line to Gemini exactly as an unplayable clip always was.
+  /// Gemini's own audio for this utterance is dropped meanwhile, as it is
+  /// while a clip plays.
+  Future<void> _playCachedClipWhenPlayerReady(String text, {required String reason}) async {
+    final generation = _clipWaitGeneration;
+    _appOwnsCurrentReply = true;
+    final result = await waitForClipPlayer(
+      ready: () => _currentClipBlocker(DateTime.now()) == null,
+      superseded: () => !mounted || _sessionClosing || generation != _clipWaitGeneration,
+    );
+    final why = result.outcome != ClipWaitOutcome.superseded
+        ? ''
+        : (!mounted || _sessionClosing ? ' (session closing)' : ' (a newer reply or utterance took over)');
+    _log_(
+      'CACHED CLIP WAIT outcome=${result.outcome.name} waited_ms=${result.waitedMs} text="$text" reason=$reason$why',
+    );
+    if (result.outcome == ClipWaitOutcome.superseded) return;
+    if (result.outcome == ClipWaitOutcome.ready && _playCachedConfirmation(text, reason: reason)) return;
+    // Timed out: today's fallback, Gemini speaks it. (A refused
+    // [_playCachedConfirmation] already logged "not used (…)" and the
+    // job-fact miss itself.)
+    if (result.outcome == ClipWaitOutcome.timedOut) {
+      _log_(
+        'CONFIRMATION CLIP: cached clip for "$text" not used (audio player re-initialising after '
+        '${result.waitedMs}ms wait) — Gemini speaks it instead',
+      );
+      final kind = jobFactKindForReason(reason);
+      final jobId = widget.jobId;
+      if (kind != null && jobId != null) {
+        _pendingJobFactMiss = (jobId: jobId, kind: kind, at: _turnActionDoneAt ?? DateTime.now());
+      }
+    }
+    _speakVerbatimViaGemini(text, reason: reason, isFiller: false);
   }
 
   /// A clip line goes into the same "what the technician heard" records a
@@ -9920,6 +9994,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _preemptiveDefaultMuteActive = true;
     // The preemptive mute now covers Gemini's audio for the new utterance.
     _releaseAppOwnedReply('new utterance transcribed — preemptive mute takes over');
+    // Build 177 Step 2: a clip still waiting for the player belongs to the
+    // previous utterance — it is not played now.
+    _clipWaitGeneration++;
   }
 
   /// P0 FIX (CONFIRMED in a real session: "I'm not able to take photos,
@@ -14773,9 +14850,31 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (!isFiller) _turnActionDoneAt ??= DateTime.now();
     if (!isFiller) _turnReplyReason ??= reason;
     if (!isFiller && !isResend && _pendingLateTranscript != null) _resolveLateTranscript(reason.replaceAll(' ', '_'));
+    if (!isFiller) _clipWaitGeneration++;
+    // Build 177 Step 2 — see [_cachedClipWaitForPlayer]: only when a clip
+    // exists and the player re-initialising is the one thing in the way.
+    if (!isFiller &&
+        !isResend &&
+        clipShouldWaitForPlayer(_currentClipBlocker(DateTime.now()), enabled: _cachedClipWaitForPlayer) &&
+        _cachedClipFor(text, reason) != null) {
+      unawaited(_playCachedClipWhenPlayerReady(text, reason: reason));
+      return;
+    }
     // Change 3 — a fixed confirmation with a saved clip plays locally; no
     // "say exactly" turn is sent (see [_playCachedConfirmation]).
     if (!isFiller && !isResend && _playCachedConfirmation(text, reason: reason)) return;
+    _speakVerbatimViaGemini(text, reason: reason, isFiller: isFiller);
+  }
+
+  /// The Gemini half of [_informGeminiToSpeakVerbatim] (everything after the
+  /// cached-clip check), unchanged — split out so a clip that waited for the
+  /// player ([_cachedClipWaitForPlayer]) and could not play falls back to it.
+  void _speakVerbatimViaGemini(String text, {required String reason, required bool isFiller}) {
+    final channel = _channel;
+    if (channel == null) {
+      _log_('$reason: WebSocket already closed — cannot inform Gemini');
+      return;
+    }
     if (!isFiller) {
       _lastReplyFromClip = false;
       _releaseAppOwnedReply('app asked Gemini to speak ($reason)');

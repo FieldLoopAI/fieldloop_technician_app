@@ -28,10 +28,15 @@ void main() {
 
     test('the new flags and their defaults', () {
       final added = kVoiceFlagsSummary.substring(b175Flags.length).trim();
+      // Build 177 appends its own flags after these (see
+      // b177_flags_test.dart); the build 176 part must read exactly as before.
       expect(
-        added,
-        'negationWordOrderFree=true cameraRequestNarrationAnyForm=true garbledQuickRepeat=true '
-        'jobFactPhraseVariants=true micGain=off speechEdgeRms=500',
+        added.startsWith(
+          'negationWordOrderFree=true cameraRequestNarrationAnyForm=true garbledQuickRepeat=true '
+          'jobFactPhraseVariants=true micGain=off speechEdgeRms=500',
+        ),
+        isTrue,
+        reason: added,
       );
     });
 

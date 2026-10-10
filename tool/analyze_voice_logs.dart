@@ -198,8 +198,9 @@ String analyzeVoiceLogs(Map<String, String> parts) {
       final tj = logTimeMs(all[j]);
       if (_utteranceStart.hasMatch(all[j]) ||
           _transcriptChunk.hasMatch(all[j]) ||
-          (t0 != null && tj != null && tj - t0 > 6000))
+          (t0 != null && tj != null && tj - t0 > 6000)) {
         break;
+      }
       if (_cameraOrNoteDone.hasMatch(all[j])) {
         suspicious.add(
           '${_clock(all[i])} "$text" -> ${_tail(all[j]).substring(0, _tail(all[j]).length.clamp(0, 140))}',
