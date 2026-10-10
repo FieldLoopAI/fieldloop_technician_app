@@ -34,6 +34,7 @@ import '../providers/voice_command_registry_provider.dart';
 import '../routing/app_navigator_key.dart';
 import '../routing/job_detail_route.dart';
 import '../services/cached_clip_player_wait.dart';
+import '../services/camera_auto_capture.dart';
 import '../services/camera_narration.dart';
 import '../services/camera_negation_guard.dart';
 import '../services/camera_request_matcher.dart';
@@ -1159,6 +1160,21 @@ const int _intentCheckTimeoutMs = int.fromEnvironment('INTENT_CHECK_TIMEOUT_MS',
 /// `GARBLED QUICK REPEAT … via=skipped_intent_wait`. false = waits as b176.
 const bool _garbledQuickRepeatSkipsIntentWait = true;
 
+/// Build 177 Step 5 (C13 one sentence): "Capture this - there's water damage
+/// here." with the camera closed also TAKES the photo. Armed only when the
+/// open_camera request itself carried a description that became the
+/// pending photo note ([_cameraRequestNarration]) — a plain "Open the
+/// camera" / "Take a photo" / "Capture this." never arms. Fires the normal
+/// deterministic capture_photo (same dispatch, guard, debounce and reply as
+/// "take a photo" with the camera live) once the camera is confirmed open,
+/// its "Camera's open." line has finished and >= 800ms have passed; any
+/// words from the technician, the camera closing, the note flow or 6s
+/// without being ready drops it (camera stays open, as in b176). The
+/// native camera-open path and CAMERA PREWARM are untouched. Logs `CAMERA
+/// AUTO-CAPTURE armed|firing|dropped` (`camera_auto_capture.dart`).
+/// false = build 176 (open + note, no shutter).
+const bool _cameraRequestAutoCapture = true;
+
 /// The job-fact clip cache that outlives a session (the screen State is
 /// rebuilt for every wake session) — see [_jobFactClipKeepAcrossSessions].
 final JobFactClipCache _appLifetimeJobFactClips = JobFactClipCache(sizeLimitFromText: _jobFactClipLengthFromText);
@@ -1214,7 +1230,8 @@ final String kVoiceFlagsSummary =
     // Build 177 — appended last so every build 176 field reads as before.
     'cachedClipWaitForPlayer=$_cachedClipWaitForPlayer '
     'jobFactClipKeepAcrossSessions=$_jobFactClipKeepAcrossSessions intentCheckTimeoutMs=$_intentCheckTimeoutMs '
-    'garbledQuickRepeatSkipsIntentWait=$_garbledQuickRepeatSkipsIntentWait';
+    'garbledQuickRepeatSkipsIntentWait=$_garbledQuickRepeatSkipsIntentWait '
+    'cameraRequestAutoCapture=$_cameraRequestAutoCapture';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
@@ -8214,6 +8231,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // Stamped with when that speech STARTED, so a late trailing chunk of the
     // utterance that caused the interruption doesn't read as new speech.
     if (textChunk.trim().isNotEmpty) _lastTechnicianTranscriptAt = _currentUtteranceStartedAt ?? DateTime.now();
+    // Build 177 Step 5 — any words heard drop an armed auto-capture.
+    if (textChunk.trim().isNotEmpty) _transcriptChunkCount++;
     // Real technician words arrived — any "Thinking..." wait ends, and if
     // they arrived after this utterance was already finalized, its
     // end-of-utterance routing re-runs on them (see
@@ -8552,12 +8571,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         requireJobId: true,
         guard: () => _screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed,
         buildArgs: (_, jobId) => {'job_id': jobId},
-        buildSpokenText: (result) => _defaultDeterministicSpokenText(
-          name: 'capture_photo',
-          humanAction: 'capture the photo',
-          appAction: 'took the photo for you',
-          result: result,
-        ),
+        buildSpokenText: _captureSpokenText,
       ),
       'get_last_photo': () => _maybeTriggerDeterministic(
         _deterministicTriggers['get_last_photo']!,
@@ -11229,6 +11243,84 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       'CAMERA NARRATION NOTED (from the camera request): "$description" from "$text" kept as the pending photo '
       'note — offered for saving when this photo is kept; no other action taken',
     );
+    _armCameraAutoCapture(text);
+  }
+
+  // --- Build 177 Step 5: C13 one-sentence auto-capture ------------------
+
+  Timer? _cameraAutoCaptureTimer;
+
+  /// Non-empty transcript chunks so far — an armed auto-capture is dropped
+  /// as soon as the technician says anything else.
+  int _transcriptChunkCount = 0;
+
+  /// See [_cameraRequestAutoCapture]. Called only from
+  /// [_noteCameraRequestNarration], i.e. only when the open_camera request
+  /// itself carried a description that became the pending photo note.
+  void _armCameraAutoCapture(String requestText) {
+    if (!_cameraRequestAutoCapture) return;
+    final note = cameraRequestAutoCaptureNote(requestText, requestPhrases: _openCameraIndicatorPhrases);
+    if (note == null) return;
+    _cameraAutoCaptureTimer?.cancel();
+    final armedAt = DateTime.now();
+    final utterances = _transcriptChunkCount;
+    _log_('CAMERA AUTO-CAPTURE armed: "$requestText" (note "$note") — shutter once the camera is open and quiet');
+    _cameraAutoCaptureTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      final now = DateTime.now();
+      final poll = cameraAutoCaptureStep(
+        sessionClosing: !mounted || _sessionClosing,
+        newUtteranceSinceArmed: utterances != _transcriptChunkCount,
+        cameraLiveAndConfirmed: _screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed,
+        cameraClosedOrPhotoTaken: _screenTask == _ScreenTask.none || _screenTask == _ScreenTask.cameraCaptured,
+        photoNoteOpen: _photoNote != null,
+        cameraNativeCallInProgress: _cameraNativeCallInProgress,
+        replyStillPlaying: (_expectedPlaybackEndAt?.isAfter(now) ?? false) || _awaitingScriptedTurnWords != null,
+        sinceArmed: now.difference(armedAt),
+      );
+      if (poll.step == AutoCaptureStep.wait) return;
+      timer.cancel();
+      if (identical(_cameraAutoCaptureTimer, timer)) _cameraAutoCaptureTimer = null;
+      if (poll.step == AutoCaptureStep.abort) {
+        _log_('CAMERA AUTO-CAPTURE dropped (${poll.why}) — the camera stays open, as before');
+        return;
+      }
+      _fireCameraAutoCapture(requestText, waitedMs: now.difference(armedAt).inMilliseconds);
+    });
+  }
+
+  /// The capture_photo trigger's own post-match steps (negation, guard,
+  /// debounce, interrupt, [_executeDeterministic] with the same args and
+  /// reply) — the phrase match is the only part not repeated, since the
+  /// request already matched open_camera.
+  void _fireCameraAutoCapture(String requestText, {required int waitedMs}) {
+    final trigger = _deterministicTriggers['capture_photo']!;
+    final jobId = widget.jobId;
+    if (jobId == null) return;
+    final cameraUp = _screenTask == _ScreenTask.cameraLive || _screenTask == _ScreenTask.cameraCaptured;
+    if (_negationGuardEnabled &&
+        (cameraActionNegation(requestText, extendedCues: _cameraCancelCuesExtended) != null ||
+            negatedCameraMention(requestText, cameraUp: cameraUp) != null)) {
+      _log_('CAMERA AUTO-CAPTURE dropped (negated request "$requestText") — nothing fired');
+      return;
+    }
+    if (!(_screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed)) {
+      _log_('CAMERA AUTO-CAPTURE dropped (capture_photo guard: screenTask=${_screenTask.name})');
+      return;
+    }
+    final now = DateTime.now();
+    final lastActivity = trigger.lastActivityAt;
+    if (lastActivity != null && now.difference(lastActivity) < _deterministicTriggerDebounce) {
+      _log_('CAMERA AUTO-CAPTURE dropped (capture_photo ran ${now.difference(lastActivity).inMilliseconds}ms ago)');
+      return;
+    }
+    trigger.lastActivityAt = now;
+    _pipelineLog('matched_firing', 'trigger=capture_photo (auto-capture after the camera request) text="$requestText"');
+    _interruptGeminiForDeterministicTrigger(trigger.name);
+    _log_(
+      'CAMERA AUTO-CAPTURE: firing capture_photo ${waitedMs}ms after open_camera for "$requestText" — same '
+      'deterministic capture_photo dispatch as "take a photo" with the camera live',
+    );
+    unawaited(_executeDeterministic(trigger, args: {'job_id': jobId}, buildSpokenText: _captureSpokenText));
   }
 
   /// Build 176 Step 3 — the capture_photo twin of
@@ -11621,6 +11713,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// whatever this returns verbatim, via [_informGeminiToSpeakVerbatim]'s
   /// tight framing. [humanAction] is unused now (kept only so every
   /// existing call site's `buildSpokenText:` callback needs no changes).
+  /// capture_photo's reply — shared by the "take a photo" trigger and the
+  /// build 177 auto-capture ([_cameraRequestAutoCapture]), so both say the
+  /// same thing.
+  String _captureSpokenText(Map<String, dynamic> result) => _defaultDeterministicSpokenText(
+    name: 'capture_photo',
+    humanAction: 'capture the photo',
+    appAction: 'took the photo for you',
+    result: result,
+  );
+
   String _defaultDeterministicSpokenText({
     required String name,
     required String humanAction,
@@ -15588,6 +15690,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (!_jobFactClipKeepAcrossSessions) _jobFactClips.clear();
     _stopJobFactPrewarm();
     _pendingJobFactMiss = null;
+    _cameraAutoCaptureTimer?.cancel();
+    _cameraAutoCaptureTimer = null;
     // CONFIRMED CRASH ("_lifecycleState != _ElementLifecycle.defunct") — the
     // same class of bug fixed several times elsewhere in this codebase (see
     // e.g. JobDetailScreen.dispose's `Future(() { _viewedJobIdController.state
