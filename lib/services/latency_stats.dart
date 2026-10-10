@@ -163,3 +163,21 @@ String describeTurnTimingSummary(List<TurnTiming> turns, {int? lateTranscripts, 
 /// TURN TIMING then measure from the true speech end.
 bool ignoreLaterSpeechEndEdge({required bool enabled, DateTime? currentSpeechEnd, DateTime? transcriptAt}) =>
     enabled && currentSpeechEnd != null && transcriptAt != null;
+
+/// Build 177 Step 6 — "action done -> first audio" for a TURN TIMING line,
+/// never more than the turn's own total. b176 14:06:09.369: 11745ms vs
+/// total 1212ms — the action time was the session greeting's (requested
+/// 14:05:57.622, before the technician's transcript), kept by `??=` for the
+/// first real reply. An action time from before the turn began (earlier
+/// than `firstAudioAt - totalMs`) belongs to an earlier line: `null` (n/a).
+int? turnActionToFirstAudioMs({required DateTime? actionAt, required DateTime firstAudioAt, required int totalMs}) {
+  if (actionAt == null) return null;
+  final ms = firstAudioAt.difference(actionAt).inMilliseconds;
+  if (ms < 0 || ms > totalMs) return null;
+  return ms;
+}
+
+/// Build 177 Step 6 — one line per session: how many turns were timed and
+/// how many of them from an estimated speech end.
+String describeTurnTimingSessionTotal(List<TurnTiming> turns) =>
+    'TURN TIMING SESSION TOTAL: turns=${turns.length} estimated=${turns.where((t) => t.isEstimated).length}';

@@ -1175,6 +1175,17 @@ const bool _garbledQuickRepeatSkipsIntentWait = true;
 /// false = build 176 (open + note, no shutter).
 const bool _cameraRequestAutoCapture = true;
 
+/// Build 177 Step 6 (logging only): TURN TIMING "action done -> first audio"
+/// can no longer exceed the turn's total. Cause (b176 14:06:09.369, 11745ms
+/// vs total 1212ms): the session greeting set the turn's action time and the
+/// first real reply kept it (`??=`, no new utterance had been detected) —
+/// app-initiated lines (greeting, inactivity warning) no longer set it, and
+/// an action time from before the turn began is logged n/a
+/// (`turnActionToFirstAudioMs`). Also logs `TURN TIMING SESSION TOTAL:
+/// turns=N estimated=M` once per session. The estimated-speech-end
+/// fallback and speechEdgeRms (500) are unchanged. false = build 176.
+const bool _turnTimingFirstAudioFix = true;
+
 /// The job-fact clip cache that outlives a session (the screen State is
 /// rebuilt for every wake session) — see [_jobFactClipKeepAcrossSessions].
 final JobFactClipCache _appLifetimeJobFactClips = JobFactClipCache(sizeLimitFromText: _jobFactClipLengthFromText);
@@ -1231,7 +1242,7 @@ final String kVoiceFlagsSummary =
     'cachedClipWaitForPlayer=$_cachedClipWaitForPlayer '
     'jobFactClipKeepAcrossSessions=$_jobFactClipKeepAcrossSessions intentCheckTimeoutMs=$_intentCheckTimeoutMs '
     'garbledQuickRepeatSkipsIntentWait=$_garbledQuickRepeatSkipsIntentWait '
-    'cameraRequestAutoCapture=$_cameraRequestAutoCapture';
+    'cameraRequestAutoCapture=$_cameraRequestAutoCapture turnTimingFirstAudioFix=$_turnTimingFirstAudioFix';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
@@ -6099,7 +6110,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       transcriptToActionMs: actionAt != null && !actionAt.isBefore(transcriptAt)
           ? actionAt.difference(transcriptAt).inMilliseconds
           : null,
-      actionToFirstAudioMs: actionAt == null ? null : now.difference(actionAt).inMilliseconds,
+      actionToFirstAudioMs: _turnTimingFirstAudioFix
+          ? turnActionToFirstAudioMs(actionAt: actionAt, firstAudioAt: now, totalMs: latency.inMilliseconds)
+          : (actionAt == null ? null : now.difference(actionAt).inMilliseconds),
       totalMs: latency.inMilliseconds,
       replyFromClip: actionAt != null && _lastReplyFromClip,
       replyKind: _currentTurnReplyKind(actionAt),
@@ -6134,6 +6147,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     debugPrint(
       'GEMINI LIVE TEST: ${describeTurnTimingSummary(_sessionTurnTimings, lateTranscripts: _sessionLateTranscripts, maxLateMs: _sessionMaxLateMs, vadSetting: _vadSettingLabel)}',
     );
+    // Build 177 Step 6 — the estimated share, easy to quote.
+    if (_turnTimingFirstAudioFix) debugPrint('GEMINI LIVE TEST: ${describeTurnTimingSessionTotal(_sessionTurnTimings)}');
   }
 
   /// See [_speechMaxContinuousDuration]'s doc comment — the hard fallback
@@ -15015,8 +15030,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         _lastNoChangeStatusLine = (text: text, at: now);
       }
     }
-    if (!isFiller) _turnActionDoneAt ??= DateTime.now();
-    if (!isFiller) _turnReplyReason ??= reason;
+    // Build 177 Step 6 — an app-initiated line (greeting, "still there?")
+    // answers nothing the technician said: it is not this turn's action.
+    final timesTurn = !isFiller && !(_turnTimingFirstAudioFix && _systemInitiatedReplyLabels.containsKey(reason));
+    if (timesTurn) _turnActionDoneAt ??= DateTime.now();
+    if (timesTurn) _turnReplyReason ??= reason;
     if (!isFiller && !isResend && _pendingLateTranscript != null) _resolveLateTranscript(reason.replaceAll(' ', '_'));
     if (!isFiller) _clipWaitGeneration++;
     // Build 177 Step 2 — see [_cachedClipWaitForPlayer]: only when a clip
@@ -15432,7 +15450,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           transcriptToActionMs: transcriptAt != null && actionAt != null && !actionAt.isBefore(transcriptAt)
               ? actionAt.difference(transcriptAt).inMilliseconds
               : null,
-          actionToFirstAudioMs: actionAt == null ? null : now.difference(actionAt).inMilliseconds,
+          actionToFirstAudioMs: _turnTimingFirstAudioFix
+              ? turnActionToFirstAudioMs(actionAt: actionAt, firstAudioAt: now, totalMs: latency.inMilliseconds)
+              : (actionAt == null ? null : now.difference(actionAt).inMilliseconds),
           totalMs: latency.inMilliseconds,
           replyFromClip: actionAt != null && _lastReplyFromClip,
           replyKind: _currentTurnReplyKind(actionAt),
