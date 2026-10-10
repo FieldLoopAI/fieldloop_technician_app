@@ -1,0 +1,15 @@
+--- a/backend/functions/get-gemini-token/index.js	2026-10-10 11:02:12.155676000 +0530
++++ b/backend/functions/get-gemini-token/index.js	2026-10-10 11:02:12.300725000 +0530
+@@ -47,6 +47,12 @@
+             responseModalities: ['AUDIO'],
+           },
+         },
++        // Build 177: lock ONLY the fields set in liveConnectConstraints above
++        // (model, responseModalities). Without this, @google/genai sends no
++        // fieldMask, which its own docs describe as "lock all fields in
++        // LiveConnectConfig" -- the client's tools, systemInstruction and
++        // realtimeInputConfig (VAD) may then be ignored by the API.
++        lockAdditionalFields: [],
+       },
+     });
+ 
