@@ -123,7 +123,7 @@ void main() {
   group('screen wiring', () {
     test('flag default and BUILD line', () {
       expect(source, contains('const bool _cameraRequestAutoCapture = true;'));
-      expect(source, contains(r"'cameraRequestAutoCapture=$_cameraRequestAutoCapture'"));
+      expect(source, contains(r"'cameraRequestAutoCapture=$_cameraRequestAutoCapture "));
     });
 
     test('armed only from the camera-request narration, after the note is kept', () {
