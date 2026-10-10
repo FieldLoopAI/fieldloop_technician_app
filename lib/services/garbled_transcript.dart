@@ -53,3 +53,22 @@ String? garbledShortRejection(String text) {
 }
 
 bool looksLikeGarbledShortUtterance(String text) => garbledShortRejection(text) == null;
+
+/// Build 177 Step 4 — camera words. A garbled short utterance with one of
+/// these still waits for the Gemini intent check (that check exists to
+/// read unclear photo requests); only one with none skips the wait.
+const Set<String> _cameraIntentWords = {
+  'photo', 'photos', 'picture', 'pictures', 'pic', 'pics', 'image', 'images', 'shot', 'shots', 'snap',
+  'snapshot', 'camera', 'capture', 'shoot',
+};
+
+/// Why [text] must NOT skip the intent-check wait, or `null` when the
+/// garbled quick repeat can answer at once: [garbledShortRejection] plus
+/// "has a camera word".
+String? garbledSkipIntentWaitRejection(String text) {
+  final rejection = garbledShortRejection(text);
+  if (rejection != null) return rejection;
+  final camera = tokenizeTriggerText(text).where(_cameraIntentWords.contains).firstOrNull;
+  if (camera != null) return 'camera word "$camera" (left to the intent check)';
+  return null;
+}

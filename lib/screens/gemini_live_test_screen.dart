@@ -1142,6 +1142,23 @@ const bool _cachedClipWaitForPlayer = true;
 /// session` at session open. false = cleared at every session end (b176).
 const bool _jobFactClipKeepAcrossSessions = true;
 
+/// Build 177 Step 4: how long the Gemini intent check waits for an answer
+/// before the normal fallback. 0 of 7 checks in builds 174 + 176 answered
+/// inside 1.8s (all ended "via timeout"), so the wait is cut to 900ms; a
+/// check that does answer inside it is handled exactly as before, and a
+/// later answer is ignored as before (`_retiredUnansweredIntentChecks`).
+/// A/B: --dart-define=INTENT_CHECK_TIMEOUT_MS=1800 restores build 176.
+const int _intentCheckTimeoutMs = int.fromEnvironment('INTENT_CHECK_TIMEOUT_MS', defaultValue: 900);
+
+/// Build 177 Step 4: a garbled short utterance (fuzzy NO MATCH, <= 8 words,
+/// no job/trade word, not question-shaped, AND no camera word) gets the
+/// [_garbledQuickRepeat] "say that again" line at once instead of after the
+/// intent check (b176 "for me": 1801ms wait, 3254ms total). A camera word
+/// still waits for the check; real questions still reach the KB
+/// (`garbledSkipIntentWaitRejection` in `garbled_transcript.dart`). Logs
+/// `GARBLED QUICK REPEAT … via=skipped_intent_wait`. false = waits as b176.
+const bool _garbledQuickRepeatSkipsIntentWait = true;
+
 /// The job-fact clip cache that outlives a session (the screen State is
 /// rebuilt for every wake session) — see [_jobFactClipKeepAcrossSessions].
 final JobFactClipCache _appLifetimeJobFactClips = JobFactClipCache(sizeLimitFromText: _jobFactClipLengthFromText);
@@ -1196,7 +1213,8 @@ final String kVoiceFlagsSummary =
     'garbledQuickRepeat=$_garbledQuickRepeat jobFactPhraseVariants=$_jobFactPhraseVariants ${describeMicKnobs()} '
     // Build 177 — appended last so every build 176 field reads as before.
     'cachedClipWaitForPlayer=$_cachedClipWaitForPlayer '
-    'jobFactClipKeepAcrossSessions=$_jobFactClipKeepAcrossSessions';
+    'jobFactClipKeepAcrossSessions=$_jobFactClipKeepAcrossSessions intentCheckTimeoutMs=$_intentCheckTimeoutMs '
+    'garbledQuickRepeatSkipsIntentWait=$_garbledQuickRepeatSkipsIntentWait';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
@@ -9168,6 +9186,17 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
 
+    // Build 177 Step 4 — see [_garbledQuickRepeatSkipsIntentWait]: only
+    // where the intent check below would have started, and only for what
+    // the garbled quick repeat would answer after it anyway.
+    if (decision.kind == IntentDecisionKind.none &&
+        _garbledQuickRepeatSkipsIntentWait &&
+        _geminiIntentCheckWouldStart(transcript) &&
+        garbledSkipIntentWaitRejection(transcript) == null &&
+        _maybeAskToRepeatGarbled(transcript, geminiIntent: 'not_asked', via: 'skipped_intent_wait')) {
+      return;
+    }
+
     // GEMINI INTENT CHECK — the matcher found nothing confident (NO MATCH
     // or FUZZY WEAK) where a photo action would make sense: ask Gemini
     // itself before treating this as unclear. Its result re-enters the
@@ -9514,7 +9543,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// a missing answer only delays the fallback slightly. Trimmed from 3.5s
   /// (a7d30b48 log: two unanswered checks each held unclear speech ~3.5s
   /// before the clarification question, on top of 2-5.6s Live latency).
-  static const Duration _geminiIntentCheckTimeout = Duration(milliseconds: 1800);
+  /// Build 177 Step 4: [_intentCheckTimeoutMs] (900 unless
+  /// --dart-define=INTENT_CHECK_TIMEOUT_MS; build 176 was 1800).
+  static const Duration _geminiIntentCheckTimeout = Duration(milliseconds: _intentCheckTimeoutMs);
 
   /// Below this, Gemini's photo classification is treated as "none".
   static const double _geminiIntentMinConfidence = 0.6;
@@ -9529,6 +9560,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (_screenTask == _ScreenTask.none && _kbGateScreen().kbFallbackEnabled) return 'open_camera';
     return null;
   }
+
+  /// The same gates [_maybeStartGeminiIntentCheck] applies before it sends
+  /// anything — true when it would ask Gemini about [transcript].
+  bool _geminiIntentCheckWouldStart(String transcript) =>
+      _geminiIntentCheckContext() != null &&
+      !_looksLikeNonInformationalFiller(transcript) &&
+      classifySmallTalk(transcript) == SmallTalkKind.none &&
+      _channel != null &&
+      !_sessionClosing;
 
   bool _maybeStartGeminiIntentCheck(String transcript, IntentDecision decision) {
     final context = _geminiIntentCheckContext();
