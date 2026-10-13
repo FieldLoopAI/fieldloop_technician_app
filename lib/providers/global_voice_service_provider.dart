@@ -14,6 +14,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../routing/app_navigator_key.dart';
 import '../screens/gemini_live_test_screen.dart';
 import '../services/gemini_token_cache.dart';
+import '../services/idle_beep_mute.dart';
 import '../services/session_reconnect.dart';
 import '../services/wake_greeting_clip.dart';
 import 'currently_viewed_job_provider.dart';
@@ -276,6 +277,10 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// microphone foreground service (VoiceSessionService) exists for;
   /// anything else is ended.
   void onAppLifecycleChanged(AppLifecycleState lifecycle) {
+    // Build 179 item A — never leave notifications silenced behind the
+    // user's back. The next idle restart in the foreground mutes again.
+    if (lifecycle == AppLifecycleState.paused) _restoreIdleBeep('app_paused');
+    if (lifecycle == AppLifecycleState.detached) _restoreIdleBeep('app_detached');
     if (lifecycle == AppLifecycleState.detached) {
       _endActiveGeminiSession('app closing (AppLifecycleState.detached)');
       cancelSessionReconnect('app closing');
@@ -301,6 +306,17 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// never changes it.
   static const MethodChannel _audioDiagnosticsChannel =
       MethodChannel('com.fieldloop.fielloop/audio_diagnostics');
+
+  /// Build 179 item A — see `idle_beep_mute.dart`. Android only; the
+  /// native side lives on [_audioDiagnosticsChannel].
+  final IdleBeepMute _idleBeepMute = IdleBeepMute(
+    invoke: (method) => _audioDiagnosticsChannel.invokeMethod<Object?>(method),
+    log: debugPrint,
+    enabled: kIdleBeepMute && defaultTargetPlatform == TargetPlatform.android,
+  );
+
+  /// Fire-and-forget restore (never awaited on any command path).
+  void _restoreIdleBeep(String reason) => unawaited(_idleBeepMute.restore(reason));
 
   /// Near-miss variants Android's generic on-device recognizer has been
   /// observed producing for the invented brand wake word "FieldLoop" (real
@@ -996,6 +1012,9 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   Future<void> initialize() async {
     if (_initialized) return;
     _initialized = true;
+    // Build 179 item A — a stream left muted by a killed process is put
+    // back (the native side also does this in MainActivity.onCreate).
+    unawaited(_idleBeepMute.restoreLeftoverAtStart());
     try {
       debugPrint('VOICE: initializing speech recognizer...');
       // _speech.initialize() (speech_to_text) and _configureTts()
@@ -1042,6 +1061,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   void exitJobScope() {
     debugPrint('VOICE: exiting job scope (mic stops listening)');
     _jobScopeActive = false;
+    _restoreIdleBeep('exit_job_scope');
     // CONFIRMED BUG (logcat): leaving the job only stopped the wake-word
     // recognizer — an open Gemini Live session kept streaming mic audio and
     // answering ("Are you there?" -> "Yes, I can hear you...") on Home.
@@ -1080,6 +1100,8 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     if (_externallyPaused) return;
     debugPrint('VOICE: pausing wake-word loop for external session ($reason) — mic will stop listening');
     _externallyPaused = true;
+    // Build 179 item A — before the Gemini session (and its audio) starts.
+    _restoreIdleBeep('gemini_session_start');
     // A genuinely new Gemini session is starting — see [GlobalVoiceState.
     // sessionEpoch]'s doc comment for why [VoiceInteractionOverlay] needs
     // this bump distinguished from an ordinary in-session phase change.
@@ -1585,6 +1607,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// again from scratch.
   Future<void> stopForLogout() async {
     debugPrint('VOICE: stopping for logout');
+    _restoreIdleBeep('logout');
     _initialized = false;
     _jobScopeActive = false;
     _geminiTokens.deactivate();
@@ -1613,6 +1636,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     state = state.copyWith(muted: muted);
     _syncGeminiTokenPrefetch();
     if (muted) {
+      _restoreIdleBeep('voice_muted');
       // Build 178 — muting ends a pending reconnect (the wake loop's own
       // guards then keep it from listening).
       cancelSessionReconnect('muted', resumeWakeLoop: true);
@@ -2232,6 +2256,17 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       // word, not to capture a command yet (see VoicePhase's doc comment).
       state = state.copyWith(transcript: '', phase: VoicePhase.awaitingWakeWord);
     });
+    // Build 179 item A — the idle wake-word listener is about to (re)start:
+    // silence the recognizer's own start/end beep. Not awaited (the native
+    // call is queued ahead of listen() on the same platform thread), and a
+    // no-op after the first restart.
+    unawaited(
+      _idleBeepMute.muteForIdleListener(
+        idleListenerActive: _jobScopeActive && !state.muted && state.available,
+        geminiSessionActive: _externallyPaused,
+        appForeground: !_appBackgrounded,
+      ),
+    );
     _voiceLog(
       'baseline wake-word listen() params: pauseFor=${_wakeWordPauseFor.inSeconds}s '
       'listenFor=${_wakeWordListenFor.inSeconds}s mode=$_stage (session should stay open '
@@ -2468,6 +2503,9 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// gets instant confirmation the system heard them. Not awaited: this
   /// must not add latency to command parsing.
   void _onWakeWordDetected() {
+    // Build 179 item A — the app's own sounds (this click, the greeting
+    // clip, the session) play with the notification stream as it was.
+    _restoreIdleBeep('wake_word');
     debugPrint('VOICE: _onWakeWordDetected() firing haptic + tone cue');
     HapticFeedback.lightImpact().catchError((e, stackTrace) {
       debugPrint('VOICE ERROR (haptic feedback): $e\n$stackTrace');
@@ -3485,6 +3523,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   @override
   void dispose() {
     debugPrint('VOICE: global service disposing (app shutdown)');
+    _restoreIdleBeep('dispose');
     _geminiTokens.deactivate();
     _stage = _ListenStage.idle;
     _cancelCommandSettleTimer();

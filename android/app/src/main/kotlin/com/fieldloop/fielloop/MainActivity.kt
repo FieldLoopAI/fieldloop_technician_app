@@ -65,6 +65,17 @@ class MainActivity : FlutterActivity() {
                         result.success(routeTtsAudioTo(AudioAttributes.USAGE_VOICE_COMMUNICATION))
                     "restoreTtsAudioRouting" ->
                         result.success(routeTtsAudioTo(AudioAttributes.USAGE_MEDIA))
+                    // Build 179 item A — see [muteRecognizerBeep].
+                    "muteRecognizerBeep" -> try {
+                        result.success(muteRecognizerBeep())
+                    } catch (e: Exception) {
+                        result.error("IDLE_BEEP_MUTE", "${e.javaClass.simpleName}: ${e.message}", null)
+                    }
+                    "restoreRecognizerBeep" -> try {
+                        result.success(restoreRecognizerBeep())
+                    } catch (e: Exception) {
+                        result.error("IDLE_BEEP_MUTE", "${e.javaClass.simpleName}: ${e.message}", null)
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -87,7 +98,91 @@ class MainActivity : FlutterActivity() {
      * Only when a session is live: every other close, and every
      * configuration-change recreation, is untouched.
      */
+    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Build 179 item A — a previous process killed while the recognizer
+        // beep was muted never got to restore the notification stream.
+        try {
+            restoreRecognizerBeep()
+        } catch (e: Exception) {
+            android.util.Log.w("FieldLoop", "IDLE BEEP MUTE UNAVAILABLE: restore at start failed: $e")
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Build 179 item A — silence the speech recognizer's start/end beep
+    // (logcat: usage=USAGE_NOTIFICATION_EVENT) while the idle wake-word
+    // listener runs. ONLY STREAM_NOTIFICATION is touched — never
+    // STREAM_MUSIC (Gemini/PCM audio), STREAM_VOICE_CALL, the ringer mode or
+    // Do-Not-Disturb. The original volume and mute state are saved to prefs
+    // before muting, so a killed process is restored at the next start
+    // ([onCreate]); restore puts back exactly the saved values.
+    // ---------------------------------------------------------------------
+
+    private val idleBeepPrefs by lazy { getSharedPreferences("fieldloop_idle_beep_mute", Context.MODE_PRIVATE) }
+
+    private fun muteRecognizerBeep(): Map<String, Any?> {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val stream = AudioManager.STREAM_NOTIFICATION
+        if (idleBeepPrefs.getBoolean("muted", false)) {
+            return mapOf("status" to "already_muted", "prev" to idleBeepPrefs.getInt("prevVolume", -1))
+        }
+        val prevVolume = audioManager.getStreamVolume(stream)
+        val prevMuted = audioManager.isStreamMute(stream)
+        if (prevMuted || prevVolume == 0) {
+            return mapOf("status" to "already_silent", "prev" to prevVolume)
+        }
+        val ringerBefore = audioManager.ringerMode
+        idleBeepPrefs.edit()
+            .putBoolean("muted", true)
+            .putInt("prevVolume", prevVolume)
+            .putBoolean("prevMuted", prevMuted)
+            .commit()
+        try {
+            audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_MUTE, 0)
+        } catch (e: Exception) {
+            idleBeepPrefs.edit().clear().commit()
+            throw e
+        }
+        // Where the notification stream is tied to the ringer, muting it can
+        // flip the ringer mode — that is not allowed here: undo and report.
+        if (audioManager.ringerMode != ringerBefore) {
+            restoreRecognizerBeep()
+            try {
+                audioManager.ringerMode = ringerBefore
+            } catch (e: Exception) {
+                // Restoring the ringer needs policy access on some devices.
+            }
+            return mapOf("status" to "unavailable", "reason" to "muting the notification stream changed the ringer mode on this device")
+        }
+        return mapOf("status" to "muted", "prev" to prevVolume)
+    }
+
+    private fun restoreRecognizerBeep(): Map<String, Any?> {
+        if (!idleBeepPrefs.getBoolean("muted", false)) return mapOf("status" to "not_muted")
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val stream = AudioManager.STREAM_NOTIFICATION
+        val prevVolume = idleBeepPrefs.getInt("prevVolume", -1)
+        val prevMuted = idleBeepPrefs.getBoolean("prevMuted", false)
+        try {
+            if (!prevMuted) audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, 0)
+            if (prevVolume >= 0 && audioManager.getStreamVolume(stream) != prevVolume) {
+                audioManager.setStreamVolume(stream, prevVolume, 0)
+            }
+        } finally {
+            idleBeepPrefs.edit().clear().commit()
+        }
+        return mapOf("status" to "restored", "vol" to audioManager.getStreamVolume(stream))
+    }
+
     override fun onDestroy() {
+        if (isFinishing) {
+            try {
+                restoreRecognizerBeep()
+            } catch (e: Exception) {
+                android.util.Log.w("FieldLoop", "IDLE BEEP MUTE UNAVAILABLE: restore on destroy failed: $e")
+            }
+        }
         if (isFinishing && VoiceSessionService.isRunning) {
             VoiceSessionService.stop(applicationContext)
             VoiceSessionService.endOrphanedProcessSoon("activity finishing with a live voice session")

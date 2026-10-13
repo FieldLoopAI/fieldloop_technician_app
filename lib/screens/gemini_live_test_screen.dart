@@ -65,6 +65,11 @@ import '../services/voice_session_power.dart';
 import '../services/transcript_timeout_policy.dart';
 import '../services/trigger_phrase_matcher.dart';
 import '../services/wake_greeting_clip.dart';
+// Build 179 — items B, C, D (see each file's doc comment).
+import '../services/b179_flags.dart';
+import '../services/local_close_command.dart';
+import '../services/photo_decline.dart';
+import '../services/wider_capture.dart';
 import '../theme/app_theme.dart';
 import '../utils/network_error.dart' show isOfflineResult;
 import '../widgets/voice_phase_indicator.dart';
@@ -1922,7 +1927,7 @@ const List<String> _capturePhotoIndicatorPhrases = [
 /// stay exactly as they are), so restating the ORIGINAL open-camera
 /// request can never accidentally fire the shutter again, no matter how
 /// this matcher evolves later.
-bool _looksLikeCapturePhotoConfirmation(String paddedText) {
+bool _looksLikeCapturePhotoConfirmation(String paddedText, {bool readyRule = true}) {
   const openCameraOnlyPhrases = [
     'take a photo',
     'take a picture',
@@ -1950,6 +1955,9 @@ bool _looksLikeCapturePhotoConfirmation(String paddedText) {
     debugPrint('LOOSE CAPTURE MATCH: shutter/confirm word "$word" matched in "$paddedText"');
     return true;
   }
+  // Build 179 item C: with [kWiderCapturePhrases] the rule below is
+  // replaced by [_looksLikeWiderCapture] (which also covers it).
+  if (!readyRule) return false;
   // P0 FIX (CONFIRMED via flutter_run_log_new.txt, builds #61 and #65):
   // bare "ready" and "go ahead" used to be plain shutterConfirmWords/phrase-
   // list entries, matching as a substring inside ANY sentence containing
@@ -1975,6 +1983,32 @@ bool _looksLikeCapturePhotoConfirmation(String paddedText) {
     }
   }
   return false;
+}
+
+/// Build 179 item C — capture_photo's raw-text matcher (camera live and
+/// confirmed only, via that trigger's guard): the ready / go-ahead rule and
+/// the whole-utterance shutter words. See `wider_capture.dart`.
+bool _looksLikeWiderCapture(String rawText) {
+  final result = matchWiderCapture(rawText);
+  if (result is WiderCaptureMatch) {
+    debugPrint('WIDER CAPTURE: matched phrase=${result.phrase} via=${result.via} text="$rawText"');
+    return true;
+  }
+  if (result is WiderCaptureBlocked) {
+    debugPrint('WIDER CAPTURE: blocked reason=${result.reason} text="$rawText"');
+  }
+  return false;
+}
+
+/// Build 179 item C — open_camera's raw-text matcher: the added phrasings
+/// first, then the existing Module D3 verb-before-noun matcher unchanged.
+bool _looksLikeWiderOrLooseOpenCamera(String rawText) {
+  final phrase = matchWiderOpenCamera(rawText);
+  if (phrase != null) {
+    debugPrint('WIDER CAPTURE: matched phrase=$phrase via=phrase_list (open_camera) text="$rawText"');
+    return true;
+  }
+  return _looksLikeOpenCameraRequest(rawText);
 }
 
 /// Trade/how-to question cues — deliberately NOT a generic "any question"
@@ -3049,7 +3083,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // Module D3: verb-before-noun request shape, not noun + any verb
       // anywhere (see [_looksLikeOpenCameraRequest]). Still vetoes
       // "last/previous photo" (get_last_photo's territory).
-      rawExtraMatcher: _looksLikeOpenCameraRequest,
+      // Build 179 item C: plus the added phrasings (`wider_capture.dart`).
+      rawExtraMatcher: kWiderCapturePhrases ? _looksLikeWiderOrLooseOpenCamera : _looksLikeOpenCameraRequest,
     ),
     // PART N item 1: no longer the noun+action loose matcher (see
     // [_looksLikeCapturePhotoConfirmation]'s doc comment for the accidental-
@@ -3059,7 +3094,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     'capture_photo': _TranscriptTrigger(
       'capture_photo',
       _capturePhotoIndicatorPhrases,
-      extraMatcher: _looksLikeCapturePhotoConfirmation,
+      // Build 179 item C: the ready / go-ahead rule moves to
+      // [_looksLikeWiderCapture] (counts words without filler, vetoes
+      // negations and questions); the shutter words stay here unchanged.
+      extraMatcher: kWiderCapturePhrases
+          ? (padded) => _looksLikeCapturePhotoConfirmation(padded, readyRule: false)
+          : _looksLikeCapturePhotoConfirmation,
+      rawExtraMatcher: kWiderCapturePhrases ? _looksLikeWiderCapture : null,
     ),
     // PART F item 4: no `extraMatcher`/`rawExtraMatcher` broadening anymore
     // — that WAS the "keyword-detect is this a question" gate the client
@@ -4580,6 +4621,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       logBuildIdentity(flags: kBuildLineFlags, when: 'session_open');
       // Build 178 Step 6c — read-only facts of the setup just sent (1011 investigation).
       _log_(describeSetupFacts(setupMessage));
+      _log_(describeB179Flags());
       // FIX 1 — one greppable line per session: which end-of-speech setting
       // this run is measuring (see [_serverVadSilenceDurationMs]).
       _log_(
@@ -6004,6 +6046,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _jobFactResolvedForCurrentUtterance = false;
     _unsupportedActionResolvedForCurrentUtterance = false;
     _answeredLocallyThisUtterance = false;
+    _localCloseBuffer = '';
+    _localCloseHandledThisUtterance = false;
     _cameraNegationBlockedThisUtterance = false;
     _metaCapabilityDetectionBuffer = '';
     _metaCapabilityDetectionResolvedForCurrentUtterance = false;
@@ -8105,6 +8149,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // go through gemini_function_dispatcher.dart, which only ever routes
       // to existing backend/provider logic.
       if (name == 'end_session') {
+        // Build 179 item B — a local close is already ending the session:
+        // acknowledge Gemini's call, never a second _stopTest.
+        if (kLocalCloseCommands && _localClose.onGeminiEndSession()) {
+          _log_('LOCAL CLOSE: duplicate end_session ignored (id=$id) — a local close is already ending the session');
+          functionResponses.add({'id': id, 'name': name, 'response': {'status': 'ending'}});
+          continue;
+        }
         _log_('toolCall: "end_session" (id=$id) — ending this voice session');
         functionResponses.add({'id': id, 'name': name, 'response': {'status': 'ending'}});
         shouldEndSession = true;
@@ -8757,6 +8808,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// picked it.
   Map<String, void Function()> _buildTriggerEvaluators(String textChunk) {
     return <String, void Function()>{
+      // Build 179 item B — whole-utterance close phrases only ("close the
+      // session", "I'm done"), so it can't take anything another trigger
+      // would have matched; blocked phrases fall through unchanged.
+      'local_close': () => _maybeHandleLocalClose(textChunk),
       // FIRST, ahead of go_back and get_job_details: an utterance that names
       // Job Details as its destination ("take me back to the job screen")
       // must never be absorbed by go_back's "take me back" (one screen back)
@@ -8927,6 +8982,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         textChunk,
         requireJobId: true,
         guard: () => _screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed,
+        // Build 179 item C (audit defect 9): "ready" while the camera is
+        // still opening used to get nothing. Only passed while it IS
+        // opening — a queued guard reply stops the rest of the utterance's
+        // routing, so camera-closed shutter words ("snap it") must still
+        // fall through to their own handling exactly as before.
+        onGuardFailed: kWiderCapturePhrases && _cameraStillOpening ? _replyCaptureWhileCameraOpening : null,
         buildArgs: (_, jobId) => {'job_id': jobId},
         buildSpokenText: _captureSpokenText,
       ),
@@ -8997,6 +9058,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final heardSoFar = _deterministicTriggers['get_kb_answer']!.buffer.trim();
     if (heardSoFar.isNotEmpty) _consumeQuestionAnnouncement();
     if (_maybeHandleQuestionAnnouncement(heardSoFar)) {
+      _finalizedCurrentUtterance = true;
+      return;
+    }
+    // Build 179 item D — "No photo for now." / "skip it": answered locally,
+    // before the intent check and the KB catch-all.
+    if (_maybeHandlePhotoDecline(heardSoFar)) {
       _finalizedCurrentUtterance = true;
       return;
     }
@@ -11577,6 +11644,193 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     return true;
   }
 
+  // --- Build 179 item C: capture while the camera is still opening -------
+
+  bool get _cameraStillOpening =>
+      _screenTask == _ScreenTask.cameraOpening || (_screenTask == _ScreenTask.cameraLive && !_cameraOpenConfirmed);
+
+  /// capture_photo's guard-failed reply while the camera is opening —
+  /// the same line open_camera's guard already speaks in that state.
+  void _replyCaptureWhileCameraOpening() {
+    if (!_cameraStillOpening) return;
+    _log_('WIDER CAPTURE: blocked reason=opening — the camera is still opening (screenTask=${_screenTask.name}); no capture');
+    _informGeminiToSpeakVerbatim(
+      "The camera's still opening — give it a moment.",
+      reason: 'capture_guard_failed_still_opening',
+    );
+  }
+
+  // --- Build 179 item B: local close commands (`local_close_command.dart`) --
+
+  final LocalCloseController _localClose = LocalCloseController();
+  String _localCloseBuffer = '';
+
+  /// This utterance already got a local-close decision (incl. a block) —
+  /// later chunks of it are not re-judged or re-logged.
+  bool _localCloseHandledThisUtterance = false;
+  Timer? _localCloseConfirmTimer;
+  Timer? _localCloseReplyWaitTimer;
+
+  /// Per-chunk evaluator, first in [_buildTriggerEvaluators]. A blocked
+  /// phrase (camera up, photo note, an answer to a photo offer, negation,
+  /// too long) does nothing here: the existing handling answers it.
+  void _maybeHandleLocalClose(String textChunk) {
+    if (!kLocalCloseCommands) return;
+    if (_utteranceAlreadyResolvedByTrigger || _localCloseHandledThisUtterance) return;
+    if (_sessionClosing || _closedByApp) return;
+    _localCloseBuffer = '$_localCloseBuffer $textChunk'.trim();
+    final heard = _localCloseBuffer;
+    if (heard.isEmpty) return;
+    final heardTurn = _recentlyHeardModelTurn();
+    final photoOffered = heardTurn != null && looksLikePhotoOfferQuestion(heardTurn.text);
+    final decision = _localClose.decide(
+      heard,
+      context: LocalCloseContext(
+        cameraActive: _screenTask != _ScreenTask.none,
+        photoNoteActive: _photoNote != null || _keptPhotoPreviewFile != null,
+        answersPhotoOffer: photoOffered && classifyContinuationAnswer(heard) != ContinuationAnswer.none,
+      ),
+      now: DateTime.now(),
+    );
+    switch (decision.kind) {
+      case LocalCloseDecisionKind.none:
+        return;
+      case LocalCloseDecisionKind.blocked:
+        _localCloseHandledThisUtterance = true;
+        _log_(
+          'LOCAL CLOSE: blocked reason=${decision.reason} phrase="${decision.phrase}" heard="$heard" — the '
+          'existing handling answers it',
+        );
+        return;
+      case LocalCloseDecisionKind.pendingDropped:
+        _localCloseConfirmTimer?.cancel();
+        _log_('LOCAL CLOSE: declined reason=other_utterance heard="$heard" — session stays open, routed normally');
+        return;
+      case LocalCloseDecisionKind.duplicate:
+        _localCloseHandledThisUtterance = true;
+        _log_('LOCAL CLOSE: duplicate ignored reason=${decision.reason} phrase="${decision.phrase}" heard="$heard"');
+        _clearAllTriggerBuffersAfterSuccess('local close duplicate');
+        return;
+      case LocalCloseDecisionKind.declined:
+        _localCloseConfirmTimer?.cancel();
+        _localCloseHandledThisUtterance = true;
+        _log_('LOCAL CLOSE: declined heard="$heard" — session stays open');
+        _pipelineLog('local_close', 'declined');
+        _clearAllTriggerBuffersAfterSuccess('local close declined');
+        _informGeminiToSpeakVerbatim(_negationGuardReply, reason: 'local_close_declined');
+        return;
+      case LocalCloseDecisionKind.askConfirm:
+        _localCloseHandledThisUtterance = true;
+        _log_('LOCAL CLOSE: matched tier=soft phrase="${decision.phrase}" heard="$heard"');
+        _log_('LOCAL CLOSE: confirm asked');
+        _pipelineLog('local_close', 'confirm asked phrase="${decision.phrase}"');
+        _clearAllTriggerBuffersAfterSuccess('local close confirm asked');
+        _informGeminiToSpeakVerbatim(localCloseConfirmQuestion, reason: 'local_close_confirm');
+        _localCloseConfirmTimer?.cancel();
+        _localCloseConfirmTimer = Timer(localCloseConfirmTimeout, () {
+          if (_localClose.onConfirmTimeout(DateTime.now())) {
+            _log_('LOCAL CLOSE: timeout — no answer in ${localCloseConfirmTimeout.inSeconds}s, session stays open, nothing said');
+          }
+        });
+        return;
+      case LocalCloseDecisionKind.closeNow:
+        _localCloseConfirmTimer?.cancel();
+        _localCloseHandledThisUtterance = true;
+        _log_(
+          decision.reason == 'confirmed'
+              ? 'LOCAL CLOSE: confirmed heard="$heard"'
+              : 'LOCAL CLOSE: matched tier=explicit phrase="${decision.phrase}" heard="$heard"',
+        );
+        _pipelineLog('local_close', 'closing phrase="${decision.phrase}"');
+        _clearAllTriggerBuffersAfterSuccess('local close');
+        _closeSessionByVoice();
+        return;
+    }
+  }
+
+  /// Says [localCloseClosingLine], waits for it to finish playing (hard cap
+  /// [localCloseReplyWaitCap]), then ends the session through the SAME
+  /// [_stopTest] every other close uses — no second teardown.
+  void _closeSessionByVoice() {
+    final requestedAt = DateTime.now();
+    _informGeminiToSpeakVerbatim(localCloseClosingLine, reason: 'local_close');
+    _localCloseReplyWaitTimer?.cancel();
+    _localCloseReplyWaitTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      final now = DateTime.now();
+      final started = _lastResponsePlaybackStartedAt?.isAfter(requestedAt) ?? false;
+      final playing = _pcmRemainingFrames > 0 || (_expectedPlaybackEndAt?.isAfter(now) ?? false);
+      final finished = started && !playing;
+      final waited = now.difference(requestedAt);
+      if (!finished && waited < localCloseReplyWaitCap && mounted && !_sessionClosing) return;
+      timer.cancel();
+      if (identical(_localCloseReplyWaitTimer, timer)) _localCloseReplyWaitTimer = null;
+      if (!mounted || _sessionClosing || _closedByApp) return;
+      _log_(
+        'LOCAL CLOSE: ending the session (closing line ${finished ? 'finished' : 'not finished — ${localCloseReplyWaitCap.inSeconds}s cap'} '
+        'after ${waited.inMilliseconds}ms) -> _stopTest(voice_close)',
+      );
+      unawaited(_stopTest(reason: 'voice_close'));
+    });
+  }
+
+  // --- Build 179 item D: local photo declines (`photo_decline.dart`) ------
+
+  /// At utterance end, before the negation sentence check, the intent layer
+  /// and the KB catch-all. Answers "Okay."; with the camera live it closes
+  /// the camera through the existing go-back camera path. Returns true when
+  /// it handled the utterance.
+  bool _maybeHandlePhotoDecline(String heard) {
+    if (!kWiderCloseDeclinePhrases || heard.isEmpty) return false;
+    if (_utteranceAlreadyResolvedByTrigger ||
+        _anyTriggerCommittedThisUtterance ||
+        _guardFailedReplySpokenThisUtterance) {
+      return false;
+    }
+    // The photo note, a captured photo awaiting keep/retake, and a camera
+    // still opening/closing keep their existing handling.
+    if (_photoNote != null || _keptPhotoPreviewFile != null) return false;
+    final cameraLive = _screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed;
+    if (_screenTask != _ScreenTask.none && !cameraLive) return false;
+    final phrase = matchPhotoDecline(heard);
+    if (phrase == null) return false;
+    final heardTurn = _recentlyHeardModelTurn();
+    if (heardTurn != null &&
+        looksLikePhotoOfferQuestion(heardTurn.text) &&
+        classifyContinuationAnswer(heard) != ContinuationAnswer.none) {
+      _log_('DECLINE: "$heard" answers the photo offer "${heardTurn.text}" — existing continuation handling');
+      return false;
+    }
+    _log_('DECLINE: matched phrase=$phrase cameraLive=$cameraLive heard="$heard"');
+    _pipelineLog('decline', 'phrase="$phrase" cameraLive=$cameraLive — no camera open, no intent check, no KB');
+    _clearAllTriggerBuffersAfterSuccess('decline $phrase');
+    if (cameraLive) {
+      unawaited(_executeDeclineCloseCamera());
+    } else {
+      _informGeminiToSpeakVerbatim(_negationGuardReply, reason: 'decline');
+    }
+    return true;
+  }
+
+  Future<void> _executeDeclineCloseCamera() async {
+    final jobId = widget.jobId ?? '';
+    final myDispatchGeneration = _beginNewDispatchGeneration();
+    _beginFunctionCallInFlight('decline close camera');
+    try {
+      await _maybeCloseCameraFlowForGoBack(
+        {'status': 'declined', 'job_id': jobId},
+        jobId: jobId,
+        tornDownReason: 'voice_decline',
+      );
+    } catch (e) {
+      _log_('DECLINE: closing the camera failed: $e');
+    } finally {
+      _endFunctionCallInFlight('decline close camera');
+    }
+    _recordDispatchSucceeded(myDispatchGeneration, 'decline');
+    if (_discardIfStaleDispatch(generation: myDispatchGeneration, triggerName: 'decline')) return;
+    _informGeminiToSpeakVerbatim(_negationGuardReply, reason: 'decline_close_camera');
+  }
+
   // --- Module C: job facts (C14-C17/C22) and "I can't" replies (C20) ------
 
   /// C13 — see [_cameraNarrationAsPhotoNote]. Only for an utterance nothing
@@ -12383,6 +12637,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final lastActivity = trigger.lastActivityAt;
     if (lastActivity != null && now.difference(lastActivity) < _deterministicTriggerDebounce) {
       trigger.resolvedForCurrentUtterance = true;
+      if (kWiderCapturePhrases && trigger.name == 'capture_photo') {
+        debugPrint('WIDER CAPTURE: blocked reason=repeat (capture_photo ran ${now.difference(lastActivity).inMilliseconds}ms ago)');
+      }
       _pipelineLog(
         'matched_not_fired',
         'trigger=${trigger.name} reason=debounce (${trigger.name} ran ${now.difference(lastActivity).inMilliseconds}ms '
@@ -16121,6 +16378,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     _pendingJobFactMiss = null;
     _cameraAutoCaptureTimer?.cancel();
     _cameraAutoCaptureTimer = null;
+    _localCloseConfirmTimer?.cancel();
+    _localCloseConfirmTimer = null;
+    _localCloseReplyWaitTimer?.cancel();
+    _localCloseReplyWaitTimer = null;
     // CONFIRMED CRASH ("_lifecycleState != _ElementLifecycle.defunct") — the
     // same class of bug fixed several times elsewhere in this codebase (see
     // e.g. JobDetailScreen.dispose's `Future(() { _viewedJobIdController.state

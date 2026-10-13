@@ -6,10 +6,12 @@ import 'app.dart';
 import 'build_identity.dart';
 import 'providers/local_notifications_service.dart';
 import 'screens/gemini_live_test_screen.dart' show kBuildLineFlags;
+import 'services/b179_flags.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   logBuildIdentity(flags: kBuildLineFlags);
+  debugPrint(describeB179Flags());
 
   await Supabase.initialize(
     url: 'https://glpzohfzldvztseriwky.supabase.co',
