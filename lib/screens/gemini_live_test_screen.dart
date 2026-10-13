@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'dart:ui' show FrameTiming;
 
 import 'package:camera/camera.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show SchedulerBinding, SchedulerPhase;
@@ -57,12 +58,15 @@ import '../services/pending_call_fillers.dart';
 import '../services/photo_decision_classifier.dart';
 import '../services/photo_note_classifier.dart';
 import '../services/question_announcement.dart';
+import '../services/session_reconnect.dart';
+import '../services/snap_command.dart';
 import '../services/transliterated_greeting.dart';
 import '../services/voice_session_power.dart';
 import '../services/transcript_timeout_policy.dart';
 import '../services/trigger_phrase_matcher.dart';
 import '../services/wake_greeting_clip.dart';
 import '../theme/app_theme.dart';
+import '../utils/network_error.dart' show isOfflineResult;
 import '../widgets/voice_phase_indicator.dart';
 import 'voice_command_registrar_mixin.dart';
 
@@ -125,7 +129,19 @@ class GeminiLiveTestScreen extends ConsumerStatefulWidget {
     this.wakeDetectedAt,
     this.wakeGreeting,
     this.endRequest,
+    this.reconnectAttempt,
+    this.skipGreeting = false,
   });
+
+  /// Build 178 — true for a reconnect: the session never asks Gemini for
+  /// the opening greeting (the wake-word greeting clip is not started either).
+  final bool skipGreeting;
+
+  /// Build 178 — set when this session is an automatic reconnect (attempt
+  /// 1..3) started by `GlobalVoiceService.restartAmbientSession`, not by a
+  /// wake word: no greeting, and setupComplete / an early failure is
+  /// reported back so the service can retry or give up.
+  final int? reconnectAttempt;
 
   /// When the wake word that started this session was recognized — the
   /// reference point for the `VOICE LATENCY: wake-to-session-live` and
@@ -306,7 +322,8 @@ const String _geminiModel = 'gemini-3.1-flash-live-preview';
 /// never trimmed. Production values since the earlier compression test —
 /// tune here. Every turn's size against these is logged as `CONTEXT
 /// REFRESH` (see `_GeminiLiveTestScreenState._logContextSize`).
-const int _contextCompressionTriggerTokens = 6000;
+// Build 178 Step 7: --dart-define=GEMINI_COMPRESSION_TRIGGER_TOKENS (default 6000, unchanged).
+const int _contextCompressionTriggerTokens = kGeminiCompressionTriggerTokens;
 const int _contextCompressionTargetTokens = 3000;
 
 /// PART F item 1: the prebuilt Live voice to request via `speechConfig`
@@ -1243,6 +1260,10 @@ final String kVoiceFlagsSummary =
     'jobFactClipKeepAcrossSessions=$_jobFactClipKeepAcrossSessions intentCheckTimeoutMs=$_intentCheckTimeoutMs '
     'garbledQuickRepeatSkipsIntentWait=$_garbledQuickRepeatSkipsIntentWait '
     'cameraRequestAutoCapture=$_cameraRequestAutoCapture turnTimingFirstAudioFix=$_turnTimingFirstAudioFix';
+
+/// Build 178 — what the BUILD line prints: every switch above, unchanged,
+/// then the build 178 ones (`session_reconnect.dart`) appended last.
+final String kBuildLineFlags = '$kVoiceFlagsSummary ${describeB178Flags()}';
 
 /// Roughly calibrated int16 RMS threshold for "the mic is picking up
 /// speech" vs. background noise/silence — good enough for a bare
@@ -3392,6 +3413,40 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   int? _turnTimingLoggedForSeq;
   int _sessionEstimatedTurns = 0;
 
+  /// Build 178 Step 6a — LOGGING ONLY. An utterance that ends with no TURN
+  /// TIMING line gets exactly one `TURN TIMING: none utterance=… reason=…`
+  /// when it ends (next utterance, or session end): the reason is the
+  /// [_turnTimingNoneHint] set where it was known (`excluded_app_turn`,
+  /// `no_estimate`), else derived (`turnTimingNoneReason`).
+  int? _turnTimingNoneLoggedForSeq;
+  String? _turnTimingNoneHint;
+  int? _turnTimingNoneHintSeq;
+  int? _replyAudioSeenForSeq;
+
+  void _noteTurnTimingNoneHint(String hint) {
+    _turnTimingNoneHint = hint;
+    _turnTimingNoneHintSeq = _utteranceSeq;
+  }
+
+  void _logTurnTimingNoneIfUntimed(int u, {bool sessionEnding = false}) {
+    if (u <= 0 || _turnTimingLoggedForSeq == u || _turnTimingNoneLoggedForSeq == u) return;
+    _turnTimingNoneLoggedForSeq = u;
+    final line = describeTurnTimingNone(
+      u,
+      turnTimingNoneReason(
+        hint: _turnTimingNoneHintSeq == u ? _turnTimingNoneHint : null,
+        replyAudioPlayed: _replyAudioSeenForSeq == u,
+        replyOwed: _replyOwed,
+      ),
+    );
+    // From teardown/dispose only debugPrint is safe (no setState).
+    if (sessionEnding) {
+      debugPrint('GEMINI LIVE TEST: $line');
+    } else {
+      _log_(line);
+    }
+  }
+
   /// See [_speechMaxContinuousDuration]'s doc comment. Set only on the
   /// false->true edge of [_isSpeaking] (mirrors [_lastSpeechActivityAt]'s own
   /// edge-only semantics), cleared to `null` whenever [_isSpeaking] goes back
@@ -3647,9 +3702,231 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// socket, and nothing may be heard or answered in that window.
   bool _sessionClosing = false;
 
+  // ===========================================================================
+  // BUILD 178 — session recovery (see `session_reconnect.dart`)
+  //
+  // b177: a server close (1011) left `_channel` set, so the mic kept
+  // streaming into the dead socket for ~90s, the diagnostics said
+  // `socket=open`, and nothing reconnected. Now a close marks the socket
+  // dead (Step 1) and, for an ambient session the technician did not end,
+  // ends THIS session through the normal [_stopTest] and asks
+  // GlobalVoiceService for a NEW one (Step 2) — this State is never
+  // restarted in place.
+  // ===========================================================================
+
+  /// Set before the app itself closes the socket ([_stopTest], [_onEndRequest]),
+  /// so a close that follows is `initiatedBy=app` and never reconnects.
+  bool _closedByApp = false;
+  bool _socketDead = false;
+  DateTime? _socketDeadAt;
+
+  /// Reset at setupComplete; logged in `SOCKET DEAD:` and read by the watchdog.
+  int _utterancesSinceSetup = 0;
+  int _transcriptsSinceSetup = 0;
+
+  /// Step 4: utterances in a row whose transcript never came within the 3s
+  /// timeout (cleared by any transcript).
+  int _consecutiveEmptyUtterances = 0;
+
+  bool _reconnectPending = false;
+  ReconnectWaiter? _reconnectWaiter;
+  Timer? _reconnectSetupTimer;
+
+  /// A reconnect attempt's outcome (ok / fail / cancelled) is reported once.
+  bool _reconnectResultReported = false;
+
+  /// Step 3 — only while an ambient session is active.
+  NetworkReconnectMonitor? _networkMonitor;
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+  bool _networkDown = false;
+
+  /// For the session-end summary line.
+  String? _socketCloseSummary;
+
+  /// The socket can still carry audio/messages.
+  bool get _socketUsable => _channel != null && !_socketDead;
+
+  /// A photo/camera step is on screen or in flight — a reconnect waits for
+  /// it (tearing down now would close the camera / drop a captured photo).
+  bool get _photoFlowInProgress =>
+      _screenTask != _ScreenTask.none ||
+      _cameraNativeCallInProgress ||
+      _cameraOpenRealCallInFlight != null ||
+      _photoNote != null;
+
+  /// Step 1 — from [_onWsDone] / [_onWsError]. Existing lines are logged
+  /// by the callers unchanged; this adds `SOCKET DEAD:` and stops sending.
+  void _onSocketDead({Object? error}) {
+    // onError is normally followed by onDone — one SOCKET DEAD per socket.
+    if (_socketCloseSummary != null) return;
+    final now = DateTime.now();
+    final channel = _channel;
+    final code = channel?.closeCode;
+    final reason = channel?.closeReason;
+    final initiatedBy = classifySocketClose(closedByApp: _closedByApp || _sessionClosing, error: error);
+    final setupAt = _setupCompleteAt;
+    final lastMessage = _diagLastServerMessageAt;
+    _log_(describeSocketDead(
+      closeCode: code,
+      closeReason: reason,
+      initiatedBy: initiatedBy,
+      sessionAgeMs: setupAt == null ? null : now.difference(setupAt).inMilliseconds,
+      utterancesSinceSetup: _utterancesSinceSetup,
+      transcriptsSinceSetup: _transcriptsSinceSetup,
+      lastServerMessageAgoMs: lastMessage == null ? null : now.difference(lastMessage).inMilliseconds,
+    ));
+    _socketCloseSummary = 'closeCode=${code ?? 'none'} closeReason=${reason == null || reason.isEmpty ? 'none' : '"$reason"'} '
+        'initiatedBy=${initiatedBy.name}';
+    if (initiatedBy == SocketCloseInitiator.app) return;
+    _socketDead = true;
+    _socketDeadAt = now;
+    _stopOutgoingAudioSummary();
+    final reconnectReason = reconnectReasonFor(closeCode: code, initiatedBy: initiatedBy);
+    // A reconnect attempt that never got to setupComplete: the service
+    // retries (4s / 8s) or gives up; this session just ends.
+    if (widget.reconnectAttempt != null && !_setupComplete) {
+      _reportReconnectAttemptFailed('socket closed before setupComplete (reason=$reconnectReason)');
+      unawaited(_stopTest(reason: 'reconnect_attempt_failed'));
+      return;
+    }
+    if (kAutoReconnect) _scheduleReconnect(reason: reconnectReason);
+  }
+
+  /// Step 2 — waits [reconnectFirstDelay] and for any photo/camera flow (and
+  /// the network) to be idle, then hands off to the service. Ambient,
+  /// job-scoped sessions only; never after the app itself ended the session.
+  void _scheduleReconnect({required String reason, bool watchdog = false}) {
+    if (!widget.ambient || widget.jobId == null || _pausedVoiceService == null) return;
+    if (_reconnectPending || _sessionClosing || _closedByApp) return;
+    _reconnectPending = true;
+    _log_('RECONNECT: scheduled attempt=1 reason=$reason in=${reconnectFirstDelay.inMilliseconds}');
+    _pausedVoiceService?.showReconnectingStatus();
+    _reconnectWaiter = ReconnectWaiter(
+      isReady: () => !_photoFlowInProgress && !_networkDown,
+      onReady: () {
+        _reconnectWaiter = null;
+        // A watchdog restart is for a session that never heard anything —
+        // a transcript during the wait means it does.
+        if (watchdog && _transcriptsSinceSetup > 0 && !_socketDead) {
+          _reconnectPending = false;
+          _log_('WATCHDOG: a transcript arrived during the wait — restart cancelled');
+          _pausedVoiceService?.clearReconnectStatus();
+          return;
+        }
+        _handOffReconnect(reason);
+      },
+      onGiveUp: (waited) {
+        _reconnectWaiter = null;
+        _log_(
+          'RECONNECT: gave up — ${_photoFlowInProgress ? 'photo/camera flow' : 'network'} still busy after '
+          '${waited.inMilliseconds}ms (reason=$reason); ending the session cleanly',
+        );
+        _pausedVoiceService?.showConnectionLost();
+        unawaited(_stopTest(reason: 'server_closed_flow_busy'));
+      },
+    )..start();
+  }
+
+  void _handOffReconnect(String reason) {
+    if (!mounted || _sessionClosing || _closedByApp) {
+      _log_('RECONNECT: cancelled — the session was ended before the reconnect started (reason=$reason)');
+      _pausedVoiceService?.clearReconnectStatus();
+      return;
+    }
+    final service = _pausedVoiceService;
+    final jobId = widget.jobId;
+    final refused = service == null || jobId == null
+        ? 'no voice service or job'
+        : service.beginSessionReconnect(jobId: jobId, reason: reason, socketDeadAt: _socketDeadAt ?? DateTime.now());
+    if (refused != null) {
+      _log_('RECONNECT: not started — $refused; ending the session cleanly');
+      service?.showConnectionLost();
+      unawaited(_stopTest(reason: 'server_closed'));
+      return;
+    }
+    unawaited(_stopTest(reason: reason == 'watchdog' ? 'watchdog_restart' : 'server_closed_reconnect'));
+  }
+
+  void _reportReconnectAttemptFailed(String why) {
+    if (widget.reconnectAttempt == null || _reconnectResultReported) return;
+    _reconnectResultReported = true;
+    _reconnectSetupTimer?.cancel();
+    _reconnectSetupTimer = null;
+    _pausedVoiceService?.reportReconnectAttemptFailed(why);
+  }
+
+  /// Step 3 — subscribed at setupComplete for ambient sessions.
+  void _startNetworkMonitor() {
+    if (!kNetworkReconnect || !widget.ambient || widget.jobId == null || _connectivitySub != null) return;
+    final monitor = NetworkReconnectMonitor(
+      isSocketDead: () => _socketDead || _channel == null,
+      lastServerMessageAt: () => _diagLastServerMessageAt,
+      onOffline: () {
+        _networkDown = true;
+        _pausedVoiceService?.showReconnectingStatus();
+      },
+      onOnlineResume: () {
+        _networkDown = false;
+        _pausedVoiceService?.clearReconnectStatus();
+      },
+      onReconnect: (reason) {
+        _networkDown = false;
+        if (_reconnectPending) {
+          _log_('NETWORK: reconnect already scheduled — not scheduling another ($reason)');
+          return;
+        }
+        _scheduleReconnect(reason: reason);
+      },
+      log: _log_,
+    );
+    _networkMonitor = monitor;
+    _connectivitySub = Connectivity().onConnectivityChanged.listen(
+      (results) => monitor.onConnectivity(online: !isOfflineResult(results)),
+      onError: (Object e) => debugPrint('NETWORK: connectivity listener error ($e)'),
+    );
+  }
+
+  void _stopNetworkMonitor() {
+    unawaited(_connectivitySub?.cancel());
+    _connectivitySub = null;
+    _networkMonitor?.dispose();
+    _networkMonitor = null;
+  }
+
+  /// Step 4 — called right after the existing silent_await_late recovery,
+  /// which it does not change.
+  void _maybeRunNoTranscriptWatchdog() {
+    if (!kNoTranscriptWatchdog) return;
+    _consecutiveEmptyUtterances++;
+    final now = DateTime.now();
+    final ownAudioPlaying = (_expectedPlaybackEndAt?.isAfter(now) ?? false) || _pcmRemainingFrames > 0;
+    if (!watchdogShouldRestart(
+      consecutiveEmptyUtterances: _consecutiveEmptyUtterances,
+      transcriptsSinceSetup: _transcriptsSinceSetup,
+      ownAudioPlaying: ownAudioPlaying,
+      micPaused: _outgoingAudioPaused,
+    )) {
+      return;
+    }
+    if (!widget.ambient || widget.jobId == null || _reconnectPending || _sessionClosing) return;
+    final service = _pausedVoiceService;
+    if (service == null || !service.tryTakeWatchdogRestart()) {
+      _log_(
+        'WATCHDOG: no transcript for $_consecutiveEmptyUtterances utterances this session — restart cap reached '
+        '($watchdogMaxRestarts per ${watchdogWindow.inSeconds}s), keeping the existing behaviour',
+      );
+      return;
+    }
+    _log_('WATCHDOG: no transcript for $_consecutiveEmptyUtterances utterances this session -> restarting session');
+    _scheduleReconnect(reason: 'watchdog', watchdog: true);
+  }
+
   void _onEndRequest() {
     final reason = widget.endRequest?.value;
     if (reason == null || _sessionClosing) return;
+    // Build 178 — the flag only (no setState / provider writes here, see
+    // below); a waiting reconnect is dropped by [_stopTest] next turn.
+    _closedByApp = true;
     // Synchronously: ONLY the flag every gate reads (mic send, server
     // messages, scripted replies). CONFIRMED via logcat: this is called from
     // `JobDetailScreen.dispose()` -> `exitJobScope()`, i.e. while the widget
@@ -3879,6 +4156,24 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _pcmRemainingFrames = 0;
     });
     _log_('Start Test tapped');
+
+    // Build 178 — an automatic reconnect: the greeting is never replayed,
+    // and a session that does not reach setupComplete in time is a failed
+    // attempt (the service retries or gives up). Any OTHER session starting
+    // (e.g. the manual Voice Assistant button) ends a reconnect in progress.
+    if (widget.skipGreeting) _sessionGreetingHandled = true;
+    final reconnectAttempt = widget.reconnectAttempt;
+    if (reconnectAttempt != null) {
+      _log_('RECONNECT: attempt=$reconnectAttempt session starting (greeting ${widget.skipGreeting ? 'skipped' : 'allowed'})');
+      _reconnectSetupTimer = Timer(reconnectSetupTimeout, () {
+        _reconnectSetupTimer = null;
+        if (_setupComplete || _closedByApp || !mounted) return;
+        _reportReconnectAttemptFailed('no setupComplete within ${reconnectSetupTimeout.inMilliseconds}ms');
+        unawaited(_stopTest(reason: 'reconnect_attempt_failed'));
+      });
+    } else {
+      ref.read(globalVoiceServiceProvider.notifier).cancelSessionReconnect('a new session was started');
+    }
 
     // P1 — pay the camera's one-time device-enumeration cost NOW, in the
     // background, while the token fetch and WebSocket connect are already
@@ -4132,6 +4427,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
           // device connection (see the "setup message sent" log line below,
           // which now reports whether `toolConfig` was included) before
           // this is trusted.
+          // Build 178 Step 7: --dart-define=GEMINI_TOOLCONFIG_ANY=false omits
+          // it (1011 A/B only); default true = sent exactly as before.
+          if (kGeminiToolConfigAny)
           'toolConfig': {
             'functionCallingConfig': {
               'mode': 'ANY',
@@ -4277,8 +4575,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       debugPrint('GEMINI FULL SYSTEM INSTRUCTION BEING SENT:\n$_effectiveSystemInstruction');
       channel.sink.add(setupMessage);
       // Build 174 — the BUILD line again on the first session of this
-      // process, in case logcat was started after the app.
-      logBuildIdentityOnFirstSessionOpen(flags: kVoiceFlagsSummary);
+      // process, in case logcat was started after the app. Build 178: on
+      // EVERY session open (b177 logs started mid-process lacked it).
+      logBuildIdentity(flags: kBuildLineFlags, when: 'session_open');
+      // Build 178 Step 6c — read-only facts of the setup just sent (1011 investigation).
+      _log_(describeSetupFacts(setupMessage));
       // FIX 1 — one greppable line per session: which end-of-speech setting
       // this run is measuring (see [_serverVadSilenceDurationMs]).
       _log_(
@@ -4349,6 +4650,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       final message = _scrubCredentials(e);
       debugPrint('GEMINI LIVE TEST ERROR: $message\n$stackTrace');
       _log_('ERROR: $message');
+      // Build 178 — a reconnect attempt that failed to start (token, handshake)
+      // is reported and ended through [_stopTest], which also removes its
+      // overlay, instead of staying in the error state.
+      if (widget.reconnectAttempt != null && !_closedByApp) {
+        _reportReconnectAttemptFailed('session start failed: $message');
+        await _stopTest(reason: 'reconnect_attempt_failed');
+        return;
+      }
       if (!mounted) return;
       setState(() {
         _phase = _TestPhase.error;
@@ -5497,7 +5806,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
   void _onMicChunk(Uint8List chunk) {
     final channel = _channel;
-    if (channel == null || _sessionClosing) return;
+    // Build 178 — a dead socket (server/network close) gets nothing more.
+    if (channel == null || _sessionClosing || _socketDead) return;
 
     // PART K — see [_cameraNativeCallInProgress]'s doc comment: hard-stop, not
     // just "don't send" — skips [_trackSpeechLevel]'s RMS work too, so this
@@ -5510,7 +5820,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // See `_outgoingAudioPaused` doc comment: capture keeps running (this
     // method still gets called every chunk), only the send to Gemini stops,
     // so resuming needs no recorder/stream reinitialization.
-    if (_outgoingAudioPaused) {
+    // Build 178 Step 3 — the network being down holds sending through this
+    // same gate (the playback-driven flag itself is not touched).
+    if (_outgoingAudioPaused || _networkDown) {
       // BUG 2 diagnostic (step 2): edge-triggered (not per-chunk — this
       // fires dozens of times/sec while paused, which would flood the log
       // for no benefit) log of the EXACT moment sending actually stops, at
@@ -5654,8 +5966,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// "waiting for the first transcript" hold is not armed.
   void _startNewUtterance(DateTime now, {required String cause, bool fromTranscript = false}) {
     _utteranceHeardText = '';
+    // Build 178 Step 6a — before the reply watch is cancelled (its owed
+    // state tells "superseded" from "no reply audio").
+    _logTurnTimingNoneIfUntimed(_utteranceSeq);
     _cancelResponseWatchdog();
     _utteranceSeq++;
+    _utterancesSinceSetup++;
     _currentUtteranceStartedAt = now;
     _latencySpeechEndAt = null;
     _latencyTranscriptAt = null;
@@ -6036,7 +6352,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   String _responseWatchState(int seq) =>
       'u=$seq replyOwed=$_replyOwed scriptedReplyPending=$_scriptedResponsePending '
       'functionCallsInFlight=$_inFlightFunctionCalls awaitingScriptedTurn=${_awaitingScriptedTurnWords != null} '
-      'intentCheckPending=${_geminiIntentCheck != null} socketOpen=${_channel != null}';
+      'intentCheckPending=${_geminiIntentCheck != null} socketOpen=$_socketUsable';
 
   void _onNoResponseYet(int seq, {required bool hang}) {
     final from = _responseWatchFrom;
@@ -6094,7 +6410,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       maxGap: _lateTranscriptMaxWait,
       voiceLikeRms: _estimatedSpeechEndRms,
     );
-    if (transcriptAt == null || estimate == null) return;
+    if (transcriptAt == null || estimate == null) {
+      _noteTurnTimingNoneHint('no_estimate'); // Build 178 Step 6a
+      return;
+    }
     final now = DateTime.now();
     final latency = now.difference(estimate.at);
     final actionAt = _turnActionDoneAt;
@@ -6128,9 +6447,14 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   void _logLatencySummaryOnce() {
     if (_latencySummaryLogged) return;
     _latencySummaryLogged = true;
+    // Build 178 Step 6a — the session's last utterance, if it was never timed.
+    _logTurnTimingNoneIfUntimed(_utteranceSeq, sessionEnding: true);
     _cancelResponseWatchdog();
+    // Build 178 Step 1 — the close code/reason appended (absent when the
+    // socket never reported a close).
     debugPrint(
-      'GEMINI LIVE TEST: ${describeLatencySummary(_sessionLatenciesMs, deadStretches: _sessionDeadStretches, hangs: _sessionHangs, estimated: _sessionEstimatedTurns)}',
+      'GEMINI LIVE TEST: ${describeLatencySummary(_sessionLatenciesMs, deadStretches: _sessionDeadStretches, hangs: _sessionHangs, estimated: _sessionEstimatedTurns)}'
+      '${_socketCloseSummary == null ? '' : ' $_socketCloseSummary'}',
     );
     // A late transcript still waiting on its outcome is written now (plain
     // debugPrint — this can run from dispose, where setState is unsafe).
@@ -6710,6 +7034,18 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         // field surfaces as a top-level `error` message instead (handled
         // just below), never as content inside `setupComplete` itself.
         _log_('setupComplete received from server — raw payload: ${decoded['setupComplete']} — starting mic stream now');
+        // Build 178 — per-session counters start here; a reconnect attempt
+        // that got this far succeeded.
+        _utterancesSinceSetup = 0;
+        _transcriptsSinceSetup = 0;
+        _consecutiveEmptyUtterances = 0;
+        if (widget.reconnectAttempt != null && !_reconnectResultReported) {
+          _reconnectResultReported = true;
+          _reconnectSetupTimer?.cancel();
+          _reconnectSetupTimer = null;
+          _pausedVoiceService?.reportReconnectSetupComplete();
+        }
+        _startNetworkMonitor();
         unawaited(_startMicStreaming());
         _scheduleJobFactPrewarm();
         return;
@@ -8173,6 +8509,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   ///     without hand-rolling eight more near-identical detectors.
   void _onInputTranscription(String textChunk) {
     _pipelineLog('transcript_received', '"$textChunk" ($_utteranceStateSummary)');
+    // Build 178 — any words at all (echo included) prove this session's
+    // transcription works: the watchdog then leaves it alone.
+    if (textChunk.trim().isNotEmpty) {
+      _transcriptsSinceSetup++;
+      _consecutiveEmptyUtterances = 0;
+    }
     _maybeLogFirstTranscriptTiming();
     // BUG 2 backstop (step 3): checked BEFORE the "inputTranscription
     // chunk:" log line and BEFORE any trigger sees this text at all — see
@@ -8857,7 +9199,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         'interrupted=${sinceWait(_diagLastServerInterruptedAt)}, turnComplete=${sinceWait(_diagLastTurnCompleteAt)}, '
         'any message ${ago(_diagLastServerMessageAt)}; last transcript ${ago(_diagLastInputTranscriptionAt)}; '
         'last clientContent we sent: $_diagLastClientContentKind ${ago(_diagLastClientContentAt)}; '
-        'socket=${_channel == null ? 'closed' : 'open'}, device OS: ${Platform.operatingSystemVersion}';
+        'socket=${_socketUsable ? 'open' : 'closed'}, device OS: ${Platform.operatingSystemVersion}';
   }
 
   void _startAwaitingLateTranscript() {
@@ -8911,6 +9253,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
             'normally and logged as TRANSCRIPT LATE with how late it was and what was done with it.',
           );
           _pipelineLog('transcript_timeout', 'silent_await_late — no reply; a late transcript is still handled normally');
+          // Build 178 Step 4 — after the unchanged recovery above.
+          _maybeRunNoTranscriptWatchdog();
         case TranscriptTimeoutAction.askToRepeat:
           _log_('TRANSCRIPT TIMEOUT RECOVERY: action=ask_to_repeat — no transcript ${waitedMs}ms after the speech edge');
           _pipelineLog(
@@ -9212,6 +9556,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         (decision.kind == IntentDecisionKind.none || decision.kind == IntentDecisionKind.weak)) {
       _log_('QUESTION ANNOUNCEMENT: "$transcript" is the announced question — skipping the camera-intent check');
       _pipelineLog('question_announcement', 'follow-up routed to the KB flow');
+      return;
+    }
+
+    // Build 178 Step 5 — see [_maybeHandleSnapCommand]: only the exact short
+    // camera commands; everything else continues exactly as before.
+    if ((decision.kind == IntentDecisionKind.none || decision.kind == IntentDecisionKind.weak) &&
+        _maybeHandleSnapCommand(transcript)) {
       return;
     }
 
@@ -9596,7 +9947,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _geminiIntentCheckContext() != null &&
       !_looksLikeNonInformationalFiller(transcript) &&
       classifySmallTalk(transcript) == SmallTalkKind.none &&
-      _channel != null &&
+      _socketUsable &&
       !_sessionClosing;
 
   bool _maybeStartGeminiIntentCheck(String transcript, IntentDecision decision) {
@@ -9607,7 +9958,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return false;
     }
     final channel = _channel;
-    if (channel == null || _sessionClosing) return false;
+    // Build 178 — never sent into a dead socket (it would only wait out its timeout).
+    if (channel == null || _sessionClosing || _socketDead) return false;
     final previous = _geminiIntentCheck;
     if (previous != null) {
       previous.timeout.cancel();
@@ -9824,6 +10176,27 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // Job Detail -> KB catch-all as before; anywhere else the KB GATE turns
     // it into a clarification question.
     _maybeFallBackToKbAnswerCatchAll();
+  }
+
+  /// Build 178 Step 5 (`SNAP_IT_FIX`) — b177: "Snap it." with the camera
+  /// closed waited 902ms on the intent check and got "say that again". A
+  /// whole-utterance short camera command (`snap_command.dart`) now fires
+  /// open_camera through the SAME trigger path a fuzzy/intent match uses
+  /// (negation guard, state guard, debounce, auto-capture all apply), and a
+  /// negated one ("Don't snap it.", "No, snap it") answers "Okay." through
+  /// the negation guard — neither waits on the intent check. Camera closed
+  /// only: with it live "snap it" stays the capture phrase it always was.
+  bool _maybeHandleSnapCommand(String transcript) {
+    if (!kSnapItFix || widget.jobId == null || _screenTask != _ScreenTask.none) return false;
+    final snap = classifySnapCommand(transcript);
+    if (snap == null) return false;
+    if (snap == SnapCommand.negated) {
+      _log_('SNAP IT FIX: "$transcript" is a negated short camera command — answering through the negation guard');
+      return _blockNegatedCameraAction('open_camera', transcript, forcedCue: 'negated short camera command');
+    }
+    _log_('SNAP IT FIX: "$transcript" is a short camera command — open_camera via the trigger path (no intent-check wait)');
+    _pipelineLog('snap_it_fix', 'open_camera via the trigger path');
+    return _fireIntentTrigger('open_camera', logLabel: 'SNAP IT FIX') || _guardFailedReplySpokenThisUtterance;
   }
 
   /// Build 176 Step 5 — see [_garbledQuickRepeat]. Only reached when the
@@ -11141,7 +11514,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// nothing else (intent check, clarification) answers it; any further
   /// block in the same utterance only logs `NEGATION GUARD also blocked`.
   /// No action fires and no camera/screen state changes.
-  bool _blockNegatedCameraAction(String action, String heard) {
+  ///
+  /// [forcedCue] (build 178, SNAP_IT_FIX): the caller already knows the
+  /// utterance is a refusal ("No, snap it") — used only when no cue below
+  /// matches. Null everywhere else, so every existing call is unchanged.
+  bool _blockNegatedCameraAction(String action, String heard, {String? forcedCue}) {
     if (!_negationGuardEnabled || !_cameraNegationGuardedActions.contains(action)) return false;
     var text = heard.trim();
     var cue = text.isEmpty ? null : cameraActionNegation(text, extendedCues: _cameraCancelCuesExtended);
@@ -11163,6 +11540,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         }
       }
     }
+    cue ??= forcedCue;
     if (cue == null) return false;
     _pipelineLog('matched_not_fired', 'trigger=$action reason=negation ("$cue")');
     if (_cameraNegationBlockedThisUtterance) {
@@ -15329,6 +15707,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// Gemini audio.
   void _playResponseChunk(Uint8List pcmBytes, {required String? mimeType}) {
     _responseChunksReceived++;
+    _replyAudioSeenForSeq = _utteranceSeq; // Build 178 Step 6a (logging only)
 
     // STEP 3 audio-echo fix: a new chunk arriving means playback is
     // genuinely NOT done yet, regardless of what `_pcmRemainingFrames` last
@@ -15425,6 +15804,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       final systemTurn = _systemInitiatedTurn;
       if (systemTurn != null && reference.isBefore(systemTurn.requestedAt)) {
         _systemInitiatedTurn = null;
+        _noteTurnTimingNoneHint('excluded_app_turn'); // Build 178 Step 6a
         _log_(
           'LATENCY EXCLUDED (${systemTurn.label}): first response byte of an app-initiated turn — the stopwatch\'s '
           'reference ($from) was ${latency.inMilliseconds}ms ago, before the app asked for this line, so it times '
@@ -15638,7 +16018,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final message = _scrubCredentials(error);
     debugPrint('GEMINI LIVE TEST ERROR (WebSocket): $message\n$stackTrace');
     _log_('ERROR (WebSocket): $message');
-    if (!mounted) return;
+    _onSocketDead(error: error);
+    // Build 178 — while reconnecting the UI stays as it is (no error state).
+    if (!mounted || _reconnectPending) return;
     setState(() {
       _phase = _TestPhase.error;
       _errorMessage = message;
@@ -15655,7 +16037,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
   void _onWsDone() {
     _log_('WebSocket closed by server (closeCode=${_channel?.closeCode}, closeReason=${_channel?.closeReason})');
-    if (!mounted) return;
+    _onSocketDead();
+    if (!mounted || _reconnectPending) return;
     setState(() => _phase = _TestPhase.closed);
   }
 
@@ -15664,10 +16047,29 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// the log, indistinguishable between the End button, end_session and the
   /// inactivity timeout (it was the button, pressed ~68s into a silent capture).
   Future<void> _stopTest({String reason = 'Stop/End button tapped'}) async {
+    // Build 178 — every close from here on is the app's own (never a
+    // reconnect trigger); a reconnect still waiting is dropped.
+    _closedByApp = true;
+    final reconnectWasWaiting = _reconnectWaiter != null && !_reconnectWaiter!.isDone;
+    _reconnectWaiter?.cancel();
+    _reconnectWaiter = null;
+    if (reconnectWasWaiting) {
+      _log_('RECONNECT: cancelled — session ended ($reason) before the reconnect started');
+      _pausedVoiceService?.clearReconnectStatus();
+    }
     _log_(
       'Stop Test tapped (reason: $reason)'
       '${_inFlightFunctionCalls > 0 ? ' — WARNING: $_inFlightFunctionCalls function call(s) still in flight; their results will have no session to report to' : ''}',
     );
+    // Build 178 — a reconnect attempt ended by anything other than its own
+    // failure (user stop, end_session, inactivity, left job) cancels the
+    // whole sequence. Before [_teardown], so its normal wake-loop resume runs.
+    if (widget.reconnectAttempt != null && !_reconnectResultReported && reason != 'reconnect_attempt_failed') {
+      _reconnectResultReported = true;
+      _reconnectSetupTimer?.cancel();
+      _reconnectSetupTimer = null;
+      _pausedVoiceService?.cancelSessionReconnect('reconnect session ended: $reason');
+    }
     await _teardown();
     if (!mounted) return;
     setState(() => _phase = _TestPhase.closed);
@@ -15703,6 +16105,13 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // FIX 7 — once per session, before anything is torn down (debugPrint
     // only, so it is safe even from dispose()).
     _logLatencySummaryOnce();
+    // Build 178 — recovery timers/listeners of this session only (the
+    // reconnect itself, if any, is owned by GlobalVoiceService by now).
+    _reconnectWaiter?.cancel();
+    _reconnectWaiter = null;
+    _reconnectSetupTimer?.cancel();
+    _reconnectSetupTimer = null;
+    _stopNetworkMonitor();
     _appOwnsCurrentReply = false;
     _confirmationCapture = null;
     // Build 174 — job-fact clips never outlive the session (build 177: unless

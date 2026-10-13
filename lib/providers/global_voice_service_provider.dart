@@ -14,6 +14,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../routing/app_navigator_key.dart';
 import '../screens/gemini_live_test_screen.dart';
 import '../services/gemini_token_cache.dart';
+import '../services/session_reconnect.dart';
 import '../services/wake_greeting_clip.dart';
 import 'currently_viewed_job_provider.dart';
 import 'deepgram_command_capture.dart';
@@ -277,6 +278,7 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   void onAppLifecycleChanged(AppLifecycleState lifecycle) {
     if (lifecycle == AppLifecycleState.detached) {
       _endActiveGeminiSession('app closing (AppLifecycleState.detached)');
+      cancelSessionReconnect('app closing');
       return;
     }
     if (lifecycle == AppLifecycleState.paused && !_jobScopeActive) {
@@ -1045,6 +1047,9 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // answering ("Are you there?" -> "Yes, I can hear you...") on Home.
     // Gemini is only ever reachable inside an active job: close it too.
     _endActiveGeminiSession('left job scope');
+    // Build 178 — no reconnect into a job that was left (between sessions
+    // nobody else hands the mic back, so this does).
+    cancelSessionReconnect('left job scope', resumeWakeLoop: true);
     _syncGeminiTokenPrefetch();
     _stage = _ListenStage.idle;
     _cancelCommandSettleTimer();
@@ -1104,6 +1109,16 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
   /// than clobbering it back on. Idempotent — calling this while not
   /// paused is a no-op.
   Future<void> resumeAfterExternalSession(String reason) async {
+    // Build 178 — see [_reconnectHoldsMic]: only the two session-end resumes
+    // are held while a reconnect starts the next session; any other resume
+    // means the reconnect is over (cancelled), and resumes as always.
+    if (_reconnectHoldsMic) {
+      if (_reconnect.inFlight && (reason == 'gemini_live_session' || reason == 'wake_word_session_returned')) {
+        debugPrint('VOICE: resume ($reason) held — a reconnect is starting the next session, wake-word loop stays paused');
+        return;
+      }
+      cancelSessionReconnect('resume requested: $reason');
+    }
     if (!_externallyPaused) return;
     _externallyPaused = false;
     debugPrint(
@@ -1223,14 +1238,219 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     endRequest.value = reason;
   }
 
-  Future<void> _triggerGeminiSession() async {
+  // ===========================================================================
+  // BUILD 178 — session reconnect (see `services/session_reconnect.dart`)
+  //
+  // A dead session ends itself through its normal `_stopTest`, after
+  // calling [beginSessionReconnect]. From then until the new session's
+  // setupComplete (or the give-up), [_reconnectHoldsMic] keeps the wake-word
+  // loop paused: the two session-end resumes ('gemini_live_session' from the
+  // screen's teardown, 'wake_word_session_returned' here) are held, so the
+  // recognizer never grabs the microphone between the two sessions. Any
+  // OTHER resume, leaving the job, muting, the app closing, or a new session
+  // starting cancels the reconnect. One sequence at a time, process-wide.
+  // ===========================================================================
+
+  final SessionReconnectCoordinator _reconnect = SessionReconnectCoordinator();
+  final WatchdogRestartCap _watchdogCap = WatchdogRestartCap();
+  bool _reconnectHoldsMic = false;
+  Timer? _reconnectDeadlineTimer;
+  ScaffoldFeatureController<SnackBar, SnackBarClosedReason>? _voiceStatusSnack;
+
+  /// Called by the dead session right before it ends itself. Null = started
+  /// (the caller then ends its session); otherwise why not (caller ends its
+  /// session normally and the wake-word loop resumes).
+  String? beginSessionReconnect({required String jobId, required String reason, required DateTime socketDeadAt}) {
+    final refused = _reconnect.begin(jobId: jobId, reason: reason, socketDeadAt: socketDeadAt);
+    if (refused != null) {
+      debugPrint('RECONNECT: not started — $refused');
+      return refused;
+    }
+    _reconnectHoldsMic = true;
+    _reconnectDeadlineTimer?.cancel();
+    // Backstop: whatever happens, the microphone goes back to the wake-word
+    // loop after the sequence deadline (plus one attempt's setup timeout).
+    _reconnectDeadlineTimer = Timer(reconnectSequenceDeadline + reconnectSetupTimeout, () {
+      _reconnectDeadlineTimer = null;
+      if (!_reconnect.inFlight) return;
+      final attempt = _reconnect.attempt;
+      final why = _reconnect.reason;
+      _reconnect.cancel();
+      // An attempt still starting must not share the mic with the wake loop:
+      // it is ended, and ITS teardown resumes the wake loop once the
+      // recorder is released.
+      final sessionUp = _activeGeminiSessionEndRequest != null;
+      _endActiveGeminiSession('reconnect deadline reached');
+      unawaited(_giveUpReconnect(why, attempt, detail: 'sequence deadline reached', resumeWakeLoop: !sessionUp));
+    });
+    debugPrint(
+      'RECONNECT: handing off job $jobId (reason=$reason) — the wake-word loop stays paused until the new session '
+      'is ready',
+    );
+    return null;
+  }
+
+  /// Starts a new ambient session for [jobId] through the same path a wake
+  /// word uses ([_triggerGeminiSession]): new screen, fresh token from
+  /// [takeGeminiToken], same job. [skipGreeting]: no greeting clip and the
+  /// new screen does not ask Gemini for one.
+  Future<void> restartAmbientSession(String jobId, String reason, int attempt, {bool skipGreeting = true}) async {
+    debugPrint(
+      'RECONNECT: attempt=$attempt starting a new ambient session for job $jobId (reason=$reason, fresh token, '
+      'greeting ${skipGreeting ? 'skipped' : 'allowed'})',
+    );
+    _reconnect.markAttemptStarted();
+    await _triggerGeminiSession(reconnectAttempt: attempt, skipGreeting: skipGreeting);
+  }
+
+  /// The new session reached setupComplete.
+  void reportReconnectSetupComplete() {
+    final attempt = _reconnect.attempt;
+    final reason = _reconnect.reason;
+    final delayMs = _reconnect.currentDelay.inMilliseconds;
+    final downtime = _reconnect.onSetupComplete();
+    if (downtime == null) return;
+    _reconnectHoldsMic = false;
+    _reconnectDeadlineTimer?.cancel();
+    _reconnectDeadlineTimer = null;
+    debugPrint(describeReconnectResult(attempt: attempt, reason: reason, delayMs: delayMs, ok: true, totalDowntimeMs: downtime));
+    clearReconnectStatus();
+  }
+
+  /// The attempt's session failed before setupComplete; it ends itself next.
+  void reportReconnectAttemptFailed(String why) {
+    if (!_reconnect.inFlight) return;
+    debugPrint('RECONNECT: attempt=${_reconnect.attempt} failed before setupComplete — $why');
+    _reconnect.onAttemptFailed();
+  }
+
+  /// Ends a pending reconnect (no-op when none). [resumeWakeLoop]: no
+  /// session holds the mic any more, so hand it back to the wake-word loop
+  /// here (its own guards decide whether it actually listens).
+  void cancelSessionReconnect(String reason, {bool resumeWakeLoop = false}) {
+    final wasHolding = _reconnectHoldsMic;
+    _reconnectHoldsMic = false;
+    _reconnectDeadlineTimer?.cancel();
+    _reconnectDeadlineTimer = null;
+    if (!_reconnect.cancel() && !wasHolding) return;
+    debugPrint('RECONNECT: cancelled ($reason)');
+    clearReconnectStatus();
+    if (resumeWakeLoop) unawaited(resumeAfterExternalSession('reconnect_cancelled'));
+  }
+
+  /// Step 4's process-wide cap (2 per 60s).
+  bool tryTakeWatchdogRestart() => _watchdogCap.tryTake();
+
+  void _continueReconnectAfterSessionEnded() {
+    final phaseBefore = _reconnect.phase;
+    final attemptBefore = _reconnect.attempt;
+    final reason = _reconnect.reason;
+    if (phaseBefore == ReconnectPhase.attempting || phaseBefore == ReconnectPhase.attemptFailed) {
+      debugPrint(describeReconnectResult(
+        attempt: attemptBefore,
+        reason: reason,
+        delayMs: _reconnect.currentDelay.inMilliseconds,
+        ok: false,
+      ));
+    }
+    final next = _reconnect.onSessionEnded((attempt) => unawaited(_startReconnectAttempt(attempt)));
+    switch (next) {
+      case ReconnectNext.scheduled:
+        debugPrint(
+          'RECONNECT: scheduled attempt=${_reconnect.attempt} reason=$reason in=${_reconnect.currentDelay.inMilliseconds}',
+        );
+      case ReconnectNext.gaveUp:
+        unawaited(_giveUpReconnect(reason, attemptBefore, detail: 'no attempt reached setupComplete'));
+      case ReconnectNext.startAttempt:
+      case ReconnectNext.nothing:
+        break;
+    }
+  }
+
+  Future<void> _startReconnectAttempt(int attempt) async {
+    final jobId = _reconnect.jobId;
+    if (!_reconnect.inFlight || jobId == null) return;
+    if (!mounted || !_jobScopeActive || state.muted || _ref.read(currentlyViewedJobIdProvider) != jobId) {
+      _reconnect.cancel();
+      await _giveUpReconnect(_reconnect.reason, attempt, detail: 'job $jobId is no longer open', quiet: true);
+      return;
+    }
+    await restartAmbientSession(jobId, _reconnect.reason, attempt);
+  }
+
+  Future<void> _giveUpReconnect(
+    String reason,
+    int attempts, {
+    required String detail,
+    bool quiet = false,
+    bool resumeWakeLoop = true,
+  }) async {
+    _reconnectHoldsMic = false;
+    _reconnectDeadlineTimer?.cancel();
+    _reconnectDeadlineTimer = null;
+    debugPrint('RECONNECT: gave up after $attempts attempt(s) reason=$reason ($detail) — back to the wake-word loop');
+    if (quiet) {
+      clearReconnectStatus();
+    } else {
+      showConnectionLost();
+    }
+    if (resumeWakeLoop) await resumeAfterExternalSession('reconnect_gave_up');
+  }
+
+  /// "Reconnecting..." — the session phase shows thinking, plus a quiet
+  /// snackbar (no dialog, no error state). Deferred a turn: callers may be
+  /// inside a build/dispose.
+  void showReconnectingStatus() {
+    setExternalSessionPhase(VoicePhase.processing);
+    _showVoiceStatus(reconnectingStatusText, duration: const Duration(seconds: 30));
+  }
+
+  void clearReconnectStatus() => _showVoiceStatus(null);
+
+  void showConnectionLost() => _showVoiceStatus(connectionLostText, duration: const Duration(seconds: 6));
+
+  void _showVoiceStatus(String? text, {Duration duration = const Duration(seconds: 4)}) {
+    Future(() {
+      final context = rootNavigatorKey.currentContext;
+      final messenger = context == null || !context.mounted ? null : ScaffoldMessenger.maybeOf(context);
+      // Ours is always the CURRENT snackbar while it is open (showing it
+      // removes whatever was current; later ones queue behind it), so
+      // removing the current one removes exactly ours.
+      final hadOurs = _voiceStatusSnack != null;
+      _voiceStatusSnack = null;
+      if (text == null) {
+        if (hadOurs) messenger?.removeCurrentSnackBar();
+        return;
+      }
+      if (messenger == null) {
+        debugPrint('VOICE STATUS: "$text" (no ScaffoldMessenger to show it)');
+        return;
+      }
+      messenger.removeCurrentSnackBar(); // ours when hadOurs, else whatever was current
+      final controller = messenger.showSnackBar(SnackBar(content: Text(text), duration: duration));
+      _voiceStatusSnack = controller;
+      // Once it is gone on its own, never close() it later — that would hide
+      // whatever snackbar is current by then.
+      unawaited(controller.closed.then((_) {
+        if (identical(_voiceStatusSnack, controller)) _voiceStatusSnack = null;
+      }));
+    });
+  }
+
+  /// [reconnectAttempt] (build 178): set by [restartAmbientSession] — the
+  /// same path, for the same job, with no wake word behind it (so no wake
+  /// time, and with [skipGreeting] no greeting clip).
+  Future<void> _triggerGeminiSession({int? reconnectAttempt, bool skipGreeting = false}) async {
+    // Build 178 — a wake word (or anything else starting a fresh session)
+    // ends a reconnect that is still pending.
+    if (reconnectAttempt == null) cancelSessionReconnect('wake word heard');
     // Claimed BEFORE the recognizer is stopped below, not after: releasing
     // the mic takes real time, and there's no reason the token (usually
     // already pre-fetched — see [_geminiTokens]) should wait behind it. The
     // no-op error listener only keeps an early return below from leaving a
     // failed fetch unhandled; the session itself still awaits and reports
     // any error exactly as before.
-    final wakeAt = _wakeWordDetectedAt;
+    final wakeAt = reconnectAttempt == null ? _wakeWordDetectedAt : null;
     final tokenFuture = takeGeminiToken(wakeAt: wakeAt);
     unawaited(tokenFuture.then((_) {}, onError: (Object _) {}));
 
@@ -1238,9 +1458,10 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // session connects and Gemini speaks it — see wake_greeting_clip.dart.
     // The session screen holds back mic audio while it plays and stops it
     // the moment the technician is heard speaking.
-    final greeting = _startWakeGreeting(wakeAt);
+    final greeting = skipGreeting ? null : _startWakeGreeting(wakeAt);
 
-    await pauseForExternalSession('wake_word');
+    // A reconnect: already paused (the hold kept it so) — a no-op.
+    await pauseForExternalSession(reconnectAttempt == null ? 'wake_word' : 'reconnect');
 
     // Gemini is reachable only inside an active job — the same scope the
     // wake-word loop itself runs in. Also catches the job being left while
@@ -1283,7 +1504,11 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
       return;
     }
 
-    debugPrint('VOICE: wake word heard — starting ambient Gemini Live session for job $jobId');
+    debugPrint(
+      reconnectAttempt == null
+          ? 'VOICE: wake word heard — starting ambient Gemini Live session for job $jobId'
+          : 'VOICE: reconnect attempt $reconnectAttempt — starting ambient Gemini Live session for job $jobId',
+    );
     final sessionEnded = Completer<void>();
     final endRequest = ValueNotifier<String?>(null);
     _activeGeminiSessionEndRequest = endRequest;
@@ -1296,6 +1521,8 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
         wakeDetectedAt: wakeAt,
         wakeGreeting: greeting,
         endRequest: endRequest,
+        reconnectAttempt: reconnectAttempt,
+        skipGreeting: skipGreeting,
         onAmbientSessionEnded: () {
           entry.remove();
           if (!sessionEnded.isCompleted) sessionEnded.complete();
@@ -1307,6 +1534,14 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     // Backstop — the screen's own teardown already stops it.
     greeting?.stop(WakeGreetingOutcome.cancelled, 'session ended');
     if (identical(_activeGeminiSessionEndRequest, endRequest)) _activeGeminiSessionEndRequest = null;
+
+    // Build 178 — the session ended for a reconnect (or a reconnect attempt
+    // failed): the microphone stays with the Gemini path and the next
+    // session (or the give-up) is decided here, never the wake-word loop.
+    if (_reconnectHoldsMic && _reconnect.inFlight) {
+      _continueReconnectAfterSessionEnded();
+      return;
+    }
 
     // Defensive backstop, not the primary resume path: GeminiLiveTestScreen
     // already calls resumeAfterExternalSession itself from _teardown()
@@ -1378,6 +1613,9 @@ class GlobalVoiceService extends StateNotifier<GlobalVoiceState> {
     state = state.copyWith(muted: muted);
     _syncGeminiTokenPrefetch();
     if (muted) {
+      // Build 178 — muting ends a pending reconnect (the wake loop's own
+      // guards then keep it from listening).
+      cancelSessionReconnect('muted', resumeWakeLoop: true);
       _stage = _ListenStage.idle;
       _cancelCommandSettleTimer();
       _cancelRestartDebounce();

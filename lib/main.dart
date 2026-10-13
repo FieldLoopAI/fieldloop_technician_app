@@ -5,11 +5,11 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'app.dart';
 import 'build_identity.dart';
 import 'providers/local_notifications_service.dart';
-import 'screens/gemini_live_test_screen.dart' show kVoiceFlagsSummary;
+import 'screens/gemini_live_test_screen.dart' show kBuildLineFlags;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  logBuildIdentity(flags: kVoiceFlagsSummary);
+  logBuildIdentity(flags: kBuildLineFlags);
 
   await Supabase.initialize(
     url: 'https://glpzohfzldvztseriwky.supabase.co',

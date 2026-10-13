@@ -304,7 +304,146 @@ String analyzeVoiceLogs(Map<String, String> parts) {
   for (final c in crash) {
     out.writeln('    $c');
   }
+  _appendB178Sections(out, ps, all);
   return out.toString();
+}
+
+// --- Build 178 Step 8 — appended after every build 177 section, which are
+// unchanged. ---------------------------------------------------------------
+
+final RegExp _turnTimingNone = RegExp(r'TURN TIMING: none utterance=(\d+) reason=(\S+)');
+final RegExp _wsClosed = RegExp(r'WebSocket closed by server \(closeCode=([^,]*),');
+final RegExp _transcriptReceived = RegExp(r'VOICE PIPELINE \[u=\d+\] transcript_received');
+const String _sessionStart = 'setupComplete received from server';
+
+/// Recovery tags and how to recognise them ("SPEECH/MIC WATCHDOG" lines are
+/// older, unrelated timers — only the `[ts] WATCHDOG:` form counts).
+final Map<String, RegExp> _recoveryTags = {
+  'SOCKET DEAD': RegExp(r'SOCKET DEAD: '),
+  'RECONNECT': RegExp(r'RECONNECT: '),
+  'WATCHDOG': RegExp(r'\] WATCHDOG: '),
+  'NETWORK': RegExp(r'\] NETWORK: '),
+  'goAway': RegExp(r'goAway received'),
+  'ERROR (WebSocket)': RegExp(r'ERROR \(WebSocket\)'),
+};
+
+void _appendB178Sections(StringBuffer out, List<_Part> ps, List<String> all) {
+  void h(String title) => out.writeln('\n== $title');
+  int count(Iterable<String> lines, Pattern p) => lines.where((l) => l.contains(p)).length;
+
+  h('B178 MODULE A: wake-word-detected -> mic-live (each value)');
+  var n = 0;
+  for (final p in ps) {
+    for (final l in p.lines) {
+      final m = _wakeMic.firstMatch(l);
+      if (m != null) out.writeln('  ${++n}. ${p.name} ${_clock(l)} ${m.group(1)}ms');
+    }
+  }
+  if (n == 0) out.writeln('  (none)');
+
+  h('B178 GEMINI TOKEN lines (verbatim)');
+  var tokenLines = 0;
+  for (final p in ps) {
+    for (final l in p.lines) {
+      if (l.contains('GEMINI TOKEN: wakeAt=') || l.contains('GEMINI TOKEN: source=')) {
+        tokenLines++;
+        out.writeln('  ${p.name} ${_clock(l)} ${_tail(l)}');
+      }
+    }
+  }
+  if (tokenLines == 0) out.writeln('  (none)');
+
+  h('B178 MODULE B: all files combined and per file');
+  for (final p in ps) {
+    out.writeln(
+      '  ${p.name}: ${_stats(p.turns)} DEAD STRETCH lines=${count(p.lines, 'DEAD STRETCH:')} '
+      'SESSION HANG lines=${count(p.lines, 'SESSION HANG:')}',
+    );
+  }
+  out.writeln(
+    '  COMBINED: ${_stats([for (final p in ps) ...p.turns])} DEAD STRETCH lines=${count(all, 'DEAD STRETCH:')} '
+    'SESSION HANG lines=${count(all, 'SESSION HANG:')}',
+  );
+
+  h('B178 PER-UTTERANCE TABLE (file | time | heard | action | source | total ms)');
+  var rows = 0;
+  for (final p in ps) {
+    var heard = '';
+    for (final l in p.lines) {
+      if (_utteranceStart.hasMatch(l)) heard = '';
+      final chunk = _transcriptChunk.firstMatch(l);
+      if (chunk != null) heard = heard.isEmpty ? chunk.group(1)! : '$heard ${chunk.group(1)!}';
+      String? row;
+      if (_turnTiming.hasMatch(l)) {
+        final t = _Turn(l);
+        row = '${t.reply} | ${t.estimated ? 'estimated' : 'true_edge'} | ${t.total}';
+      } else if (_turnTimingNone.firstMatch(l) case final m?) {
+        row = 'none(${m.group(2)}) | none | -';
+      }
+      if (row == null) continue;
+      rows++;
+      final shown = heard.length > 60 ? '${heard.substring(0, 57)}...' : heard;
+      out.writeln('  ${p.name} | ${_clock(l)} | "$shown" | $row');
+      heard = '';
+    }
+  }
+  if (rows == 0) out.writeln('  (none)');
+
+  h('B178 SESSION RECOVERY');
+  for (final e in _recoveryTags.entries) {
+    final lines = [
+      for (final p in ps)
+        for (final l in p.lines)
+          if (e.value.hasMatch(l)) '${p.name} ${_clock(l)} ${_tail(l)}',
+    ];
+    out.writeln('  ${e.key}=${lines.length}');
+    for (final l in lines) {
+      out.writeln('    $l');
+    }
+  }
+  final codes = <String, int>{};
+  for (final l in all) {
+    final code = _wsClosed.firstMatch(l)?.group(1);
+    if (code != null) codes[code] = (codes[code] ?? 0) + 1;
+  }
+  out.writeln(
+    '  WebSocket closed=${codes.values.fold(0, (a, b) => a + b)}'
+    '${codes.isEmpty ? '' : ' (${codes.entries.map((e) => 'closeCode=${e.key}: ${e.value}').join(', ')})'}',
+  );
+  for (final p in ps) {
+    for (final l in p.lines) {
+      if (_wsClosed.hasMatch(l)) out.writeln('    ${p.name} ${_clock(l)} ${_tail(l)}');
+    }
+  }
+
+  h('B178 SESSIONS WITH ZERO TRANSCRIPTS (utterances but no transcript_received)');
+  var zero = 0;
+  for (final p in ps) {
+    String? startedAt;
+    var utterances = 0;
+    var transcripts = 0;
+    void close() {
+      if (startedAt != null && utterances > 0 && transcripts == 0) {
+        zero++;
+        out.writeln('  ${p.name} session from $startedAt: utterances=$utterances transcripts=0');
+      }
+    }
+
+    for (final l in p.lines) {
+      if (l.contains(_sessionStart)) {
+        close();
+        startedAt = _clock(l);
+        utterances = 0;
+        transcripts = 0;
+      } else if (_utteranceStart.hasMatch(l)) {
+        utterances++;
+      } else if (_transcriptReceived.hasMatch(l)) {
+        transcripts++;
+      }
+    }
+    close();
+  }
+  out.writeln('  sessions=$zero');
 }
 
 void main(List<String> args) {
