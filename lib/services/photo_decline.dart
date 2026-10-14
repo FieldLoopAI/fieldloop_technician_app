@@ -43,6 +43,33 @@ const List<String> photoDeclinePhrases = [
   'forget the picture',
 ];
 
+/// Build 180 item E — `--dart-define=WIDER_DECLINE_B180=false` turns these
+/// additions off.
+const bool kWiderDeclineB180 = bool.fromEnvironment('WIDER_DECLINE_B180', defaultValue: true);
+
+/// Build 180 item E — more declines, same whole-utterance / tail / leading-
+/// filler rules (b178: "Actually I don't want to take now." fell through to
+/// a clarification). Tokenized ("don't" -> "don t"). "actually" is already
+/// dropped as filler, so "Actually I don't want to take now." matches
+/// 'i don t want to take now'. "skip the picture" and "no picture for now"
+/// are already in [photoDeclinePhrases].
+const List<String> photoDeclinePhrasesB180 = [
+  'i don t want to take one',
+  'i don t want to take a photo',
+  'i don t want to take a picture',
+  'i don t want a photo',
+  'i don t want a picture',
+  'i don t want to take now',
+  'no i don t want to take one',
+  'i don t need a photo',
+  'not taking a photo',
+];
+
+/// The phrases [matchPhotoDecline] uses: build 179's, plus build 180's when
+/// [b180] is on.
+List<String> activePhotoDeclinePhrases({bool b180 = kWiderDeclineB180}) =>
+    b180 ? [...photoDeclinePhrases, ...photoDeclinePhrasesB180] : photoDeclinePhrases;
+
 const Set<String> _fillerWords = {'um', 'umm', 'uh', 'okay', 'ok', 'well', 'so', 'actually', 'please', 'just'};
 
 const List<List<String>> _leadingFillerPairs = [
@@ -69,14 +96,14 @@ bool _startsWith(List<String> words, List<String> prefix) {
 }
 
 /// The decline phrase [text] consists of, or null.
-String? matchPhotoDecline(String text) {
+String? matchPhotoDecline(String text, {bool b180 = kWiderDeclineB180}) {
   var words = tokenizeTriggerText(text).where((w) => !_fillerWords.contains(w)).toList();
   for (final pair in _leadingFillerPairs) {
     if (_startsWith(words, pair)) words = words.sublist(pair.length);
   }
   if (words.isEmpty) return null;
   // Longest phrase first, so "no photo for now" is reported as itself.
-  final phrases = [...photoDeclinePhrases]..sort((a, b) => b.length.compareTo(a.length));
+  final phrases = [...activePhotoDeclinePhrases(b180: b180)]..sort((a, b) => b.length.compareTo(a.length));
   for (final phrase in phrases) {
     final p = phrase.split(' ');
     if (!_startsWith(words, p)) continue;

@@ -10,7 +10,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show SchedulerBinding, SchedulerPhase;
-import 'package:flutter/services.dart' show MethodChannel;
+import 'package:flutter/services.dart' show AssetManifest, MethodChannel, rootBundle;
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_sound/flutter_sound.dart';
@@ -67,6 +67,12 @@ import '../services/trigger_phrase_matcher.dart';
 import '../services/wake_greeting_clip.dart';
 // Build 179 — items B, C, D (see each file's doc comment).
 import '../services/b179_flags.dart';
+// Build 180 — items A–E (see each file's doc comment).
+import '../services/b180_flags.dart';
+import '../services/close_line_playback.dart';
+import '../services/late_finalize.dart';
+import '../services/scripted_reply_clips.dart';
+import '../services/wait_hold_intent.dart';
 import '../services/local_close_command.dart';
 import '../services/photo_decline.dart';
 import '../services/wider_capture.dart';
@@ -4234,7 +4240,16 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // Change 3 — saved confirmation clips into memory before the first
     // command, so a reply-time lookup never touches disk.
     if (_useCachedConfirmationClips) {
-      unawaited(confirmationClips.preload().then((n) => debugPrint('CONFIRMATION CLIP: $n saved clip(s) ready')));
+      // Build 180 item A — seed clips from assets/clips/ first (only keys the
+      // store lacks), then preload exactly as before.
+      unawaited(
+        _seedScriptedClips().then((_) => confirmationClips.preload()).then((n) {
+          debugPrint('CONFIRMATION CLIP: $n saved clip(s) ready');
+          if (kScriptedReplyClips) {
+            debugPrint('SCRIPTED CLIP: store has $n clip(s): ${confirmationClips.keys.join(',')}');
+          }
+        }),
+      );
     }
     // Change 4 — the estimate/change orders start loading now (both
     // providers then stay current via Realtime + in-app updates), so the
@@ -4622,6 +4637,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // Build 178 Step 6c — read-only facts of the setup just sent (1011 investigation).
       _log_(describeSetupFacts(setupMessage));
       _log_(describeB179Flags());
+      _log_(describeB180Flags());
       // FIX 1 — one greppable line per session: which end-of-speech setting
       // this run is measuring (see [_serverVadSilenceDurationMs]).
       _log_(
@@ -5055,11 +5071,41 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// Plays [text]'s cached clip through [_playResponseChunk] — the same path
   /// as Gemini audio — if one is saved and nothing makes it unsafe right
   /// now. Returns false when the caller must use the Gemini path instead.
+  /// Build 180 item A — seed clips are copied in once per app run.
+  static bool _scriptedClipsSeeded = false;
+
+  /// Build 180 item A — copies WAVs under `assets/clips/` (named by
+  /// `clipFileKey(text)`) into the clip store for every key it does not
+  /// already hold, and logs the store's folder once per session so its
+  /// clips can be pulled with adb. No assets -> nothing is copied.
+  Future<void> _seedScriptedClips() async {
+    if (!kScriptedReplyClips) return;
+    try {
+      final dir = await confirmationClips.directory();
+      debugPrint('SCRIPTED CLIP: clip folder on this device: ${dir.path}');
+      if (_scriptedClipsSeeded) return;
+      _scriptedClipsSeeded = true;
+      final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
+      final assets = manifest.listAssets().where((path) => path.startsWith(scriptedClipAssetDir)).toList();
+      final result = await seedClipStore(
+        directory: dir,
+        assetPaths: assets,
+        loadAsset: (path) async => (await rootBundle.load(path)).buffer.asUint8List(),
+      );
+      debugPrint(
+        'SCRIPTED CLIP: seeded ${result.seeded} from assets (skipped ${result.skippedExisting} existing)'
+        '${result.rejected.isEmpty ? '' : ' — refused: ${result.rejected}'}',
+      );
+    } catch (e) {
+      debugPrint('SCRIPTED CLIP: seeding skipped ($e) — clips are recorded from Gemini as before');
+    }
+  }
+
   bool _playCachedConfirmation(String text, {required String reason}) {
     final jobFactKind = jobFactKindForReason(reason);
     if (jobFactKind != null) return _playCachedJobFact(text, kind: jobFactKind, reason: reason);
     if (!_useCachedConfirmationClips ||
-        !isCacheableReplyLine(reason, text, includeFixedLines: _cacheFixedReplyLines)) {
+        !isClipEligibleReply(reason, text, includeFixedLines: _cacheFixedReplyLines)) {
       return false;
     }
     final pcm = confirmationClips.pcmFor(text);
@@ -5414,7 +5460,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       if (!_jobFactAudioCache || jobId == null || !isCacheableJobFact(kind)) return null;
       return _jobFactClips.pcmFor(jobId, kind, text);
     }
-    if (!_useCachedConfirmationClips || !isCacheableReplyLine(reason, text, includeFixedLines: _cacheFixedReplyLines)) {
+    if (!_useCachedConfirmationClips || !isClipEligibleReply(reason, text, includeFixedLines: _cacheFixedReplyLines)) {
       return null;
     }
     return confirmationClips.pcmFor(text);
@@ -5508,7 +5554,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       return;
     }
     if (!_useCachedConfirmationClips) return;
-    if (!isCacheableReplyLine(_awaitingScriptedTurnReason, text, includeFixedLines: _cacheFixedReplyLines) ||
+    if (!isClipEligibleReply(_awaitingScriptedTurnReason, text, includeFixedLines: _cacheFixedReplyLines) ||
         confirmationClips.pcmFor(text) != null) {
       return;
     }
@@ -6007,6 +6053,19 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// [fromTranscript]: a real transcript chunk is already in hand, so the
   /// "waiting for the first transcript" hold is not armed.
   void _startNewUtterance(DateTime now, {required String cause, bool fromTranscript = false}) {
+    // Build 180 item B — a late re-run still pending for the utterance that
+    // is ending runs NOW, on its own buffers, before they are reset (b179
+    // dropped it here: "Photo, I don't want to take one." got no reply).
+    final lateStep = _lateFinalize.onNewUtterance(seq: _utteranceSeq, alreadyResolved: _lateFinalizeAlreadyResolved);
+    if (lateStep == LateFinalizeStep.runImmediate) {
+      _lateTranscriptFinalizeTimer?.cancel();
+      _lateTranscriptFinalizeTimer = null;
+      _logLateFinalize(lateStep);
+      _pipelineLog('late_transcript_finalize', 're-running end-of-utterance routing before a new utterance starts');
+      _finalizeUtteranceEndDeterministicTriggers();
+    } else if (lateStep == LateFinalizeStep.skippedAlreadyResolved) {
+      _logLateFinalize(lateStep);
+    }
     _utteranceHeardText = '';
     // Build 178 Step 6a — before the reply watch is cancelled (its owed
     // state tells "superseded" from "no reply audio").
@@ -6335,6 +6394,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     }
     _speechBurstStartedAt = null;
     _log_(reason);
+    // Build 180 item B — a late re-run deferred by this burst is covered by
+    // the routing right below (same utterance, now with all its words).
+    _logLateFinalize(_lateFinalize.onSpeechEnded(seq: _utteranceSeq));
     _finalizeUtteranceEndDeterministicTriggers();
   }
 
@@ -9067,6 +9129,12 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _finalizedCurrentUtterance = true;
       return;
     }
+    // Build 180 item C — "Not ready." / "Hold on." with the camera up:
+    // "Okay.", nothing captured, before the negation check and intent layer.
+    if (_maybeHandleWaitHold(heardSoFar)) {
+      _finalizedCurrentUtterance = true;
+      return;
+    }
     // Build 176 Step 2 — a negated camera sentence in any word order is
     // never a KB question, a site note or a photo note (C13 narration).
     if (_maybeBlockNegatedCameraSentence(heardSoFar)) {
@@ -9197,9 +9265,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// DECISION now happens at `transcriptTimeoutFallbackAfter` (change 1b).
   static const Duration _lateTranscriptMaxWait = Duration(seconds: 8);
 
-  /// How long a late transcript must be quiet (no further chunks) before
-  /// end-of-utterance routing re-runs on it.
-  static const Duration _lateTranscriptSettle = Duration(milliseconds: 700);
+  // How long a late transcript must be quiet (no further chunks) before
+  // end-of-utterance routing re-runs on it: build 180 item B moved this
+  // (was a fixed 700ms) to [LateFinalizeController.delay] —
+  // --dart-define=LATE_FINALIZE_MS, see `late_finalize.dart`.
 
   // --- Transcript-wait diagnostics (measurement only) -------------------
   //
@@ -9420,12 +9489,48 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// same "already resolved" flags and stands down.
   void _scheduleLateTranscriptFinalize() {
     _lateTranscriptFinalizeTimer?.cancel();
-    _lateTranscriptFinalizeTimer = Timer(_lateTranscriptSettle, () {
+    // Build 180 item B — the settle is [kLateFinalizeMs] (see
+    // `late_finalize.dart` for the evidence); 700 = build 179 exactly.
+    final seq = _utteranceSeq;
+    _lateFinalize.armed(seq);
+    _lateTranscriptFinalizeTimer = Timer(_lateFinalize.delay, () {
       _lateTranscriptFinalizeTimer = null;
-      if (!mounted || _isSpeaking) return; // still talking — the natural silence edge will finalize it
-      _pipelineLog('late_transcript_finalize', 're-running end-of-utterance routing on the late transcript');
-      _finalizeUtteranceEndDeterministicTriggers();
+      if (!mounted) return;
+      final step = _lateFinalize.onTimerFired(
+        seq: seq,
+        isSpeaking: _isSpeaking,
+        alreadyResolved: _lateFinalizeAlreadyResolved,
+      );
+      switch (step) {
+        case LateFinalizeStep.runSettled:
+          _logLateFinalize(step);
+          _pipelineLog('late_transcript_finalize', 're-running end-of-utterance routing on the late transcript');
+          _finalizeUtteranceEndDeterministicTriggers();
+        case LateFinalizeStep.skippedAlreadyResolved:
+          _logLateFinalize(step);
+        case LateFinalizeStep.none:
+        case LateFinalizeStep.droppedLegacy:
+        case LateFinalizeStep.runImmediate:
+        case LateFinalizeStep.logAfterBurst:
+          // still talking — this burst's own silence edge (or a new
+          // utterance's start, see [_startNewUtterance]) finalizes it
+          return;
+      }
     });
+  }
+
+  /// Build 180 item B — see `late_finalize.dart`.
+  final LateFinalizeController _lateFinalize = LateFinalizeController();
+
+  /// A per-chunk trigger, or a reply of its own, already resolved the
+  /// utterance: its end-of-utterance steps would all stand down anyway.
+  bool get _lateFinalizeAlreadyResolved =>
+      _utteranceAlreadyResolvedByTrigger || _anyTriggerCommittedThisUtterance || _guardFailedReplySpokenThisUtterance;
+
+  void _logLateFinalize(LateFinalizeStep step) {
+    final reason = lateFinalizeReason(step);
+    if (reason == null) return;
+    _log_('LATE FINALIZE: delay=${_lateFinalize.delayMs} reason=$reason (u=$_utteranceSeq)');
   }
 
   /// Task B — one line per step of transcript -> matcher -> dispatch ->
@@ -11759,14 +11864,24 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       final now = DateTime.now();
       final started = _lastResponsePlaybackStartedAt?.isAfter(requestedAt) ?? false;
       final playing = _pcmRemainingFrames > 0 || (_expectedPlaybackEndAt?.isAfter(now) ?? false);
-      final finished = started && !playing;
+      // Build 180 item D — also wait until the line is fully delivered and
+      // nothing is left in the jitter prebuffer (b179 15:26:16.915 tore down
+      // 17ms in, its audio still prebuffered); cap 4s instead of
+      // [localCloseReplyWaitCap] (2s). Off: build 179's rule exactly.
+      final finished = closeLineFinished(
+        started: started,
+        playing: playing,
+        turnDelivered: _turnComplete,
+        prebufferEmpty: _pcmPrebuffer.isEmpty,
+      );
+      final waitCap = closeLineWaitCap();
       final waited = now.difference(requestedAt);
-      if (!finished && waited < localCloseReplyWaitCap && mounted && !_sessionClosing) return;
+      if (!finished && waited < waitCap && mounted && !_sessionClosing) return;
       timer.cancel();
       if (identical(_localCloseReplyWaitTimer, timer)) _localCloseReplyWaitTimer = null;
       if (!mounted || _sessionClosing || _closedByApp) return;
       _log_(
-        'LOCAL CLOSE: ending the session (closing line ${finished ? 'finished' : 'not finished — ${localCloseReplyWaitCap.inSeconds}s cap'} '
+        'LOCAL CLOSE: ending the session (closing line ${finished ? 'finished' : 'not finished — ${waitCap.inSeconds}s cap'} '
         'after ${waited.inMilliseconds}ms) -> _stopTest(voice_close)',
       );
       unawaited(_stopTest(reason: 'voice_close'));
@@ -11808,6 +11923,30 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     } else {
       _informGeminiToSpeakVerbatim(_negationGuardReply, reason: 'decline');
     }
+    return true;
+  }
+
+  /// Build 180 item C — see `wait_hold_intent.dart`. Camera live or
+  /// opening only; the camera stays as it is and nothing is captured.
+  bool _maybeHandleWaitHold(String heard) {
+    if (!kWaitHoldIntent || heard.isEmpty) return false;
+    if (_utteranceAlreadyResolvedByTrigger ||
+        _anyTriggerCommittedThisUtterance ||
+        _guardFailedReplySpokenThisUtterance) {
+      return false;
+    }
+    final applies = waitHoldApplies(
+      cameraLiveOrOpening: _screenTask == _ScreenTask.cameraLive || _screenTask == _ScreenTask.cameraOpening,
+      photoNoteActive: _photoNote != null || _keptPhotoPreviewFile != null,
+      closeQuestionPending: _localClose.confirmPending,
+    );
+    if (!applies) return false;
+    final phrase = matchWaitHold(heard);
+    if (phrase == null) return false;
+    _log_('WAIT: matched phrase=$phrase state=${_screenTask.name} heard="$heard" — camera unchanged, nothing captured');
+    _pipelineLog('wait_hold', 'phrase="$phrase" state=${_screenTask.name} — no capture, no intent check, no KB');
+    _clearAllTriggerBuffersAfterSuccess('wait/hold $phrase');
+    _informGeminiToSpeakVerbatim(_negationGuardReply, reason: 'wait_hold');
     return true;
   }
 

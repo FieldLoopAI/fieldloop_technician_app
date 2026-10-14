@@ -157,6 +157,13 @@ class ConfirmationClipStore {
 
   int get count => _pcmByKey.length;
 
+  /// Build 180 — the clip keys currently in memory (for the store log line).
+  Iterable<String> get keys => _pcmByKey.keys;
+
+  /// Build 180 — the folder the clips are saved in (seeding, and the log line
+  /// that tells where to pull them from with adb).
+  Future<Directory> directory() => _directory();
+
   Future<File> _file(String text) async {
     final dir = await _directory();
     return File('${dir.path}${Platform.pathSeparator}$filePrefix${clipFileKey(text)}.wav');
