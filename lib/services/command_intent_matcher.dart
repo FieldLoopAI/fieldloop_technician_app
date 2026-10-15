@@ -22,6 +22,7 @@
 /// so trade/job questions keep reaching the knowledge base.
 library;
 
+import 'b182_flags.dart';
 import 'camera_request_matcher.dart';
 import 'trigger_phrase_matcher.dart';
 
@@ -389,11 +390,15 @@ enum IntentDecisionKind {
 }
 
 class IntentDecision {
-  const IntentDecision(this.kind, {this.best, this.runnerUp, this.scores = const []});
+  const IntentDecision(this.kind, {this.best, this.runnerUp, this.scores = const [], this.remarkVetoed = false});
 
   final IntentDecisionKind kind;
   final IntentScore? best;
   final IntentScore? runnerUp;
+
+  /// Build 182 item B — a bare-object open_camera score was dropped because
+  /// the utterance is a remark (see [isCameraRemark]); log `FUZZY REMARK VETO`.
+  final bool remarkVetoed;
 
   /// Every candidate that scored, best first — for the log.
   final List<IntentScore> scores;
@@ -416,8 +421,36 @@ class IntentDecision {
   }
 }
 
+/// Words that make a photo mention a request even though the loose
+/// matcher's verb list doesn't cover them — mostly words this file's
+/// normalizer drops as filler ("I'd LIKE a photo", "a photo PLEASE").
+const List<List<String>> _cameraRemarkRequestMarkers = [
+  ['please'], ['like', 'a'], ['like', 'an'], ['d', 'like'], ['would', 'like'], ['love', 'a'], ['d', 'love'],
+  ['would', 'love'], ['for', 'me'],
+];
+
+/// Build 182 item B ([kFuzzyRemarkVeto]) — b181 log 14:29:21: "I like the
+/// photo." normalized to a bare "photo" ("like" is filler here) and scored
+/// open_camera 0.80, although the loose matcher had already said "camera/
+/// photo mentioned but no request verb in front of it — a remark, not a
+/// request". True when the CAMERA GATE's own rule ([assessCameraRequest])
+/// calls [transcript] a statement and none of [_cameraRemarkRequestMarkers]
+/// is in it. Short bare mentions ("photo", "camera please", "Tika shot")
+/// stay unclear there, so they are never vetoed.
+bool isCameraRemark(String transcript) {
+  if (assessCameraRequest(transcript).kind != CameraRequestAssessment.statement) return false;
+  final padded = ' ${tokenizeTriggerText(transcript).join(' ')} ';
+  return !_cameraRemarkRequestMarkers.any((m) => padded.contains(' ${m.join(' ')} '));
+}
+
 /// Decides what [transcript] most likely means among [intents].
-IntentDecision classifyCommandIntent(String transcript, {List<CommandIntent> intents = defaultCommandIntents}) {
+/// [remarkVeto] — build 182 item B: drops open_camera's bare-object score
+/// for a remark (see [isCameraRemark]); no other trigger's scoring changes.
+IntentDecision classifyCommandIntent(
+  String transcript, {
+  List<CommandIntent> intents = defaultCommandIntents,
+  bool remarkVeto = kFuzzyRemarkVeto,
+}) {
   final normalized = normalizeCommandWordsWithBoundaries(transcript);
   final words = normalized.words;
   if (words.isEmpty) return const IntentDecision(IntentDecisionKind.none);
@@ -431,19 +464,44 @@ IntentDecision classifyCommandIntent(String transcript, {List<CommandIntent> int
         allowActionMatch: intent.requestShape?.call(transcript) ?? true,
       ),
   ]..sort((a, b) => b.confidence.compareTo(a.confidence));
-  if (scores.isEmpty) return const IntentDecision(IntentDecisionKind.none);
+  var remarkVetoed = false;
+  if (remarkVeto &&
+      scores.any((x) => x.trigger == 'open_camera' && x.confidence == _bareObject) &&
+      isCameraRemark(transcript)) {
+    scores.removeWhere((x) => x.trigger == 'open_camera' && x.confidence == _bareObject);
+    remarkVetoed = true;
+  }
+  if (scores.isEmpty) return IntentDecision(IntentDecisionKind.none, remarkVetoed: remarkVetoed);
 
   final best = scores.first;
   final runnerUp = scores.length > 1 ? scores[1] : null;
   // Questions only act on strong matches; weaker ones stay with the KB.
   final floor = looksLikeQuestion(transcript) ? confidentThreshold : weakThreshold;
-  if (best.confidence < floor) return IntentDecision(IntentDecisionKind.none, scores: scores);
+  if (best.confidence < floor) return IntentDecision(IntentDecisionKind.none, scores: scores, remarkVetoed: remarkVetoed);
 
   if (runnerUp != null && runnerUp.confidence >= floor && best.confidence - runnerUp.confidence < ambiguityMargin) {
-    return IntentDecision(IntentDecisionKind.ambiguous, best: best, runnerUp: runnerUp, scores: scores);
+    return IntentDecision(
+      IntentDecisionKind.ambiguous,
+      best: best,
+      runnerUp: runnerUp,
+      scores: scores,
+      remarkVetoed: remarkVetoed,
+    );
   }
   if (best.confidence >= confidentThreshold) {
-    return IntentDecision(IntentDecisionKind.confident, best: best, runnerUp: runnerUp, scores: scores);
+    return IntentDecision(
+      IntentDecisionKind.confident,
+      best: best,
+      runnerUp: runnerUp,
+      scores: scores,
+      remarkVetoed: remarkVetoed,
+    );
   }
-  return IntentDecision(IntentDecisionKind.weak, best: best, runnerUp: runnerUp, scores: scores);
+  return IntentDecision(
+    IntentDecisionKind.weak,
+    best: best,
+    runnerUp: runnerUp,
+    scores: scores,
+    remarkVetoed: remarkVetoed,
+  );
 }

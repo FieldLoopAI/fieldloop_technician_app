@@ -22,6 +22,7 @@
 /// Pure Dart and deterministic: no network, no Gemini call.
 library;
 
+import 'b182_flags.dart';
 import 'trigger_phrase_matcher.dart';
 
 /// `--dart-define=LOCAL_CLOSE_COMMANDS=false` turns item B off.
@@ -79,6 +80,28 @@ const List<String> localCloseSoftPhrases = [
   'all done',
   'i m finished',
   'i am finished',
+];
+
+/// Build 182 item C ([kLoopOffClose]) — merged in at match time only, so
+/// the two lists above are unchanged. b181 device log (14:28:22/:33/:41):
+/// "loop off" was transcribed "loop of" 3 times out of 3 and nothing
+/// matched. "loop off", "field loop off" and "fieldloop off" were already
+/// explicit above; they are repeated here so this list reads as the whole
+/// item. "field look" is ASR's spelling of the wake word.
+const List<String> loopOffExplicitPhrases = [
+  'loop off',
+  'field loop off',
+  'fieldloop off',
+  'field look off',
+];
+
+/// Ask first: "loop of" is ordinary English. Whole utterance only, like
+/// every phrase here — "loop of wire" is `too_long` for nothing (these are
+/// left out of the contained-phrase check, so it isn't even logged).
+const List<String> loopOffSoftPhrases = [
+  'loop of',
+  'field loop of',
+  'field look of',
 ];
 
 /// Words that carry no meaning for the close decision, dropped anywhere.
@@ -164,10 +187,12 @@ bool _startsWith(List<String> words, List<String> prefix) {
 
 /// The phrase [words] consists of — the phrase, optionally plus one
 /// allowed tail — or null.
-({String phrase, LocalCloseTier tier})? _wholeMatch(List<String> words) {
+({String phrase, LocalCloseTier tier})? _wholeMatch(List<String> words, {required bool loopOff}) {
   for (final (tier, list) in [
     (LocalCloseTier.explicit, localCloseExplicitPhrases),
     (LocalCloseTier.soft, localCloseSoftPhrases),
+    if (loopOff) (LocalCloseTier.explicit, loopOffExplicitPhrases),
+    if (loopOff) (LocalCloseTier.soft, loopOffSoftPhrases),
   ]) {
     for (final phrase in list) {
       final p = phrase.split(' ');
@@ -183,16 +208,17 @@ bool _startsWith(List<String> words, List<String> prefix) {
 }
 
 /// The first close phrase found anywhere in [words] (for the too_long log).
-String? _containedPhrase(List<String> words) {
+String? _containedPhrase(List<String> words, {required bool loopOff}) {
   final padded = ' ${words.join(' ')} ';
-  for (final phrase in [...localCloseExplicitPhrases, ...localCloseSoftPhrases]) {
+  for (final phrase in [...localCloseExplicitPhrases, ...localCloseSoftPhrases, if (loopOff) ...loopOffExplicitPhrases]) {
     if (padded.contains(' $phrase ')) return phrase;
   }
   return null;
 }
 
 /// Classifies one utterance. null = not a close phrase at all.
-LocalCloseResult? matchLocalClose(String text) {
+/// [loopOff] — build 182 item C (see [loopOffExplicitPhrases]).
+LocalCloseResult? matchLocalClose(String text, {bool loopOff = kLoopOffClose}) {
   final all = _words(text);
   if (all.isEmpty) return null;
   final words = _withoutLeadingWakeWord(all);
@@ -200,16 +226,17 @@ LocalCloseResult? matchLocalClose(String text) {
   if (negationStripped != null) {
     // "don't close the session", "I'm not done": the request without its
     // negation would have closed — say why it didn't.
-    final m = _wholeMatch(negationStripped) ?? _wholeMatch(_withoutLeadingWakeWord(negationStripped));
+    final m = _wholeMatch(negationStripped, loopOff: loopOff) ??
+        _wholeMatch(_withoutLeadingWakeWord(negationStripped), loopOff: loopOff);
     if (m != null) return LocalCloseBlocked('negation', phrase: m.phrase);
-    final contained = _containedPhrase(negationStripped);
+    final contained = _containedPhrase(negationStripped, loopOff: loopOff);
     return contained == null ? null : LocalCloseBlocked('negation', phrase: contained);
   }
   if (words.length <= localCloseMaxWords) {
-    final m = _wholeMatch(words) ?? _wholeMatch(all);
+    final m = _wholeMatch(words, loopOff: loopOff) ?? _wholeMatch(all, loopOff: loopOff);
     if (m != null) return LocalCloseMatch(m.tier, m.phrase);
   }
-  final contained = _containedPhrase(words);
+  final contained = _containedPhrase(words, loopOff: loopOff);
   return contained == null ? null : LocalCloseBlocked('too_long', phrase: contained);
 }
 
@@ -289,10 +316,17 @@ class LocalCloseDecision {
 /// Per-session state: the pending yes/no question, the repeat-block, and
 /// whether a close was already requested (local or Gemini `end_session`).
 class LocalCloseController {
-  LocalCloseController({this.confirmTimeout = localCloseConfirmTimeout, this.repeatBlock = localCloseRepeatBlock});
+  LocalCloseController({
+    this.confirmTimeout = localCloseConfirmTimeout,
+    this.repeatBlock = localCloseRepeatBlock,
+    this.loopOffClose = kLoopOffClose,
+  });
 
   final Duration confirmTimeout;
   final Duration repeatBlock;
+
+  /// Build 182 item C — see [matchLocalClose]'s `loopOff`.
+  final bool loopOffClose;
 
   ({String phrase, DateTime askedAt})? _pending;
   bool _closeRequested = false;
@@ -302,7 +336,7 @@ class LocalCloseController {
   bool get closeRequested => _closeRequested;
 
   LocalCloseDecision decide(String text, {required LocalCloseContext context, required DateTime now}) {
-    final match = matchLocalClose(text);
+    final match = matchLocalClose(text, loopOff: loopOffClose);
     if (_closeRequested) {
       return match is LocalCloseMatch
           ? LocalCloseDecision(LocalCloseDecisionKind.duplicate, phrase: match.phrase, reason: 'close_already_requested')

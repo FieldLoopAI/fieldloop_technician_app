@@ -69,6 +69,9 @@ import '../services/wake_greeting_clip.dart';
 import '../services/b179_flags.dart';
 // Build 180 — items A–E (see each file's doc comment).
 import '../services/b180_flags.dart';
+// Build 182 — items A–C (see b182_flags.dart).
+import '../services/b182_flags.dart';
+import '../services/one_reply_per_utterance.dart';
 import '../services/close_line_playback.dart';
 import '../services/late_finalize.dart';
 import '../services/scripted_reply_clips.dart';
@@ -4638,6 +4641,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _log_(describeSetupFacts(setupMessage));
       _log_(describeB179Flags());
       _log_(describeB180Flags());
+      _log_(describeB182Flags());
       // FIX 1 — one greppable line per session: which end-of-speech setting
       // this run is measuring (see [_serverVadSilenceDurationMs]).
       _log_(
@@ -9665,6 +9669,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (_maybeAnswerPhotoOffer(transcript)) return;
 
     final decision = classifyCommandIntent(transcript);
+    // Build 182 item B — see [isCameraRemark].
+    if (decision.remarkVetoed) _log_('FUZZY REMARK VETO: open_camera text=$transcript');
     _log_(decision.describe(transcript));
     _pipelineLog('intent_layer', '${decision.kind.name}${decision.best == null ? '' : ' best=${decision.best!.trigger}'}');
 
@@ -10321,11 +10327,18 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         (confidence ?? 0) >= _geminiIntentMinConfidence;
     // Either answer means "they want a photo" — the CURRENT state decides
     // which step that is (the camera may have changed while waiting).
-    final trigger = !wantsPhoto
+    var trigger = !wantsPhoto
         ? null
         : (_screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed)
         ? 'capture_photo'
         : (_screenTask == _ScreenTask.none ? 'open_camera' : null);
+    // Build 182 item B — Gemini's "open_camera" for a remark ("That photo
+    // looks good") is not acted on, the same as the fuzzy layer: it falls
+    // through to the weak / catch-all handling below like any "none".
+    if (trigger == 'open_camera' && kFuzzyRemarkVeto && isCameraRemark(check.transcript)) {
+      _log_('FUZZY REMARK VETO: open_camera text=${check.transcript}');
+      trigger = null;
+    }
     if (trigger != null) {
       logOutcome('fired_$trigger');
       if (_fireIntentTrigger(trigger, logLabel: 'GEMINI INTENT CHECK') || _guardFailedReplySpokenThisUtterance) return;
@@ -11096,6 +11109,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         _armPreemptiveDefaultMuteSafetyTimer();
         return;
       }
+      // Build 182 item A — see `one_reply_per_utterance.dart`: already
+      // answered (e.g. the garbled_quick_repeat clip) -> no second line.
+      final oneReply = _oneReplyGuard.onSafetyTimeout(_utteranceSeq);
+      if (oneReply.suppress) {
+        _log_('ONE REPLY: suppressed timeout reply u=$_utteranceSeq (already answered by ${oneReply.answeredBy})');
+        if (oneReply.countUnclear) _countUnclearInput();
+        _clearPreemptiveDefaultMuteSilently('one_reply_per_utterance');
+        return;
+      }
       _log_(
         'PREEMPTIVE DEFAULT MUTE: safety timeout (${_preemptiveDefaultMuteSafetyDelay.inSeconds}s) — nothing '
         'ever resolved this, not even a KB catch-all dispatch, and nothing genuinely in flight either — inviting '
@@ -11112,6 +11134,21 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   DateTime? _lastUnclearInputAt;
   static const Duration _unclearInputStreakWindow = Duration(seconds: 40);
   static const String _unclearInputShortReply = 'Sorry, still not catching that.';
+
+  /// Build 182 item A — see `one_reply_per_utterance.dart`.
+  final OneReplyGuard _oneReplyGuard = OneReplyGuard();
+
+  /// One step of the unclear-input streak — [_respondToUnclearInput]'s own
+  /// counting (unchanged), also used when [_oneReplyGuard] suppresses the
+  /// safety timeout's reply so that utterance still counts once.
+  void _countUnclearInput() {
+    final now = DateTime.now();
+    final last = _lastUnclearInputAt;
+    if (last == null || now.difference(last) > _unclearInputStreakWindow) _unclearInputStreak = 0;
+    _lastUnclearInputAt = now;
+    _unclearInputStreak++;
+    _oneReplyGuard.recordUnclearCounted(_utteranceSeq);
+  }
 
   /// P1 FIX (CONFIRMED: a run of unclear inputs — bad pickup, echo, noise —
   /// got a near-identical full "I didn't catch that, try again" line every
@@ -11130,11 +11167,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
   /// escalation (1st, 2nd, quiet from the 3rd) is the same either way.
   /// Returns whether [reconfirmText] was actually spoken.
   bool _respondToUnclearInput({required String reason, bool clarify = false, String? reconfirmText}) {
-    final now = DateTime.now();
-    final last = _lastUnclearInputAt;
-    if (last == null || now.difference(last) > _unclearInputStreakWindow) _unclearInputStreak = 0;
-    _lastUnclearInputAt = now;
-    _unclearInputStreak++;
+    _countUnclearInput();
     if (reconfirmText != null && _unclearInputStreak <= 2) {
       _log_('UNCLEAR INPUT: reconfirming the best guess (miss #$_unclearInputStreak, reason=$reason)');
       _informGeminiToSpeakVerbatim(reconfirmText, reason: reason);
@@ -15809,6 +15842,10 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     final timesTurn = !isFiller && !(_turnTimingFirstAudioFix && _systemInitiatedReplyLabels.containsKey(reason));
     if (timesTurn) _turnActionDoneAt ??= DateTime.now();
     if (timesTurn) _turnReplyReason ??= reason;
+    // Build 182 item A — this utterance now has its reply (clip or spoken).
+    if (timesTurn && !isResend && reason != 'preemptive_default_mute_timeout') {
+      _oneReplyGuard.recordReply(_utteranceSeq, reason);
+    }
     if (!isFiller && !isResend && _pendingLateTranscript != null) _resolveLateTranscript(reason.replaceAll(' ', '_'));
     if (!isFiller) _clipWaitGeneration++;
     // Build 177 Step 2 — see [_cachedClipWaitForPlayer]: only when a clip
