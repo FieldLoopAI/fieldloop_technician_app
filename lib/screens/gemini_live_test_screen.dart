@@ -75,6 +75,10 @@ import '../services/one_reply_per_utterance.dart';
 // Build 183 — Change A (see b183_flags.dart).
 import '../services/b183_flags.dart';
 import '../services/live_camera_remark_veto.dart';
+// Build 184 — Changes A–D (see b184_flags.dart).
+import '../services/another_one_capture.dart';
+import '../services/b184_flags.dart';
+import '../services/remark_quick_reply.dart';
 import '../services/close_line_playback.dart';
 import '../services/late_finalize.dart';
 import '../services/scripted_reply_clips.dart';
@@ -4646,6 +4650,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _log_(describeB180Flags());
       _log_(describeB182Flags());
       _log_(describeB183Flags());
+      _log_(describeB184Flags());
       // FIX 1 — one greppable line per session: which end-of-speech setting
       // this run is measuring (see [_serverVadSilenceDurationMs]).
       _log_(
@@ -9192,6 +9197,11 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         result: result,
       ),
     );
+    // Build 184 Changes B and C — see [_maybeCaptureBeforeNarration].
+    if (_maybeCaptureBeforeNarration()) {
+      _finalizedCurrentUtterance = true;
+      return;
+    }
     // C13 — before the intent layer, whose Gemini check would otherwise ask
     // "is this 'take the photo'?" about a plain description.
     if (_maybeNoteCameraNarration()) {
@@ -9734,6 +9744,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // Guard/debounce said no after all — the normal handling below
       // (including the context-aware "I didn't catch that" reply) applies.
     }
+    // Build 184 Change A — see [_maybeQuickReplyToRemark].
+    if (_maybeQuickReplyToRemark(transcript, decision)) return;
 
     // C19 fast refusal — see [_offTopicFastRefusal]. Only for an utterance
     // no matcher placed at all (NO MATCH), before the Gemini intent check
@@ -9793,6 +9805,66 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       case IntentDecisionKind.weak:
         _respondToWeakIntentMatch(transcript, decision);
     }
+  }
+
+  /// Build 184 Change A (`remark_quick_reply.dart`) — a remark gets the
+  /// stored "Noted." now: no intent check, no clarification, no KB call,
+  /// no camera action, nothing saved. Same "this utterance has its reply"
+  /// flag the C19 fast refusal sets, so the catch-all stands down.
+  bool _maybeQuickReplyToRemark(String transcript, IntentDecision decision) {
+    if (widget.jobId == null) return false;
+    final path = remarkQuickReplyPath(
+      transcript,
+      enabled: kRemarkQuickReply,
+      cameraLiveArmed: _screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed,
+      cameraClosed: _screenTask == _ScreenTask.none,
+      liveVetoesOn: kLiveCameraRemarkVeto && kLiveRemarkIntentCheckVeto,
+      decision: decision,
+      photoNoteActive: _photoNote != null,
+      expectingQuestion: _expectingQuestionThisUtterance,
+      nonInformationalFiller: _looksLikeNonInformationalFiller(transcript),
+    );
+    if (path == null) return false;
+    _log_("REMARK QUICK REPLY: '$transcript' -> Noted (no question, no KB) path=${path.name}");
+    _pipelineLog('remark_quick_reply', 'path=${path.name}');
+    _guardFailedReplySpokenThisUtterance = true;
+    _informGeminiToSpeakVerbatim(remarkQuickReplyText, reason: remarkQuickReplyReason);
+    return true;
+  }
+
+  /// Build 184 Changes B and C (`another_one_capture.dart`), camera live and
+  /// armed, run just before C13 narration (which would otherwise keep
+  /// "Please take another one now" / "Yes, take another one" as a photo
+  /// note). Both fire capture_photo through its own evaluator (guard,
+  /// negation, debounce, reply unchanged), with no intent-check wait:
+  ///  - B: the whole utterance is an "another one" phrase;
+  ///  - C: a yes-word, then a live-camera capture phrase.
+  /// Anything else: C13 and the intent layer run exactly as before.
+  bool _maybeCaptureBeforeNarration() {
+    if ((!kAnotherOneCapture && !kYesCaptureRouting) || widget.jobId == null || _photoNote != null) return false;
+    if (_screenTask != _ScreenTask.cameraLive || !_cameraOpenConfirmed) return false;
+    if (_utteranceAlreadyResolvedByTrigger || _anyTriggerCommittedThisUtterance || _guardFailedReplySpokenThisUtterance) {
+      return false;
+    }
+    final heard = _deterministicTriggers['get_kb_answer']!.buffer.trim();
+    final phrase = kAnotherOneCapture ? matchAnotherOneCapture(heard) : null;
+    if (phrase != null) {
+      _log_('ANOTHER ONE CAPTURE: phrase="$phrase" heard="$heard" — capture_photo (no intent-check wait)');
+      _pipelineLog('another_one_capture', 'phrase="$phrase"');
+      return _fireIntentTrigger('capture_photo', logLabel: 'ANOTHER ONE CAPTURE') || _guardFailedReplySpokenThisUtterance;
+    }
+    if (!kYesCaptureRouting) return false;
+    final rest = yesCaptureRest(heard);
+    if (rest == null) return false;
+    final via = matchAnyTriggerPhrase(rest, _capturePhotoIndicatorPhrases) != null
+        ? 'phrase_list'
+        : matchWiderCapture(rest) is WiderCaptureMatch
+        ? 'wider_capture'
+        : (kAnotherOneCapture && matchAnotherOneCapture(rest) != null ? 'another_one' : null);
+    if (via == null) return false;
+    _log_('YES CAPTURE ROUTING: heard="$heard" rest="$rest" via=$via — capture_photo instead of C13 narration');
+    _pipelineLog('yes_capture_routing', 'via=$via');
+    return _fireIntentTrigger('capture_photo', logLabel: 'YES CAPTURE ROUTING') || _guardFailedReplySpokenThisUtterance;
   }
 
   /// [_offTopicFastRefusal] — refuses a clearly general-knowledge question
@@ -11823,7 +11895,8 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
 
   // --- Build 179 item B: local close commands (`local_close_command.dart`) --
 
-  final LocalCloseController _localClose = LocalCloseController();
+  // Build 184 Change D — [b184LocalCloseConfirmTimeout] (8 s with the flag off).
+  final LocalCloseController _localClose = LocalCloseController(confirmTimeout: b184LocalCloseConfirmTimeout());
   String _localCloseBuffer = '';
 
   /// This utterance already got a local-close decision (incl. a block) —
@@ -11888,9 +11961,9 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
         _clearAllTriggerBuffersAfterSuccess('local close confirm asked');
         _informGeminiToSpeakVerbatim(localCloseConfirmQuestion, reason: 'local_close_confirm');
         _localCloseConfirmTimer?.cancel();
-        _localCloseConfirmTimer = Timer(localCloseConfirmTimeout, () {
+        _localCloseConfirmTimer = Timer(_localClose.confirmTimeout, () {
           if (_localClose.onConfirmTimeout(DateTime.now())) {
-            _log_('LOCAL CLOSE: timeout — no answer in ${localCloseConfirmTimeout.inSeconds}s, session stays open, nothing said');
+            _log_('LOCAL CLOSE: timeout — no answer in ${_localClose.confirmTimeout.inSeconds}s, session stays open, nothing said');
           }
         });
         return;
