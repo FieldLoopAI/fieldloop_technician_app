@@ -72,6 +72,9 @@ import '../services/b180_flags.dart';
 // Build 182 — items A–C (see b182_flags.dart).
 import '../services/b182_flags.dart';
 import '../services/one_reply_per_utterance.dart';
+// Build 183 — Change A (see b183_flags.dart).
+import '../services/b183_flags.dart';
+import '../services/live_camera_remark_veto.dart';
 import '../services/close_line_playback.dart';
 import '../services/late_finalize.dart';
 import '../services/scripted_reply_clips.dart';
@@ -4642,6 +4645,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _log_(describeB179Flags());
       _log_(describeB180Flags());
       _log_(describeB182Flags());
+      _log_(describeB183Flags());
       // FIX 1 — one greppable line per session: which end-of-speech setting
       // this run is measuring (see [_serverVadSilenceDurationMs]).
       _log_(
@@ -9701,9 +9705,19 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // keep/retake, the note question), and never over a confident match to
     // something other than the camera.
     final otherConfidentTrigger = decision.kind == IntentDecisionKind.confident && decision.best!.trigger != 'open_camera';
-    final liveNoun = _screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed && !otherConfidentTrigger
+    var liveNoun = _screenTask == _ScreenTask.cameraLive && _cameraOpenConfirmed && !otherConfidentTrigger
         ? liveCameraShotNoun(transcript)
         : null;
+    // Build 183 Change A — see `live_camera_remark_veto.dart`: "I like the
+    // photo." is a remark, not a shutter command. Normal handling below.
+    if (liveNoun != null && kLiveCameraRemarkVeto && isLiveCameraRemark(transcript)) {
+      _log_(
+        "LIVE REMARK VETO: '$transcript' score=${(decision.best?.confidence ?? 0).toStringAsFixed(2)} "
+        'noun=$liveNoun opinion=${liveCameraRemarkWord(transcript)} -> no capture',
+      );
+      _pipelineLog('intent_layer', 'live_remark_veto noun=$liveNoun');
+      liveNoun = null;
+    }
     if (liveNoun != null) {
       _log_(
         'FUZZY LIVE-CAMERA MATCH: "$liveNoun" in "$transcript" with the camera live and armed — firing capture_photo '
@@ -10337,6 +10351,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     // through to the weak / catch-all handling below like any "none".
     if (trigger == 'open_camera' && kFuzzyRemarkVeto && isCameraRemark(check.transcript)) {
       _log_('FUZZY REMARK VETO: open_camera text=${check.transcript}');
+      trigger = null;
+    }
+    // Build 183 Change A — the same live-camera remark rule for Gemini's
+    // "capture_photo" ("That looks good" has no shutter noun of its own).
+    if (trigger == 'capture_photo' && kLiveRemarkIntentCheckVeto && isLiveCameraRemark(check.transcript)) {
+      _log_(
+        "LIVE REMARK VETO: '${check.transcript}' score=${confidence?.toStringAsFixed(2) ?? 'none'} "
+        'source=gemini_intent_check opinion=${liveCameraRemarkWord(check.transcript)} -> no capture',
+      );
       trigger = null;
     }
     if (trigger != null) {
