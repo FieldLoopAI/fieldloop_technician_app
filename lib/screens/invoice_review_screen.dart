@@ -56,28 +56,52 @@ class InvoiceReviewScreen extends ConsumerStatefulWidget {
     this.generateInvoice = generateInvoicePdf,
     this.sendSms = sendInvoiceSms,
     this.fetchPaymentStatus = fetchLatestInvoicePayment,
+    this.addAdjustmentRow = addInvoiceAdjustment,
+    this.deleteAdjustmentRow = deleteInvoiceAdjustment,
+    this.fetchPreview = fetchInvoicePreview,
   });
 
   final String jobId;
   final InvoicePreview preview;
 
   /// The backend calls, defaulting to the real ones — overridable only so
-  /// test/b185 can drive generation/SMS outcomes without a network.
+  /// test/b185 can drive generation/SMS/adjustment outcomes without a network.
   final Future<GeneratedInvoice> Function({required String jobId}) generateInvoice;
   final Future<void> Function({required String invoiceId, required String pdfUrl}) sendSms;
   final Future<LatestInvoicePayment?> Function(String jobId) fetchPaymentStatus;
+  final Future<Object?> Function({required String jobId, required String description, required double amount})
+  addAdjustmentRow;
+  final Future<void> Function(String adjustmentId) deleteAdjustmentRow;
+  final Future<InvoicePreview> Function({required String jobId}) fetchPreview;
 
   @override
   ConsumerState<InvoiceReviewScreen> createState() => _InvoiceReviewScreenState();
 }
 
+/// The adjustment handlers, reachable from test/b185 so their own payment
+/// re-check can be exercised without going through the (disabled) controls.
+@visibleForTesting
+abstract interface class InvoiceAdjustmentActions {
+  Future<void> addAdjustment();
+  Future<void> removeAdjustment(InvoiceAdjustment adjustment);
+}
+
+/// Shown when an adjustment write is refused because the invoice is frozen.
+const String kInvoiceLockedMessage = 'Invoice is locked - payment is pending or paid';
+
 class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
-    with SafeRefDisposal<InvoiceReviewScreen>, VoiceCommandRegistrarMixin<InvoiceReviewScreen>, WidgetsBindingObserver {
+    with SafeRefDisposal<InvoiceReviewScreen>, VoiceCommandRegistrarMixin<InvoiceReviewScreen>, WidgetsBindingObserver
+    implements InvoiceAdjustmentActions {
   // BUILD 185 — Stripe test-mode payments (all behind [kStripePayments]).
   // [_invoiceId] is the invoice this screen generated, or the job's latest
   // invoice when it was already pending/paid on open.
   String? _invoiceId;
   InvoicePaymentStatus? _paymentStatus;
+  // The job's latest invoice status, whichever invoice that is (unpaid when
+  // there is none), and whether it has been read yet. Adjustments stay
+  // locked until it has.
+  InvoicePaymentStatus? _latestStatus;
+  PaymentStatusLoad _statusLoad = kStripePayments ? PaymentStatusLoad.loading : PaymentStatusLoad.loaded;
   bool _startingPayment = false;
   String? _paymentError;
   bool _awaitingCheckoutReturn = false;
@@ -144,22 +168,85 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
   /// when it isn't this screen's invoice, nothing here changes.
   Future<void> _refreshPaymentStatus({bool adoptFrozenInvoice = false}) async {
     try {
-      final latest = await widget.fetchPaymentStatus(widget.jobId);
-      if (!mounted || latest == null) return;
-      if (_invoiceId == null) {
-        if (!adoptFrozenInvoice || !isInvoicePaymentFrozen(latest.status)) return;
-        setState(() => _invoiceId = latest.id);
-      }
-      if (latest.id != _invoiceId) return;
-      if (latest.status != _paymentStatus) {
-        debugPrint('PAYMENT: invoice ${latest.id} status ${_paymentStatus?.name} -> ${latest.status.name}');
-        setState(() => _paymentStatus = latest.status);
-        ref.invalidate(latestInvoicePaymentProvider(widget.jobId));
-      }
-      if (latest.status == InvoicePaymentStatus.paid) _stopPaymentPoll('paid');
+      _applyLatestPayment(await widget.fetchPaymentStatus(widget.jobId), adoptFrozenInvoice: adoptFrozenInvoice);
     } catch (e) {
       debugPrint('PAYMENT: status re-read failed for job ${widget.jobId} ($e)');
+      if (mounted && _statusLoad != PaymentStatusLoad.loaded) setState(() => _statusLoad = PaymentStatusLoad.failed);
     }
+  }
+
+  /// Records the job's latest invoice status (unpaid when there is none) for
+  /// the adjustments lock, then follows this screen's own invoice.
+  void _applyLatestPayment(LatestInvoicePayment? latest, {bool adoptFrozenInvoice = false}) {
+    if (!mounted) return;
+    final latestStatus = latest?.status ?? InvoicePaymentStatus.unpaid;
+    if (_statusLoad != PaymentStatusLoad.loaded || latestStatus != _latestStatus) {
+      setState(() {
+        _statusLoad = PaymentStatusLoad.loaded;
+        _latestStatus = latestStatus;
+      });
+    }
+    if (latest == null) return;
+    if (_invoiceId == null) {
+      if (!adoptFrozenInvoice || !isInvoicePaymentFrozen(latest.status)) return;
+      setState(() => _invoiceId = latest.id);
+    }
+    if (latest.id != _invoiceId) return;
+    if (latest.status != _paymentStatus) {
+      debugPrint('PAYMENT: invoice ${latest.id} status ${_paymentStatus?.name} -> ${latest.status.name}');
+      setState(() => _paymentStatus = latest.status);
+      ref.invalidate(latestInvoicePaymentProvider(widget.jobId));
+    }
+    if (latest.status == InvoicePaymentStatus.paid) _stopPaymentPoll('paid');
+  }
+
+  /// The status that decides the adjustments lock: frozen if either this
+  /// screen's invoice or the job's latest invoice is pending/paid.
+  InvoicePaymentStatus? get _lockStatus =>
+      isInvoicePaymentFrozen(_paymentStatus) ? _paymentStatus : (_latestStatus ?? _paymentStatus);
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.maybeOf(context)
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// The handlers' own check before any write that changes the invoice
+  /// amount — independent of whether the control that called them was
+  /// enabled. Refuses on the local state first, then re-reads the latest
+  /// invoice's status so a payment started elsewhere is caught too.
+  Future<bool> _invoiceWritable({required bool recheckServer}) async {
+    if (!kStripePayments) return true;
+    if (isInvoicePaymentFrozen(_lockStatus)) {
+      debugPrint('PAYMENT: adjustment refused for job ${widget.jobId} (status ${_lockStatus?.name})');
+      _showMessage(kInvoiceLockedMessage);
+      return false;
+    }
+    if (_statusLoad != PaymentStatusLoad.loaded) {
+      debugPrint('PAYMENT: adjustment refused for job ${widget.jobId} (payment status ${_statusLoad.name})');
+      _showMessage("Couldn't confirm the payment status - try again");
+      return false;
+    }
+    if (!recheckServer) return true;
+    try {
+      _applyLatestPayment(await widget.fetchPaymentStatus(widget.jobId), adoptFrozenInvoice: true);
+    } catch (e) {
+      debugPrint('PAYMENT: adjustment refused for job ${widget.jobId} (status re-check failed: $e)');
+      if (mounted) _showMessage("Couldn't confirm the payment status - try again");
+      return false;
+    }
+    if (!mounted) return false;
+    if (isInvoicePaymentFrozen(_lockStatus)) {
+      debugPrint('PAYMENT: adjustment refused for job ${widget.jobId} (status ${_lockStatus?.name})');
+      _showMessage(kInvoiceLockedMessage);
+      return false;
+    }
+    return true;
+  }
+
+  void _retryPaymentStatus() {
+    setState(() => _statusLoad = PaymentStatusLoad.loading);
+    unawaited(_refreshPaymentStatus(adoptFrozenInvoice: true));
   }
 
   void _startPaymentPoll() {
@@ -233,11 +320,15 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
       _preview.adjustments.isNotEmpty;
 
   Future<void> _refreshPreview() async {
-    final fresh = await fetchInvoicePreview(jobId: widget.jobId);
+    final fresh = await widget.fetchPreview(jobId: widget.jobId);
     if (mounted) setState(() => _preview = fresh);
   }
 
-  Future<void> _addAdjustment() async {
+  /// Checked before the sheet opens, and again (against the server) after
+  /// it closes — the status may have changed while it was open.
+  @override
+  Future<void> addAdjustment() async {
+    if (!await _invoiceWritable(recheckServer: false) || !mounted) return;
     final added = await showModalBottomSheet<_NewAdjustment>(
       context: context,
       isScrollControlled: true,
@@ -246,13 +337,16 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
       builder: (_) => _AddAdjustmentSheet(currentTotal: _preview.grossTotal),
     );
     if (added == null || !mounted) return;
+    if (!await _invoiceWritable(recheckServer: true)) return;
     await _runAdjustmentChange(
-      () => addInvoiceAdjustment(jobId: widget.jobId, description: added.description, amount: added.amount),
+      () => widget.addAdjustmentRow(jobId: widget.jobId, description: added.description, amount: added.amount),
     );
   }
 
-  Future<void> _removeAdjustment(InvoiceAdjustment adjustment) async {
-    await _runAdjustmentChange(() => deleteInvoiceAdjustment(adjustment.id));
+  @override
+  Future<void> removeAdjustment(InvoiceAdjustment adjustment) async {
+    if (!await _invoiceWritable(recheckServer: true)) return;
+    await _runAdjustmentChange(() => widget.deleteAdjustmentRow(adjustment.id));
   }
 
   Future<void> _runAdjustmentChange(Future<Object?> Function() change) async {
@@ -282,6 +376,11 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
       !_preview.estimateApproved || _preview.pendingChangeOrders.isNotEmpty;
 
   Future<void> _onGeneratePressed() async {
+    // B185: a frozen invoice can't be regenerated (the backend refuses too).
+    if (kStripePayments && isInvoicePaymentFrozen(_lockStatus)) {
+      _showMessage(kInvoiceLockedMessage);
+      return;
+    }
     if (!_needsExtraConfirmation) {
       await _generateAndSend();
       return;
@@ -420,11 +519,14 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
                     // Pops back to Job Detail — both the Estimate and Change
                     // Orders tabs (and their full screens) live there; this
                     // screen deliberately offers no in-place editing of its
-                    // own (see the class doc comment).
-                    child: TextButton(
-                      onPressed: () => Navigator.of(context).pop(),
-                      child: const Text('Fix something first'),
-                    ),
+                    // own (see the class doc comment). B185: hidden once the
+                    // invoice is pending/paid — nothing left to fix.
+                    child: showFixSomethingFirst(enabled: kStripePayments, status: _lockStatus)
+                        ? TextButton(
+                            onPressed: () => Navigator.of(context).pop(),
+                            child: const Text('Fix something first'),
+                          )
+                        : const SizedBox.shrink(),
                   ),
                   const SizedBox(height: 12),
                   if (_error != null) ...[
@@ -534,8 +636,10 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
       sent: _sent,
       generating: _generating,
       updatingAdjustments: _updatingAdjustments,
-      status: _paymentStatus,
+      status: _lockStatus,
+      load: _statusLoad,
     );
+    final frozen = kStripePayments && isInvoicePaymentFrozen(_lockStatus);
     return _card(
       Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -584,10 +688,12 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
                       ),
                     ),
                     IconButton(
-                      onPressed: locked ? null : () => _removeAdjustment(adjustment),
+                      onPressed: locked ? null : () => removeAdjustment(adjustment),
                       tooltip: 'Remove',
                       visualDensity: VisualDensity.compact,
-                      icon: const Icon(Icons.close_rounded, size: 18, color: AppColors.neutralGrey),
+                      color: AppColors.neutralGrey,
+                      disabledColor: AppColors.borderGrey,
+                      icon: const Icon(Icons.close_rounded, size: 18),
                     ),
                   ],
                 ),
@@ -596,14 +702,37 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
             const SizedBox(height: 8),
             Text(_adjustmentError!, style: const TextStyle(color: AppColors.error, fontSize: 12.5)),
           ],
+          if (frozen) ...[
+            const SizedBox(height: 8),
+            const Text(kInvoiceLockedMessage, style: TextStyle(fontSize: 12.5, color: AppColors.neutralGrey)),
+          ] else if (kStripePayments && _statusLoad == PaymentStatusLoad.loading) ...[
+            const SizedBox(height: 8),
+            const Text('Checking payment status…', style: TextStyle(fontSize: 12.5, color: AppColors.neutralGrey)),
+          ] else if (kStripePayments && _statusLoad == PaymentStatusLoad.failed) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    "Couldn't check the payment status.",
+                    style: TextStyle(fontSize: 12.5, color: AppColors.error),
+                  ),
+                ),
+                TextButton(onPressed: _retryPaymentStatus, child: const Text('Retry')),
+              ],
+            ),
+          ],
           const SizedBox(height: 8),
           Align(
             alignment: Alignment.centerLeft,
             child: TextButton.icon(
-              onPressed: locked ? null : _addAdjustment,
+              onPressed: locked ? null : addAdjustment,
               icon: const Icon(Icons.add_rounded, size: 18),
               label: const Text('Add Line Item'),
-              style: TextButton.styleFrom(foregroundColor: AppColors.primaryGreenDark),
+              style: TextButton.styleFrom(
+                foregroundColor: AppColors.primaryGreenDark,
+                disabledForegroundColor: AppColors.borderGrey,
+              ),
             ),
           ),
         ],

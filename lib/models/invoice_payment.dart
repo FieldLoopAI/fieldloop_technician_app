@@ -77,16 +77,30 @@ bool showCollectPaymentButton({
 }) =>
     enabled && invoiceId != null && status != InvoicePaymentStatus.paid;
 
-/// The existing adjustments lock (sent / generating / updating), plus a
-/// frozen payment when the flag is on.
+/// Where Invoice Review's read of `/invoices/payment-status` stands. Until
+/// it has [loaded], the screen can't know whether the invoice is frozen.
+enum PaymentStatusLoad { loading, loaded, failed }
+
+/// The existing adjustments lock (sent / generating / updating), plus, when
+/// the flag is on, a frozen payment or a payment status that hasn't loaded
+/// (still loading, or the read failed). No invoice yet loads as unpaid.
 bool adjustmentsLocked({
   required bool enabled,
   required bool sent,
   required bool generating,
   required bool updatingAdjustments,
   required InvoicePaymentStatus? status,
+  PaymentStatusLoad load = PaymentStatusLoad.loaded,
 }) =>
-    sent || generating || updatingAdjustments || (enabled && isInvoicePaymentFrozen(status));
+    sent ||
+    generating ||
+    updatingAdjustments ||
+    (enabled && (load != PaymentStatusLoad.loaded || isInvoicePaymentFrozen(status)));
+
+/// "Fix something first" (pop back to Job Detail to edit) is hidden once the
+/// invoice is frozen — there is nothing left to fix before sending.
+bool showFixSomethingFirst({required bool enabled, required InvoicePaymentStatus? status}) =>
+    !(enabled && isInvoicePaymentFrozen(status));
 
 /// The "Internal only" fee/net box is hidden while the homeowner may be
 /// holding the tablet (pending or paid).
