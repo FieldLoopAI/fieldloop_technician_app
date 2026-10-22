@@ -2,7 +2,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const Stripe = require('stripe');
 const { fakeSupabase } = require('./fake_supabase');
-const { _handle: handle, _headerValue: headerValue } = require('../index');
+const {
+  _handle: handle, _headerValue: headerValue, _normalizeWebhookSecret: normalizeWebhookSecret, _signatureDiagnostic: signatureDiagnostic,
+} = require('../index');
 
 // Offline only: constructEvent / generateTestHeaderString never call Stripe.
 // Both values are dummy fixtures, not real credentials.
@@ -42,8 +44,20 @@ function signed(payload, { secret = WEBHOOK_SECRET, base64 = false, headerName =
   return event;
 }
 
-function deps(db) {
-  return { getSupabaseClient: async () => db, getStripe: async () => ({ stripe, webhookSecret: WEBHOOK_SECRET }) };
+function deps(db, webhookSecret = WEBHOOK_SECRET) {
+  return { getSupabaseClient: async () => db, getStripe: async () => ({ stripe, webhookSecret }) };
+}
+
+async function captureLogs(fn) {
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  try {
+    await fn();
+  } finally {
+    console.log = original;
+  }
+  return lines;
 }
 
 const paidSession = { id: 'cs_test_abc', payment_status: 'paid', amount_total: 361900, payment_intent: 'pi_test_xyz123' };
@@ -204,4 +218,71 @@ test('DB failure on the dedupe insert -> 500', async () => {
   const res = await handle(signed(stripeEvent('checkout.session.completed', paidSession)), deps(db));
   assert.equal(res.statusCode, 500);
   assert.equal(db.tables.invoices[0].payment_status, 'pending');
+});
+
+test('secret normalization: whitespace and surrounding quotes are removed', () => {
+  const variants = [
+    WEBHOOK_SECRET, ` ${WEBHOOK_SECRET} `, `${WEBHOOK_SECRET}\n`, `"${WEBHOOK_SECRET}"`,
+    `'${WEBHOOK_SECRET}'`, ` "${WEBHOOK_SECRET}"\r\n`, `\t'${WEBHOOK_SECRET}' `,
+  ];
+  variants.forEach((raw, i) => assert.equal(normalizeWebhookSecret(raw), WEBHOOK_SECRET, `variant ${i}`));
+  assert.equal(normalizeWebhookSecret(null), '');
+  assert.equal(normalizeWebhookSecret(' "" '), '');
+});
+
+for (const [label, stored] of [
+  ['quoted', `"${WEBHOOK_SECRET}"`],
+  ['padded', `  ${WEBHOOK_SECRET}\n`],
+  ['quoted+padded', ` '${WEBHOOK_SECRET}' `],
+]) {
+  test(`a ${label} stored secret still verifies and marks paid`, async () => {
+    const db = fakeSupabase(seed());
+    const res = await handle(signed(stripeEvent('checkout.session.completed', paidSession)), deps(db, stored));
+    assert.equal(res.statusCode, 200);
+    assert.equal(db.tables.invoices[0].payment_status, 'paid');
+  });
+}
+
+test('a secret that is only quotes/whitespace counts as missing (500, nothing written)', async () => {
+  const db = fakeSupabase(seed());
+  const res = await handle(signed(stripeEvent('checkout.session.completed', paidSession)), deps(db, ' "" '));
+  assert.equal(res.statusCode, 500);
+  assert.equal(db.calls.length, 0);
+});
+
+test('bad signature: 400, plus one diagnostic line with no secret or signature text', async () => {
+  const db = fakeSupabase(seed());
+  const event = signed(stripeEvent('checkout.session.completed', paidSession), { secret: 'whsec_other_fixture' });
+  const bodyBytes = Buffer.byteLength(event.body);
+  let res;
+  const lines = await captureLogs(async () => { res = await handle(event, deps(db)); });
+  assert.equal(res.statusCode, 400);
+  assert.equal(JSON.parse(res.body).error, 'Bad signature');
+  assert.equal(db.calls.length, 0);
+  const diag = lines.filter(l => l.includes('bad signature diag'));
+  assert.deepEqual(diag, [
+    `STRIPE WEBHOOK: bad signature diag secretStartsWithWhsec=true secretLength=${WEBHOOK_SECRET.length} bodyBytes=${bodyBytes}`,
+  ]);
+  const all = lines.join('\n');
+  assert.equal(all.includes(WEBHOOK_SECRET), false);
+  assert.equal(all.includes(WEBHOOK_SECRET.slice(6)), false);
+  assert.equal(all.includes(event.headers['stripe-signature']), false);
+  assert.equal(/v1=[0-9a-f]{16,}/.test(all), false);
+});
+
+test('diagnostic reports a non-whsec secret and the body size without any content', () => {
+  const line = signatureDiagnostic('sk_test_wrong_kind_fixture', Buffer.from('{"a":1}'));
+  assert.equal(line, 'STRIPE WEBHOOK: bad signature diag secretStartsWithWhsec=false secretLength=26 bodyBytes=7');
+  assert.equal(line.includes('sk_test'), false);
+});
+
+test('missing signature still returns 400 "Missing signature" with no diagnostics', async () => {
+  const db = fakeSupabase(seed());
+  const event = signed(stripeEvent('checkout.session.completed', paidSession));
+  event.headers = {};
+  let res;
+  const lines = await captureLogs(async () => { res = await handle(event, deps(db)); });
+  assert.equal(res.statusCode, 400);
+  assert.equal(JSON.parse(res.body).error, 'Missing signature');
+  assert.equal(lines.some(l => l.includes('diag')), false);
 });

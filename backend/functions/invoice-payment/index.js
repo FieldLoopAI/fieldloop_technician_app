@@ -32,8 +32,33 @@ function routeOf(event) {
   return { method, path };
 }
 
-function returnBase() {
-  return process.env.STRIPE_RETURN_BASE || DEFAULT_RETURN_BASE;
+const RETURN_PATH = '/stripe/return';
+
+// The return page URL, from STRIPE_RETURN_BASE (or the default). Accepts the
+// API stage base (".../dev") or the full page (".../dev/stripe/return"),
+// with or without a trailing slash: "/stripe/return" is appended when it's
+// missing. Any query string on the base is kept; a fragment is dropped. An
+// unparseable value falls back to the default.
+function returnBase(configured = process.env.STRIPE_RETURN_BASE) {
+  let url;
+  try {
+    url = new URL(String(configured || DEFAULT_RETURN_BASE).trim());
+  } catch (_) {
+    console.log('CHECKOUT: STRIPE_RETURN_BASE is not a valid URL — using the default');
+    url = new URL(DEFAULT_RETURN_BASE);
+  }
+  let path = url.pathname.replace(/\/+$/, '');
+  if (!path.endsWith(RETURN_PATH)) path += RETURN_PATH;
+  url.pathname = path;
+  url.hash = '';
+  return url;
+}
+
+// success_url / cancel_url: the return page with ?status=<status>.
+function returnUrl(status, configured) {
+  const url = returnBase(configured);
+  url.searchParams.set('status', status);
+  return url.toString();
 }
 
 function returnPage() {
@@ -123,6 +148,7 @@ async function createCheckout(event, deps) {
 
   const attempt = Number(invoice.checkout_attempts) || 0;
   const base = returnBase();
+  console.log(`CHECKOUT: returnUrl=${base.host}${base.pathname}`);
   const session = await stripe.checkout.sessions.create({
     // No payment_method_types: API 2026-09-30.endive rejects it; payment
     // methods come from the Stripe Dashboard settings (card only).
@@ -143,8 +169,8 @@ async function createCheckout(event, deps) {
     metadata: { invoice_id: invoice.id, job_id: job.id },
     client_reference_id: invoice.id,
     expires_at: Math.floor(Date.now() / 1000) + CHECKOUT_TTL_SECONDS,
-    success_url: `${base}?status=success`,
-    cancel_url: `${base}?status=cancel`,
+    success_url: returnUrl('success'),
+    cancel_url: returnUrl('cancel'),
   }, { idempotencyKey: `invoice_${invoice.id}_${attempt}` });
 
   const { data: updated, error: updateErr } = await supabase
@@ -201,3 +227,4 @@ async function handle(event, deps) {
 exports.handler = (event) => handle(event, { requireTechnician, getSupabaseClient, getStripe });
 exports._handle = handle;
 exports._routeOf = routeOf;
+exports._returnUrl = returnUrl;

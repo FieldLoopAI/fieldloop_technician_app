@@ -89,17 +89,34 @@ async function processEvent(supabase, stripeEvent) {
   return 'ignored';
 }
 
+// The stored signing secret without surrounding whitespace or quotes
+// (a pasted value like ' "whsec_..." ' would never verify).
+function normalizeWebhookSecret(raw) {
+  if (raw === null || raw === undefined) return '';
+  return String(raw).trim().replace(/^["']+|["']+$/g, '').trim();
+}
+
+// Bad-signature diagnostics with no secret material: prefix check, length,
+// and the raw body size only.
+function signatureDiagnostic(secret, rawBody) {
+  return `STRIPE WEBHOOK: bad signature diag secretStartsWithWhsec=${secret.startsWith('whsec_')} `
+    + `secretLength=${secret.length} bodyBytes=${rawBody.length}`;
+}
+
 async function handle(event, deps) {
   let stripeEvent;
   try {
-    const { stripe, webhookSecret } = await deps.getStripe();
+    const { stripe, webhookSecret: storedSecret } = await deps.getStripe();
+    const webhookSecret = normalizeWebhookSecret(storedSecret);
     if (!webhookSecret) throw new Error('webhookSecret missing from the Stripe secret');
     const signature = headerValue(event, 'stripe-signature');
     if (!signature) return reply(400, { error: 'Missing signature' });
+    const rawBody = rawBodyOf(event);
     try {
-      stripeEvent = stripe.webhooks.constructEvent(rawBodyOf(event), signature, webhookSecret);
+      stripeEvent = stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
     } catch (err) {
       console.log('STRIPE WEBHOOK: bad signature');
+      console.log(signatureDiagnostic(webhookSecret, rawBody));
       return reply(400, { error: 'Bad signature' });
     }
   } catch (err) {
@@ -140,3 +157,5 @@ async function handle(event, deps) {
 exports.handler = (event) => handle(event, { getSupabaseClient, getStripe });
 exports._handle = handle;
 exports._headerValue = headerValue;
+exports._normalizeWebhookSecret = normalizeWebhookSecret;
+exports._signatureDiagnostic = signatureDiagnostic;

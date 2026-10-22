@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fakeSupabase } = require('./fake_supabase');
-const { _handle: handle, _routeOf: routeOf } = require('../index');
+const { _handle: handle, _routeOf: routeOf, _returnUrl: returnUrl } = require('../index');
 
 const JOB_ID = '13be2358-5296-4d94-9a58-9d1662ac4902';
 const TECH = { id: 'tech-1', contractor_id: 'contractor-1', full_name: 'Demo Tech' };
@@ -113,15 +113,53 @@ test('payment_method_types is never sent to Stripe (rejected by API 2026-09-30.e
   assert.equal(s.created.length, 2);
 });
 
-test('STRIPE_RETURN_BASE overrides the return URL base', async () => {
+test('STRIPE_RETURN_BASE overrides the return URL host and path prefix', async () => {
   process.env.STRIPE_RETURN_BASE = 'https://example.test/return';
   try {
     const s = fakeStripe();
     await handle(checkoutEvent('inv-1'), deps(fakeSupabase(seed()), s));
-    assert.equal(s.created[0].params.success_url, 'https://example.test/return?status=success');
+    assert.equal(s.created[0].params.success_url, 'https://example.test/return/stripe/return?status=success');
   } finally {
     delete process.env.STRIPE_RETURN_BASE;
   }
+});
+
+const STAGE = 'https://tqb5mpwlpf.execute-api.us-east-1.amazonaws.com/dev';
+const PAGE = `${STAGE}/stripe/return`;
+
+test('return URL: stage base, full page, trailing slashes and default all give the same URLs', () => {
+  for (const base of [STAGE, `${STAGE}/`, `${STAGE}//`, PAGE, `${PAGE}/`, ` ${STAGE} `, undefined, '']) {
+    assert.equal(returnUrl('success', base), `${PAGE}?status=success`, String(base));
+    assert.equal(returnUrl('cancel', base), `${PAGE}?status=cancel`, String(base));
+  }
+});
+
+test('return URL: a query string on the base is kept and status is set once', () => {
+  assert.equal(returnUrl('success', `${STAGE}?src=app`), `${PAGE}?src=app&status=success`);
+  assert.equal(returnUrl('cancel', `${PAGE}/?status=old`), `${PAGE}?status=cancel`);
+  assert.equal(returnUrl('success', `${STAGE}#frag`), `${PAGE}?status=success`);
+});
+
+test('return URL: an unparseable base falls back to the default page', () => {
+  assert.equal(returnUrl('success', 'not a url'), `${PAGE}?status=success`);
+});
+
+test('deployed env form (stage base, no /stripe/return) builds the Thank-you page URLs and logs host+path only', async () => {
+  process.env.STRIPE_RETURN_BASE = STAGE;
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  try {
+    const s = fakeStripe();
+    await handle(checkoutEvent('inv-1'), deps(fakeSupabase(seed()), s));
+    assert.equal(s.created[0].params.success_url, `${PAGE}?status=success`);
+    assert.equal(s.created[0].params.cancel_url, `${PAGE}?status=cancel`);
+  } finally {
+    console.log = original;
+    delete process.env.STRIPE_RETURN_BASE;
+  }
+  const logged = lines.filter(l => l.startsWith('CHECKOUT: returnUrl='));
+  assert.deepEqual(logged, ['CHECKOUT: returnUrl=tqb5mpwlpf.execute-api.us-east-1.amazonaws.com/dev/stripe/return']);
 });
 
 test('checkout refuses a technician who is not the job lead (403), no session', async () => {
