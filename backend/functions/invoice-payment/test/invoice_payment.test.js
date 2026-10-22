@@ -76,7 +76,7 @@ test('checkout creates a destination-charge session with the stored amounts', as
 
   const { params, opts } = s.created[0];
   assert.equal(params.mode, 'payment');
-  assert.deepEqual(params.payment_method_types, ['card']);
+  assert.equal('payment_method_types' in params, false);
   assert.equal(params.line_items[0].price_data.currency, 'usd');
   assert.equal(params.line_items[0].price_data.unit_amount, 361900);
   assert.equal(params.line_items[0].price_data.product_data.name, 'Invoice INV-12345678 - FL-1BA500');
@@ -98,6 +98,19 @@ test('checkout creates a destination-charge session with the stored amounts', as
   assert.equal(inv.application_fee_cents, 7057);
   assert.equal(inv.checkout_attempts, 1);
   assert.ok(inv.payment_initiated_at);
+});
+
+test('payment_method_types is never sent to Stripe (rejected by API 2026-09-30.endive)', async () => {
+  const s = fakeStripe({ retrieveStatus: 'expired' });
+  // Both the first session and a replacement for an expired one.
+  await handle(checkoutEvent('inv-1'), deps(fakeSupabase(seed()), s));
+  await handle(checkoutEvent('inv-1'),
+    deps(fakeSupabase(seed({ payment_status: 'pending', stripe_checkout_session_id: 'cs_test_old', checkout_attempts: 1 })), s));
+  for (const { params } of s.created) {
+    assert.equal(Object.prototype.hasOwnProperty.call(params, 'payment_method_types'), false);
+    assert.equal(JSON.stringify(params).includes('payment_method_types'), false);
+  }
+  assert.equal(s.created.length, 2);
 });
 
 test('STRIPE_RETURN_BASE overrides the return URL base', async () => {

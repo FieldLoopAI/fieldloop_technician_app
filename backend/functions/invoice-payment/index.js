@@ -124,8 +124,9 @@ async function createCheckout(event, deps) {
   const attempt = Number(invoice.checkout_attempts) || 0;
   const base = returnBase();
   const session = await stripe.checkout.sessions.create({
+    // No payment_method_types: API 2026-09-30.endive rejects it; payment
+    // methods come from the Stripe Dashboard settings (card only).
     mode: 'payment',
-    payment_method_types: ['card'],
     line_items: [{
       price_data: {
         currency: 'usd',
