@@ -59,6 +59,31 @@ test('valid signature + completed + matching amount marks the invoice paid', asy
   assert.deepEqual(db.tables.stripe_events.map(e => e.id), ['evt_test_1']);
 });
 
+test('legacy paid_ts and stripe_payment_intent_ref mirror paid_at and stripe_payment_intent_id', async () => {
+  const db = fakeSupabase(seed());
+  await handle(signed(stripeEvent('checkout.session.completed', paidSession)), deps(db));
+  const inv = db.tables.invoices[0];
+  assert.ok(inv.paid_at);
+  assert.equal(inv.paid_ts, inv.paid_at);
+  assert.equal(inv.stripe_payment_intent_ref, 'pi_test_xyz123');
+  assert.equal(inv.stripe_payment_intent_ref, inv.stripe_payment_intent_id);
+});
+
+test('expanded payment_intent object: both intent columns get its id', async () => {
+  const db = fakeSupabase(seed());
+  await handle(signed(stripeEvent('checkout.session.completed', { ...paidSession, payment_intent: { id: 'pi_test_obj999' } })), deps(db));
+  const inv = db.tables.invoices[0];
+  assert.equal(inv.stripe_payment_intent_id, 'pi_test_obj999');
+  assert.equal(inv.stripe_payment_intent_ref, 'pi_test_obj999');
+});
+
+test('legacy columns stay untouched on an amount mismatch', async () => {
+  const db = fakeSupabase(seed({ paid_ts: null, stripe_payment_intent_ref: null }));
+  await handle(signed(stripeEvent('checkout.session.completed', { ...paidSession, amount_total: 1 })), deps(db));
+  assert.equal(db.tables.invoices[0].paid_ts, null);
+  assert.equal(db.tables.invoices[0].stripe_payment_intent_ref, null);
+});
+
 test('jobs.status is never written', async () => {
   const db = fakeSupabase(seed());
   await handle(signed(stripeEvent('checkout.session.completed', paidSession)), deps(db));

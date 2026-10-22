@@ -47,11 +47,15 @@ async function markPaid(supabase, session) {
   const paymentIntentId = typeof session.payment_intent === 'string'
     ? session.payment_intent
     : session.payment_intent?.id || null;
+  const paidAt = new Date().toISOString();
   const { error: updateErr } = await supabase
     .from('invoices').update({
       payment_status: 'paid',
-      paid_at: new Date().toISOString(),
+      paid_at: paidAt,
       stripe_payment_intent_id: paymentIntentId,
+      // Legacy columns already on invoices, kept in step with the new ones.
+      paid_ts: paidAt,
+      stripe_payment_intent_ref: paymentIntentId,
     })
     .eq('id', invoice.id)
     .neq('payment_status', 'paid');

@@ -24,6 +24,10 @@ Payload format 1.0 or 2.0 both work (header lookup is case-insensitive; base64 b
 - Dedupe: `stripe_events` row per event id; a repeat -> 200, not reprocessed.
 - Paid only when `session.payment_status = 'paid'` AND `session.amount_total = invoices.amount_cents`
   (a mismatch is logged as `AMOUNT MISMATCH` and the invoice stays pending).
+- On paid it writes `invoices.payment_status = 'paid'`, `paid_at`, `stripe_payment_intent_id`, and the
+  existing legacy columns `paid_ts` (= `paid_at`) and `stripe_payment_intent_ref` (= `stripe_payment_intent_id`).
+  Both legacy columns must exist on `invoices` (they are not in the repo migrations); if either is missing,
+  the update fails, the webhook returns 500 and Stripe retries.
 - `checkout.session.expired` -> back to `unpaid` only while still `pending` with the same session id.
 - DB failure -> 500 (the event row is removed first, so Stripe's retry is processed).
 - Never writes `jobs`.

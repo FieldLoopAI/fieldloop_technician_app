@@ -49,10 +49,23 @@ import 'voice_command_registrar_mixin.dart';
 /// even though it has no invoice-specific voice commands of its own; it
 /// registers the same job-lifecycle set so voice keeps working here too.
 class InvoiceReviewScreen extends ConsumerStatefulWidget {
-  const InvoiceReviewScreen({super.key, required this.jobId, required this.preview});
+  const InvoiceReviewScreen({
+    super.key,
+    required this.jobId,
+    required this.preview,
+    this.generateInvoice = generateInvoicePdf,
+    this.sendSms = sendInvoiceSms,
+    this.fetchPaymentStatus = fetchLatestInvoicePayment,
+  });
 
   final String jobId;
   final InvoicePreview preview;
+
+  /// The backend calls, defaulting to the real ones — overridable only so
+  /// test/b185 can drive generation/SMS outcomes without a network.
+  final Future<GeneratedInvoice> Function({required String jobId}) generateInvoice;
+  final Future<void> Function({required String invoiceId, required String pdfUrl}) sendSms;
+  final Future<LatestInvoicePayment?> Function(String jobId) fetchPaymentStatus;
 
   @override
   ConsumerState<InvoiceReviewScreen> createState() => _InvoiceReviewScreenState();
@@ -131,7 +144,7 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
   /// when it isn't this screen's invoice, nothing here changes.
   Future<void> _refreshPaymentStatus({bool adoptFrozenInvoice = false}) async {
     try {
-      final latest = await fetchLatestInvoicePayment(widget.jobId);
+      final latest = await widget.fetchPaymentStatus(widget.jobId);
       if (!mounted || latest == null) return;
       if (_invoiceId == null) {
         if (!adoptFrozenInvoice || !isInvoicePaymentFrozen(latest.status)) return;
@@ -325,11 +338,19 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
       _error = null;
     });
     try {
-      final generated = await generateInvoicePdf(jobId: widget.jobId);
+      final generated = await widget.generateInvoice(jobId: widget.jobId);
       if (!mounted) return;
-      setState(() => _generatingStatus = 'Sending to customer…');
+      setState(() {
+        _generatingStatus = 'Sending to customer…';
+        // B185: the invoice exists now — Collect Payment must not depend on
+        // the SMS below succeeding (failed send, no phone on file).
+        if (kStripePayments) {
+          _invoiceId = generated.id;
+          _paymentStatus = InvoicePaymentStatus.unpaid;
+        }
+      });
 
-      await sendInvoiceSms(invoiceId: generated.id, pdfUrl: generated.pdfUrl);
+      await widget.sendSms(invoiceId: generated.id, pdfUrl: generated.pdfUrl);
       if (!mounted) return;
 
       final customerName = ref.read(jobByIdProvider(widget.jobId))?.customerName.trim();
@@ -339,10 +360,6 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
         _generatingStatus = null;
         _sent = true;
         _sentMessage = message;
-        if (kStripePayments) {
-          _invoiceId = generated.id;
-          _paymentStatus = InvoicePaymentStatus.unpaid;
-        }
       });
       unawaited(ref.read(globalVoiceServiceProvider.notifier).speak(message));
     } catch (e) {
@@ -437,6 +454,13 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
                     // or paid — frozen, so only its payment state is shown.
                     _buildPaymentPanel()
                   else ...[
+                    // B185: generated but not sent (the SMS failed or there
+                    // is no phone) — the existing error shows above, and the
+                    // invoice can still be paid here.
+                    if (kStripePayments && _invoiceId != null && !_generating) ...[
+                      _buildPaymentPanel(),
+                      const SizedBox(height: 14),
+                    ],
                     if (!_hasLineItems) ...[
                       const Text(
                         'Add at least one line item before generating the invoice.',
