@@ -1,5 +1,6 @@
 const { requireTechnician } = require('./shared/auth');
 const { getSupabaseClient } = require('./shared/supabaseClient');
+const { httpError, invoiceCents, assertJobOwner, FROZEN_PAYMENT_STATUSES } = require('./shared/payment_math');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const PDFDocument = require('pdfkit');
@@ -15,8 +16,22 @@ exports.handler = async (event) => {
     const { jobId } = JSON.parse(event.body);
     const supabase = await getSupabaseClient();
 
-    const { data: job } = await supabase
-      .from('jobs').select('*, customers(*)').eq('id', jobId).single();
+    const { data: job, error: jobErr } = await supabase
+      .from('jobs').select('*, customers(*)').eq('id', jobId).maybeSingle();
+    if (jobErr) throw jobErr;
+    assertJobOwner(job, technician);
+
+    // Freeze check (B185) — runs before the visit auto-close below so a
+    // job whose invoice payment has started changes nothing at all.
+    const { data: frozenInvoices, error: frozenErr } = await supabase
+      .from('invoices').select('id')
+      .eq('job_id', jobId)
+      .in('payment_status', FROZEN_PAYMENT_STATUSES)
+      .limit(1);
+    if (frozenErr) throw frozenErr;
+    if (frozenInvoices && frozenInvoices.length > 0) {
+      throw httpError(409, 'Payment has already started for this job\'s invoice, so it can\'t be regenerated');
+    }
 
     // Defensive backstop: if this job still has an open visit (arrived
     // but never departed), close it now so billable_hours reflects real
@@ -73,11 +88,14 @@ exports.handler = async (event) => {
       .from('contractors').select('*, contractor_compliance(*)').eq('id', job.contractor_id).single();
 
     const { data: contractorFinancials } = await supabase
-      .from('contractor_financials').select('platform_fee_rate').eq('contractor_id', job.contractor_id).single();
+      .from('contractor_financials').select('platform_fee_rate').eq('contractor_id', job.contractor_id).maybeSingle();
+    if (!contractorFinancials) throw new Error('Platform fee rate is not configured for this contractor');
     const { data: estimates } = await supabase
-      .from('job_estimates').select('*').eq('job_id', jobId).order('created_at', { ascending: false }).limit(1);
-    const estimate = estimates[0];
-    if (!estimate) throw new Error('No estimate found for this job');
+      .from('job_estimates').select('*')
+      .eq('job_id', jobId).eq('status', 'approved').is('voided_at', null)
+      .order('created_at', { ascending: false }).limit(1);
+    const estimate = (estimates || [])[0];
+    if (!estimate) throw new Error('No approved estimate');
     const { data: changeOrders } = await supabase.from('change_orders').select('*').eq('job_id', jobId);
     const approved = (changeOrders || []).filter(c => c.status === 'approved' && !c.voided_at);
     const voided = (changeOrders || []).filter(c => c.voided_at);
@@ -90,8 +108,10 @@ exports.handler = async (event) => {
     const approvedTotal = approved.reduce((s, c) => s + Number(c.additional_amount), 0);
     const grossTotal = Number(estimate.total_amount) + approvedTotal + adjustmentsTotal;
     if (grossTotal < 0) throw new Error('Invoice total cannot be negative — check the discounts');
-    const feeRate = Number(contractorFinancials.platform_fee_rate) || 0.02;
-    const feeAmount = Math.round(grossTotal * feeRate * 100) / 100;
+    // Integer cents, no fallback rate: a missing or <= 0 rate throws.
+    const feeRate = Number(contractorFinancials.platform_fee_rate);
+    const { feeCents, netCents } = invoiceCents(grossTotal, feeRate);
+    const feeAmount = feeCents / 100;
 
     const customer = job.customers;
 
@@ -214,7 +234,7 @@ exports.handler = async (event) => {
       total: grossTotal,
       platform_fee: feeAmount,
       platform_fee_rate: feeRate,
-      net_to_contractor: grossTotal - feeAmount,
+      net_to_contractor: netCents / 100,
       estimate_total: estimate.total_amount,
       approved_change_orders_total: approvedTotal,
       adjustments_total: adjustmentsTotal,
@@ -225,6 +245,6 @@ exports.handler = async (event) => {
 
     return { statusCode: 200, headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify({ invoice, pdfUrl }) };
   } catch (err) {
-    return { statusCode: 400, headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify({ error: err.message }) };
+    return { statusCode: err.statusCode || 400, headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify({ error: err.message }) };
   }
 };

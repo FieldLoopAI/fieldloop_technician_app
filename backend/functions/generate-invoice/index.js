@@ -40,7 +40,9 @@ exports.handler = async (event) => {
 
     const approvedTotal = approved.reduce((sum, c) => sum + Number(c.additional_amount), 0);
     const grossTotal = Number(estimate.total_amount) + approvedTotal + adjustmentsTotal;
-            const feeRate = Number(contractorFinancials.platform_fee_rate) || 0.02;
+            // No fallback rate (B185): a missing or <= 0 rate is a config error.
+            const feeRate = Number(contractorFinancials.platform_fee_rate);
+            if (!Number.isFinite(feeRate) || feeRate <= 0) throw new Error('Platform fee rate is not configured for this contractor');
     const feeAmount = Math.round(grossTotal * feeRate * 100) / 100;
     const netToContractor = Math.round((grossTotal - feeAmount) * 100) / 100;
 

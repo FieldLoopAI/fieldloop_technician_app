@@ -1,0 +1,19 @@
+{
+  "name": "invoice-payment",
+  "version": "1.0.0",
+  "description": "Build 185 Stripe test-mode payments",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "3.1119.0",
+    "@supabase/supabase-js": "2.112.4",
+    "stripe": "23.0.0"
+  },
+  "private": true
+}
