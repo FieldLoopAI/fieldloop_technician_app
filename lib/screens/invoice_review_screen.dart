@@ -3,22 +3,29 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../models/change_order.dart';
 import '../models/invoice_adjustment.dart';
+import '../models/invoice_payment.dart';
 import '../models/invoice_preview.dart';
 import '../models/job_estimate.dart';
 import '../models/mock_job.dart';
+import '../providers/currently_viewed_job_provider.dart';
 import '../providers/global_voice_service_provider.dart';
 import '../providers/invoice_provider.dart';
+import '../providers/job_runtime_provider.dart';
 import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
 import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
+import '../services/b185_flags.dart';
+import '../services/checkout_voice_hold.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../theme/design_tokens.dart';
 import '../widgets/app_components.dart';
+import '../widgets/invoice_payment_status_chip.dart';
 import '../widgets/manual_entry_form.dart';
 import '../widgets/primary_button.dart';
 import 'voice_command_registrar_mixin.dart';
@@ -52,7 +59,146 @@ class InvoiceReviewScreen extends ConsumerStatefulWidget {
 }
 
 class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
-    with SafeRefDisposal<InvoiceReviewScreen>, VoiceCommandRegistrarMixin<InvoiceReviewScreen> {
+    with SafeRefDisposal<InvoiceReviewScreen>, VoiceCommandRegistrarMixin<InvoiceReviewScreen>, WidgetsBindingObserver {
+  // BUILD 185 — Stripe test-mode payments (all behind [kStripePayments]).
+  // [_invoiceId] is the invoice this screen generated, or the job's latest
+  // invoice when it was already pending/paid on open.
+  String? _invoiceId;
+  InvoicePaymentStatus? _paymentStatus;
+  bool _startingPayment = false;
+  String? _paymentError;
+  bool _awaitingCheckoutReturn = false;
+  Timer? _paymentPoll;
+  static const Duration _paymentPollInterval = Duration(seconds: 3);
+  static const Duration _paymentPollWindow = Duration(minutes: 2);
+  late final GlobalVoiceService _voiceService;
+  late final StateController<String?> _viewedJobIdController;
+  late final CheckoutVoiceHold _voiceHold;
+
+  @override
+  void initState() {
+    super.initState();
+    _voiceService = capture((ref) => ref.read(globalVoiceServiceProvider.notifier));
+    _viewedJobIdController = capture((ref) => ref.read(currentlyViewedJobIdProvider.notifier));
+    _voiceHold = CheckoutVoiceHold(
+      stopVoice: _voiceService.exitJobScope,
+      resumeVoice: _voiceService.enterJobScope,
+      log: debugPrint,
+    );
+    if (kStripePayments) {
+      WidgetsBinding.instance.addObserver(this);
+      unawaited(_refreshPaymentStatus(adoptFrozenInvoice: true));
+    }
+  }
+
+  @override
+  void dispose() {
+    _paymentPoll?.cancel();
+    if (kStripePayments) WidgetsBinding.instance.removeObserver(this);
+    if (_voiceHold.isHeld) {
+      // Normally released on resume; if this screen goes first, give the
+      // mic back after the frame — only if Job Detail still has this job
+      // open (its own dispose clears the viewed job and exits voice scope).
+      final hold = _voiceHold;
+      final viewed = _viewedJobIdController;
+      final jobId = widget.jobId;
+      final eligible = _voiceEligibleNow();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        unawaited(hold.release(jobId: jobId, reason: 'screen_disposed', stillEligible: eligible && viewed.state == jobId));
+      });
+    }
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !_awaitingCheckoutReturn) return;
+    debugPrint('PAYMENT: app resumed after checkout for job ${widget.jobId} — re-reading status');
+    unawaited(_voiceHold.release(jobId: widget.jobId, reason: 'app_resumed', stillEligible: _voiceEligibleNow()));
+    unawaited(_refreshPaymentStatus());
+  }
+
+  /// Job Detail's own voice rule (`_voiceEligible`): an active-status job.
+  bool _voiceEligibleNow() {
+    try {
+      return activeJobStatuses.contains(ref.read(jobRuntimeProvider(widget.jobId)).status);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Re-reads `/invoices/payment-status`. Only the latest invoice counts:
+  /// when it isn't this screen's invoice, nothing here changes.
+  Future<void> _refreshPaymentStatus({bool adoptFrozenInvoice = false}) async {
+    try {
+      final latest = await fetchLatestInvoicePayment(widget.jobId);
+      if (!mounted || latest == null) return;
+      if (_invoiceId == null) {
+        if (!adoptFrozenInvoice || !isInvoicePaymentFrozen(latest.status)) return;
+        setState(() => _invoiceId = latest.id);
+      }
+      if (latest.id != _invoiceId) return;
+      if (latest.status != _paymentStatus) {
+        debugPrint('PAYMENT: invoice ${latest.id} status ${_paymentStatus?.name} -> ${latest.status.name}');
+        setState(() => _paymentStatus = latest.status);
+        ref.invalidate(latestInvoicePaymentProvider(widget.jobId));
+      }
+      if (latest.status == InvoicePaymentStatus.paid) _stopPaymentPoll('paid');
+    } catch (e) {
+      debugPrint('PAYMENT: status re-read failed for job ${widget.jobId} ($e)');
+    }
+  }
+
+  void _startPaymentPoll() {
+    _paymentPoll?.cancel();
+    final until = DateTime.now().add(_paymentPollWindow);
+    _paymentPoll = Timer.periodic(_paymentPollInterval, (_) {
+      if (!mounted) return _stopPaymentPoll('unmounted');
+      if (DateTime.now().isAfter(until)) return _stopPaymentPoll('2 min window over');
+      unawaited(_refreshPaymentStatus());
+    });
+  }
+
+  void _stopPaymentPoll(String why) {
+    if (_paymentPoll == null) return;
+    _paymentPoll?.cancel();
+    _paymentPoll = null;
+    debugPrint('PAYMENT: status poll stopped for job ${widget.jobId} ($why)');
+  }
+
+  /// "Collect Payment": the server creates (or reuses) the Checkout session
+  /// and freezes the invoice; voice is held; the hosted page opens in a
+  /// Custom Tab (external browser if that fails). The homeowner pays there.
+  Future<void> _collectPayment() async {
+    final invoiceId = _invoiceId;
+    if (invoiceId == null || _startingPayment) return;
+    setState(() {
+      _startingPayment = true;
+      _paymentError = null;
+    });
+    try {
+      final session = await createCheckoutSession(invoiceId);
+      if (!mounted) return;
+      setState(() => _paymentStatus = InvoicePaymentStatus.pending);
+      ref.invalidate(latestInvoicePaymentProvider(widget.jobId));
+
+      _voiceHold.hold(jobId: widget.jobId, voiceEligible: _voiceEligibleNow());
+      final uri = Uri.parse(session.url);
+      var launched = await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
+      if (!launched) launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!launched) {
+        await _voiceHold.release(jobId: widget.jobId, reason: 'launch_failed', stillEligible: _voiceEligibleNow());
+        throw StateError('Could not open the payment page.');
+      }
+      _awaitingCheckoutReturn = true;
+      _startPaymentPoll();
+    } catch (e) {
+      if (mounted) setState(() => _paymentError = e is StateError ? e.message : e.toString());
+    } finally {
+      if (mounted) setState(() => _startingPayment = false);
+    }
+  }
+
   bool _generating = false;
   String? _generatingStatus;
   String? _error;
@@ -193,6 +339,10 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
         _generatingStatus = null;
         _sent = true;
         _sentMessage = message;
+        if (kStripePayments) {
+          _invoiceId = generated.id;
+          _paymentStatus = InvoicePaymentStatus.unpaid;
+        }
       });
       unawaited(ref.read(globalVoiceServiceProvider.notifier).speak(message));
     } catch (e) {
@@ -241,7 +391,12 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
                     _TimeOnSiteCard(preview: preview),
                   ],
                   const SizedBox(height: 20),
-                  _FinancialSummaryCard(estimate: estimate, approvedTotal: approvedTotal, preview: preview),
+                  _FinancialSummaryCard(
+                    estimate: estimate,
+                    approvedTotal: approvedTotal,
+                    preview: preview,
+                    showInternal: showInternalFeeSection(enabled: kStripePayments, status: _paymentStatus),
+                  ),
                   const SizedBox(height: 20),
                   Align(
                     alignment: Alignment.center,
@@ -271,8 +426,16 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
                     ),
                     const SizedBox(height: 10),
                   ],
-                  if (_sent && _sentMessage != null)
-                    _SentConfirmation(message: _sentMessage!)
+                  if (_sent && _sentMessage != null) ...[
+                    _SentConfirmation(message: _sentMessage!),
+                    if (kStripePayments && _invoiceId != null) ...[
+                      const SizedBox(height: 14),
+                      _buildPaymentPanel(),
+                    ],
+                  ] else if (!showGenerateButton(enabled: kStripePayments, status: _paymentStatus))
+                    // Opened on a job whose latest invoice is already pending
+                    // or paid — frozen, so only its payment state is shown.
+                    _buildPaymentPanel()
                   else ...[
                     if (!_hasLineItems) ...[
                       const Text(
@@ -342,7 +505,13 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
   /// here, on top of the estimate + approved change orders, without touching
   /// either of those customer-facing records.
   Widget _buildAdjustmentsSection(InvoicePreview preview) {
-    final locked = _sent || _generating || _updatingAdjustments;
+    final locked = adjustmentsLocked(
+      enabled: kStripePayments,
+      sent: _sent,
+      generating: _generating,
+      updatingAdjustments: _updatingAdjustments,
+      status: _paymentStatus,
+    );
     return _card(
       Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -415,6 +584,53 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
           ),
         ],
       ),
+    );
+  }
+
+  /// BUILD 185 — the invoice's payment state plus "Collect Payment" until
+  /// it's paid.
+  Widget _buildPaymentPanel() {
+    final status = _paymentStatus ?? InvoicePaymentStatus.unpaid;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text(
+              'Payment',
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.neutralGrey),
+            ),
+            const SizedBox(width: 10),
+            InvoicePaymentStatusChip(status: status),
+          ],
+        ),
+        if (status == InvoicePaymentStatus.pending) ...[
+          const SizedBox(height: 8),
+          const Text(
+            'Waiting for the payment to be confirmed…',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: AppColors.neutralGrey, fontSize: 12.5),
+          ),
+        ],
+        if (_paymentError != null) ...[
+          const SizedBox(height: 10),
+          Text(
+            _paymentError!,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: AppColors.statusRedText, fontSize: 13, fontWeight: FontWeight.w600),
+          ),
+        ],
+        if (showCollectPaymentButton(enabled: kStripePayments, invoiceId: _invoiceId, status: status)) ...[
+          const SizedBox(height: 12),
+          PrimaryButton(
+            label: 'Collect Payment',
+            icon: Icons.credit_card_rounded,
+            isLoading: _startingPayment,
+            onPressed: _startingPayment ? null : _collectPayment,
+          ),
+        ],
+      ],
     );
   }
 
@@ -715,11 +931,20 @@ class _LineItemRow extends StatelessWidget {
 /// the customer's PDF (see `backend/functions/generate-invoice-pdf`, which
 /// omits the fee entirely).
 class _FinancialSummaryCard extends StatelessWidget {
-  const _FinancialSummaryCard({required this.estimate, required this.approvedTotal, required this.preview});
+  const _FinancialSummaryCard({
+    required this.estimate,
+    required this.approvedTotal,
+    required this.preview,
+    this.showInternal = true,
+  });
 
   final JobEstimate estimate;
   final double approvedTotal;
   final InvoicePreview preview;
+
+  /// False (B185) while payment is pending or paid — the homeowner may be
+  /// holding the tablet.
+  final bool showInternal;
 
   @override
   Widget build(BuildContext context) {
@@ -751,32 +976,34 @@ class _FinancialSummaryCard extends StatelessWidget {
               style: const TextStyle(fontSize: 25, fontWeight: FontWeight.w900, color: AppColors.primaryGreenDark),
             ),
           ),
-          const SizedBox(height: 18),
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(color: AppColors.background, borderRadius: BorderRadius.circular(10)),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Row(
-                  children: [
-                    Icon(Icons.lock_outline_rounded, size: 13, color: AppColors.neutralGrey),
-                    SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        'Internal only — not shown to the customer',
-                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.neutralGrey),
+          if (showInternal) ...[
+            const SizedBox(height: 18),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(color: AppColors.background, borderRadius: BorderRadius.circular(10)),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.lock_outline_rounded, size: 13, color: AppColors.neutralGrey),
+                      SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          'Internal only — not shown to the customer',
+                          style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.neutralGrey),
+                        ),
                       ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                _summarySmallLine('Platform Fee (${(preview.feeRate * 100).toStringAsFixed(1)}%)', preview.feeAmount),
-                const SizedBox(height: 4),
-                _summarySmallLine('Net to Contractor', preview.netToContractor),
-              ],
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  _summarySmallLine('Platform Fee (${(preview.feeRate * 100).toStringAsFixed(1)}%)', preview.feeAmount),
+                  const SizedBox(height: 4),
+                  _summarySmallLine('Net to Contractor', preview.netToContractor),
+                ],
+              ),
             ),
-          ),
+          ],
         ],
       ),
     );

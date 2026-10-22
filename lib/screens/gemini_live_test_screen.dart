@@ -78,6 +78,7 @@ import '../services/live_camera_remark_veto.dart';
 // Build 184 — Changes A–D (see b184_flags.dart).
 import '../services/another_one_capture.dart';
 import '../services/b184_flags.dart';
+import '../services/b185_flags.dart';
 import '../services/remark_quick_reply.dart';
 import '../services/close_line_playback.dart';
 import '../services/late_finalize.dart';
@@ -4651,6 +4652,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       _log_(describeB182Flags());
       _log_(describeB183Flags());
       _log_(describeB184Flags());
+      _log_(describeB185Flags());
       // FIX 1 — one greppable line per session: which end-of-speech setting
       // this run is measuring (see [_serverVadSilenceDurationMs]).
       _log_(

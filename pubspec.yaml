@@ -58,6 +58,9 @@ dependencies:
   sqflite: ^2.4.3
   path: ^1.9.1
   web_socket_channel: ^3.0.3
+  # Build 185 — opens the hosted Stripe Checkout page (Custom Tab /
+  # browser). Was already a transitive dependency (6.3.2).
+  url_launcher: ^6.3.2
   # Raw PCM microphone audio streaming for the Deepgram command-capture path
   # (speech_to_text, used for on-device wake-word detection, only ever
   # exposes recognized text — never raw audio bytes).

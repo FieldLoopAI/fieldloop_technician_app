@@ -11,6 +11,7 @@ import 'services/b180_flags.dart';
 import 'services/b182_flags.dart';
 import 'services/b183_flags.dart';
 import 'services/b184_flags.dart';
+import 'services/b185_flags.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,6 +21,7 @@ void main() async {
   debugPrint(describeB182Flags());
   debugPrint(describeB183Flags());
   debugPrint(describeB184Flags());
+  debugPrint(describeB185Flags());
 
   await Supabase.initialize(
     url: 'https://glpzohfzldvztseriwky.supabase.co',

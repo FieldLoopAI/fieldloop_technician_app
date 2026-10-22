@@ -8,6 +8,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/change_order.dart';
+import '../models/invoice_payment.dart';
 import '../models/job_photo.dart';
 import '../models/mock_job.dart';
 import '../providers/arrival_provider.dart';
@@ -31,12 +32,14 @@ import '../providers/visit_tracking_service.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../routing/job_detail_route.dart';
+import '../services/b185_flags.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../theme/design_tokens.dart';
 import '../widgets/app_components.dart';
 import '../widgets/approval_status_pill.dart';
 import '../widgets/empty_state_actions.dart';
+import '../widgets/invoice_payment_status_chip.dart';
 import '../widgets/job_history_feed_timeline.dart';
 import '../widgets/job_photo_thumbnail.dart';
 import '../widgets/pending_upload_badge.dart';
@@ -1564,7 +1567,11 @@ class _TabContent extends ConsumerWidget {
                   'Payment status',
                   style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textDark),
                 ),
-                value: _InvoiceStatusBadge(status: invoiceStatus),
+                // B185: the real latest-invoice payment status (the mock
+                // invoiceStatusProvider badge is the flag-off path).
+                value: kStripePayments
+                    ? _RealPaymentStatusBadge(jobId: job.id)
+                    : _InvoiceStatusBadge(status: invoiceStatus),
               ),
               const SizedBox(height: 14),
               if (estimate == null)
@@ -1782,6 +1789,24 @@ class _InvoiceStatusBadge extends StatelessWidget {
     InvoiceStatus.pending => const StatusChip(tone: StatusTone.pending, label: 'Pending'),
     InvoiceStatus.paid => const StatusChip(tone: StatusTone.approved, label: 'Paid'),
   };
+}
+
+/// Build 185 — `/invoices/payment-status` for the job's latest invoice:
+/// Unpaid (also when there is no invoice yet) / Pending / Paid. While loading
+/// or on a failed read it shows a neutral chip, never a guessed status.
+class _RealPaymentStatusBadge extends ConsumerWidget {
+  const _RealPaymentStatusBadge({required this.jobId});
+
+  final String jobId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return ref.watch(latestInvoicePaymentProvider(jobId)).when(
+      data: (latest) => InvoicePaymentStatusChip(status: latest?.status ?? InvoicePaymentStatus.unpaid),
+      loading: () => const StatusChip(tone: StatusTone.neutral, label: 'Checking…', icon: Icons.sync_rounded),
+      error: (error, stack) => const StatusChip(tone: StatusTone.neutral, label: 'Unavailable', icon: Icons.cloud_off_rounded),
+    );
+  }
 }
 
 /// Tap fallback for the `job_complete` voice command

@@ -7,6 +7,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/env.dart';
 import '../models/invoice_adjustment.dart';
+import '../models/invoice_payment.dart';
 import '../models/invoice_preview.dart';
 
 /// Fetches a read-only preview of what a job's invoice would look like via
@@ -158,3 +159,82 @@ final jobInvoiceAdjustmentsProvider = FutureProvider.autoDispose.family<List<Inv
     return const [];
   }
 });
+
+// ===========================================================================
+// BUILD 185 — Stripe test-mode payments (see `services/b185_flags.dart` and
+// `backend/functions/invoice-payment`). The real counterpart of the mock
+// `invoiceStatusProvider` in `estimate_invoice_providers.dart`, which stays
+// as it is for the flag-off path and the mock InvoiceScreen.
+// ===========================================================================
+
+/// Creates (or reuses the open) Stripe Checkout session for [invoiceId] via
+/// `/invoices/checkout`. The server freezes the invoice ('pending') before
+/// replying. Throws with the server's message on any refusal.
+Future<CheckoutSession> createCheckoutSession(String invoiceId) async {
+  final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
+  if (accessToken == null) {
+    throw StateError('No active session — please sign in again.');
+  }
+
+  debugPrint('PAYMENT: requesting /invoices/checkout for invoice $invoiceId...');
+  final response = await http.post(
+    Uri.parse('$apiBaseUrl/invoices/checkout'),
+    headers: {'Authorization': 'Bearer $accessToken', 'Content-Type': 'application/json'},
+    body: jsonEncode({'invoiceId': invoiceId}),
+  );
+  if (response.statusCode != 200) {
+    debugPrint('PAYMENT ERROR (checkout): ${response.statusCode} ${response.body}');
+    throw StateError('Starting the payment failed (${response.statusCode}): ${_serverError(response.body)}');
+  }
+
+  final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+  final url = decoded['url'] as String?;
+  final sessionId = decoded['sessionId'] as String?;
+  if (url == null || url.isEmpty || sessionId == null) {
+    throw StateError('Starting the payment failed: response missing "url" or "sessionId".');
+  }
+  final amountCents = (decoded['amountCents'] as num?)?.toInt();
+  final feeCents = (decoded['feeCents'] as num?)?.toInt();
+  debugPrint(
+    'PAYMENT: checkout ready for invoice $invoiceId amountCents=$amountCents feeCents=$feeCents '
+    'session=…${sessionId.length > 6 ? sessionId.substring(sessionId.length - 6) : sessionId}',
+  );
+  return CheckoutSession(url: url, sessionId: sessionId, amountCents: amountCents, feeCents: feeCents);
+}
+
+/// The job's latest invoice and its payment status via
+/// `/invoices/payment-status` (server-side ownership check, so no new RLS
+/// is needed for the app). Null when the job has no invoice yet.
+Future<LatestInvoicePayment?> fetchLatestInvoicePayment(String jobId) async {
+  final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
+  if (accessToken == null) {
+    throw StateError('No active session — please sign in again.');
+  }
+
+  final response = await http.get(
+    Uri.parse('$apiBaseUrl/invoices/payment-status').replace(queryParameters: {'jobId': jobId}),
+    headers: {'Authorization': 'Bearer $accessToken'},
+  );
+  if (response.statusCode != 200) {
+    debugPrint('PAYMENT ERROR (payment-status): ${response.statusCode} ${response.body}');
+    throw StateError('Loading the payment status failed (${response.statusCode}): ${_serverError(response.body)}');
+  }
+  final latest = LatestInvoicePayment.fromResponse(jsonDecode(response.body) as Map<String, dynamic>);
+  debugPrint('PAYMENT: status for job $jobId -> invoice=${latest?.id} status=${latest?.status.name}');
+  return latest;
+}
+
+/// Real latest-invoice payment status for a job. Invalidated by Invoice
+/// Review whenever it re-reads the status.
+final latestInvoicePaymentProvider = FutureProvider.autoDispose.family<LatestInvoicePayment?, String>(
+  (ref, jobId) => fetchLatestInvoicePayment(jobId),
+);
+
+/// `{"error": "..."}` -> the message; anything else -> the raw body.
+String _serverError(String body) {
+  try {
+    final decoded = jsonDecode(body);
+    if (decoded is Map && decoded['error'] is String) return decoded['error'] as String;
+  } catch (_) {}
+  return body;
+}
