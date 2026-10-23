@@ -31,6 +31,8 @@ class LatestInvoicePayment {
     required this.status,
     required this.paidAt,
     required this.total,
+    this.processingFeeCents,
+    this.chargeTotalCents,
   });
 
   final String id;
@@ -38,6 +40,11 @@ class LatestInvoicePayment {
   final InvoicePaymentStatus status;
   final DateTime? paidAt;
   final double? total;
+
+  /// Card-fee surcharge (server STRIPE_PASS_FEE): only in the reply when it
+  /// is on, and only set on an invoice whose Checkout charged it.
+  final int? processingFeeCents;
+  final int? chargeTotalCents;
 
   /// `{"invoice": {...} | null}` -> the invoice, or null when the job has none.
   static LatestInvoicePayment? fromResponse(Map<String, dynamic> json) {
@@ -51,19 +58,47 @@ class LatestInvoicePayment {
       status: parseInvoicePaymentStatus(invoice['payment_status']),
       paidAt: rawPaidAt == null ? null : DateTime.tryParse(rawPaidAt),
       total: rawTotal == null ? null : double.tryParse(rawTotal.toString()),
+      processingFeeCents: (invoice['processing_fee_cents'] as num?)?.toInt(),
+      chargeTotalCents: (invoice['charge_total_cents'] as num?)?.toInt(),
     );
   }
 }
 
 /// `/invoices/checkout`'s reply.
 class CheckoutSession {
-  const CheckoutSession({required this.url, required this.sessionId, required this.amountCents, required this.feeCents});
+  const CheckoutSession({
+    required this.url,
+    required this.sessionId,
+    required this.amountCents,
+    required this.feeCents,
+    this.processingFeeCents,
+    this.chargeTotalCents,
+  });
 
   final String url;
   final String sessionId;
   final int? amountCents;
   final int? feeCents;
+
+  /// See [LatestInvoicePayment.processingFeeCents].
+  final int? processingFeeCents;
+  final int? chargeTotalCents;
 }
+
+/// The card processing fee the customer pays on top, and the total they
+/// pay — only when the server reported a fee above zero; otherwise null and
+/// the Payment panel shows nothing extra.
+({int processingFeeCents, int chargeTotalCents})? cardSurcharge({
+  required int? processingFeeCents,
+  required int? chargeTotalCents,
+}) {
+  if (processingFeeCents == null || processingFeeCents <= 0) return null;
+  if (chargeTotalCents == null || chargeTotalCents <= 0) return null;
+  return (processingFeeCents: processingFeeCents, chargeTotalCents: chargeTotalCents);
+}
+
+/// Integer cents -> "$1234.56", the Invoice Review money format.
+String formatCents(int cents) => '\$${(cents ~/ 100)}.${(cents % 100).toString().padLeft(2, '0')}';
 
 // ---------------------------------------------------------------------------
 // Invoice Review visibility rules (pure, so test/b185 can pin them).

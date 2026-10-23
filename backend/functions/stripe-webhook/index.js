@@ -31,15 +31,25 @@ function rawBodyOf(event) {
 }
 
 async function markPaid(supabase, session) {
+  // '*' rather than a column list: charge_total_cents only exists once the
+  // processing-fee migration is applied, and naming it before then would
+  // fail every webhook.
   const { data: invoice, error } = await supabase
-    .from('invoices').select('id, job_id, amount_cents, payment_status')
+    .from('invoices').select('*')
     .eq('stripe_checkout_session_id', session.id).maybeSingle();
   if (error) throw error;
   if (!invoice) {
     console.log(`STRIPE WEBHOOK: no invoice for session=${tail6(session.id)}`);
     return 'no_invoice';
   }
-  if (session.amount_total !== invoice.amount_cents) {
+  // A card-fee surcharge session charged charge_total_cents (invoice +
+  // processing fee); an older row (null/0) is checked exactly as before.
+  if (invoice.charge_total_cents) {
+    if (session.amount_total !== invoice.charge_total_cents) {
+      console.log(`STRIPE WEBHOOK: AMOUNT MISMATCH invoice=${invoice.id} job=${invoice.job_id} (charge total incl. processing fee) — not marked paid`);
+      return 'amount_mismatch';
+    }
+  } else if (session.amount_total !== invoice.amount_cents) {
     console.log(`STRIPE WEBHOOK: AMOUNT MISMATCH invoice=${invoice.id} job=${invoice.job_id} sessionCents=${session.amount_total} invoiceCents=${invoice.amount_cents} — not marked paid`);
     return 'amount_mismatch';
   }

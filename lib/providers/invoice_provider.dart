@@ -199,7 +199,14 @@ Future<CheckoutSession> createCheckoutSession(String invoiceId) async {
     'PAYMENT: checkout ready for invoice $invoiceId amountCents=$amountCents feeCents=$feeCents '
     'session=…${sessionId.length > 6 ? sessionId.substring(sessionId.length - 6) : sessionId}',
   );
-  return CheckoutSession(url: url, sessionId: sessionId, amountCents: amountCents, feeCents: feeCents);
+  return CheckoutSession(
+    url: url,
+    sessionId: sessionId,
+    amountCents: amountCents,
+    feeCents: feeCents,
+    processingFeeCents: (decoded['processingFeeCents'] as num?)?.toInt(),
+    chargeTotalCents: (decoded['chargeTotalCents'] as num?)?.toInt(),
+  );
 }
 
 /// The job's latest invoice and its payment status via

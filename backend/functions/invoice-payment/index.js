@@ -3,6 +3,7 @@ const { getSupabaseClient } = require('./shared/supabaseClient');
 const { getStripe } = require('./shared/stripeClient');
 const {
   httpError, toCents, requireFeeRate, feeCentsFor, storedFeeMatches, assertJobOwner, tail6,
+  parseFeePct, surchargeTotalCents,
 } = require('./shared/payment_math');
 
 // Build 185 payment routes (one Lambda, dispatched by method + path):
@@ -61,6 +62,20 @@ function returnUrl(status, configured) {
   return url.toString();
 }
 
+// Card-fee surcharge: on only when STRIPE_PASS_FEE is exactly "true"; then
+// the customer also pays STRIPE_FEE_PCT (default 0.029) + STRIPE_FEE_FIXED_CENTS
+// (default 30) as a separate Checkout line. null = off (today's behavior).
+function passFeeConfig(env = process.env) {
+  if (env.STRIPE_PASS_FEE !== 'true') return null;
+  const pct = parseFeePct(env.STRIPE_FEE_PCT ?? '0.029');
+  const rawFixed = env.STRIPE_FEE_FIXED_CENTS ?? '30';
+  const fixedCents = /^\d+$/.test(String(rawFixed).trim()) ? Number(String(rawFixed).trim()) : NaN;
+  if (!pct || !Number.isSafeInteger(fixedCents)) {
+    throw httpError(500, 'Card processing fee is not configured correctly');
+  }
+  return { pct, fixedCents };
+}
+
 function returnPage() {
   return {
     statusCode: 200,
@@ -95,6 +110,7 @@ async function createCheckout(event, deps) {
   const technician = await deps.requireTechnician(event);
   const { invoiceId } = JSON.parse(event.body || '{}');
   if (!invoiceId) throw httpError(400, 'invoiceId is required');
+  const passFee = passFeeConfig();
   const supabase = await deps.getSupabaseClient();
 
   const { data: invoice, error: invoiceErr } = await supabase
@@ -120,6 +136,10 @@ async function createCheckout(event, deps) {
         sessionId: existing.id,
         amountCents: invoice.amount_cents,
         feeCents: invoice.application_fee_cents,
+        ...(passFee ? {
+          processingFeeCents: invoice.processing_fee_cents ?? null,
+          chargeTotalCents: invoice.charge_total_cents ?? null,
+        } : {}),
       });
     }
     if (existing.status === 'complete') {
@@ -146,6 +166,32 @@ async function createCheckout(event, deps) {
   const destination = financials?.stripe_account_id;
   if (!destination) throw httpError(409, 'This contractor has no Stripe account connected');
 
+  const lineItems = [{
+    price_data: {
+      currency: 'usd',
+      unit_amount: totalCents,
+      product_data: { name: `Invoice ${invoice.invoice_number} - ${job.job_id_public}` },
+    },
+    quantity: 1,
+  }];
+  let applicationFeeCents = feeCents;
+  let surcharge = null;
+  if (passFee) {
+    // The customer pays Stripe's fee on top; the platform keeps feeCents
+    // after Stripe takes its fee from the application fee.
+    const chargeTotalCents = surchargeTotalCents(totalCents, passFee.pct, passFee.fixedCents);
+    const processingFeeCents = chargeTotalCents - totalCents;
+    if (processingFeeCents > 0) {
+      lineItems.push({
+        price_data: { currency: 'usd', unit_amount: processingFeeCents, product_data: { name: 'Card processing fee' } },
+        quantity: 1,
+      });
+    }
+    applicationFeeCents = processingFeeCents + feeCents;
+    surcharge = { processingFeeCents, chargeTotalCents };
+    console.log(`CHECKOUT: card processing fee passed to the customer invoice=${invoice.id}`);
+  }
+
   const attempt = Number(invoice.checkout_attempts) || 0;
   const base = returnBase();
   console.log(`CHECKOUT: returnUrl=${base.host}${base.pathname}`);
@@ -153,16 +199,9 @@ async function createCheckout(event, deps) {
     // No payment_method_types: API 2026-09-30.endive rejects it; payment
     // methods come from the Stripe Dashboard settings (card only).
     mode: 'payment',
-    line_items: [{
-      price_data: {
-        currency: 'usd',
-        unit_amount: totalCents,
-        product_data: { name: `Invoice ${invoice.invoice_number} - ${job.job_id_public}` },
-      },
-      quantity: 1,
-    }],
+    line_items: lineItems,
     payment_intent_data: {
-      application_fee_amount: feeCents,
+      application_fee_amount: applicationFeeCents,
       transfer_data: { destination },
       metadata: { invoice_id: invoice.id, job_id: job.id },
     },
@@ -181,6 +220,10 @@ async function createCheckout(event, deps) {
       amount_cents: totalCents,
       application_fee_cents: feeCents,
       checkout_attempts: attempt + 1,
+      ...(surcharge ? {
+        processing_fee_cents: surcharge.processingFeeCents,
+        charge_total_cents: surcharge.chargeTotalCents,
+      } : {}),
     })
     .eq('id', invoice.id)
     .neq('payment_status', 'paid')
@@ -189,7 +232,10 @@ async function createCheckout(event, deps) {
   if (!updated || updated.length === 0) throw httpError(409, 'This invoice is already paid');
 
   console.log(`CHECKOUT: created invoice=${invoice.id} job=${job.id} amountCents=${totalCents} feeCents=${feeCents} attempt=${attempt} session=${tail6(session.id)} destination=${tail6(destination)}`);
-  return json(200, { url: session.url, sessionId: session.id, amountCents: totalCents, feeCents });
+  return json(200, {
+    url: session.url, sessionId: session.id, amountCents: totalCents, feeCents,
+    ...(surcharge ? { processingFeeCents: surcharge.processingFeeCents, chargeTotalCents: surcharge.chargeTotalCents } : {}),
+  });
 }
 
 async function paymentStatus(event, deps) {
@@ -206,6 +252,10 @@ async function paymentStatus(event, deps) {
         payment_status: invoice.payment_status,
         paid_at: invoice.paid_at ?? null,
         total: invoice.total,
+        ...(process.env.STRIPE_PASS_FEE === 'true' ? {
+          processing_fee_cents: invoice.processing_fee_cents ?? null,
+          charge_total_cents: invoice.charge_total_cents ?? null,
+        } : {}),
       }
       : null,
   });
@@ -228,3 +278,4 @@ exports.handler = (event) => handle(event, { requireTechnician, getSupabaseClien
 exports._handle = handle;
 exports._routeOf = routeOf;
 exports._returnUrl = returnUrl;
+exports._passFeeConfig = passFeeConfig;

@@ -62,6 +62,30 @@ function assertJobOwner(job, technician) {
   }
 }
 
+// Card-fee surcharge (invoice-payment's STRIPE_PASS_FEE): the customer pays
+// Stripe's percentage + fixed fee on top of the invoice. The rate stays a
+// decimal string ("0.029") and the math is exact integer arithmetic.
+
+// "0.029" -> { num: 29n, den: 1000n }; null unless 0 <= rate < 1 with at
+// most 6 decimals.
+function parseFeePct(raw) {
+  const s = String(raw ?? '').trim();
+  const m = /^(0?)\.(\d{1,6})$|^0$/.exec(s);
+  if (!m) return null;
+  if (s === '0') return { num: 0n, den: 1n };
+  return { num: BigInt(m[2]), den: 10n ** BigInt(m[2].length) };
+}
+
+// The charge total T so that T - S covers pct*T + fixed:
+// T = ceil((S + fixed) / (1 - pct)), all integer cents.
+function surchargeTotalCents(totalCents, pct, fixedCents) {
+  if (!Number.isSafeInteger(totalCents) || totalCents < 0) throw httpError(400, 'Amount is not a number');
+  if (!Number.isSafeInteger(fixedCents) || fixedCents < 0) throw httpError(500, 'Card processing fee is not configured correctly');
+  const numerator = (BigInt(totalCents) + BigInt(fixedCents)) * pct.den;
+  const denominator = pct.den - pct.num;
+  return Number((numerator + denominator - 1n) / denominator);
+}
+
 // Last 6 characters of a Stripe id — the only part ever logged.
 function tail6(id) {
   return id ? String(id).slice(-6) : 'none';
@@ -78,5 +102,7 @@ module.exports = {
   isPaymentFrozen,
   assertJobFound,
   assertJobOwner,
+  parseFeePct,
+  surchargeTotalCents,
   tail6,
 };

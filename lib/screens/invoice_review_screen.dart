@@ -104,6 +104,9 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
   PaymentStatusLoad _statusLoad = kStripePayments ? PaymentStatusLoad.loading : PaymentStatusLoad.loaded;
   bool _startingPayment = false;
   String? _paymentError;
+  // The card processing fee + customer total for [_invoiceId], only when the
+  // server reported one (see [cardSurcharge]).
+  ({int processingFeeCents, int chargeTotalCents})? _surcharge;
   bool _awaitingCheckoutReturn = false;
   Timer? _paymentPoll;
   static const Duration _paymentPollInterval = Duration(seconds: 3);
@@ -192,6 +195,9 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
       setState(() => _invoiceId = latest.id);
     }
     if (latest.id != _invoiceId) return;
+    final surcharge =
+        cardSurcharge(processingFeeCents: latest.processingFeeCents, chargeTotalCents: latest.chargeTotalCents);
+    if (surcharge != null && surcharge != _surcharge) setState(() => _surcharge = surcharge);
     if (latest.status != _paymentStatus) {
       debugPrint('PAYMENT: invoice ${latest.id} status ${_paymentStatus?.name} -> ${latest.status.name}');
       setState(() => _paymentStatus = latest.status);
@@ -279,7 +285,12 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
     try {
       final session = await createCheckoutSession(invoiceId);
       if (!mounted) return;
-      setState(() => _paymentStatus = InvoicePaymentStatus.pending);
+      final surcharge =
+          cardSurcharge(processingFeeCents: session.processingFeeCents, chargeTotalCents: session.chargeTotalCents);
+      setState(() {
+        _paymentStatus = InvoicePaymentStatus.pending;
+        if (surcharge != null) _surcharge = surcharge;
+      });
       ref.invalidate(latestInvoicePaymentProvider(widget.jobId));
 
       _voiceHold.hold(jobId: widget.jobId, voiceEligible: _voiceEligibleNow());
@@ -758,6 +769,12 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
             InvoicePaymentStatusChip(status: status),
           ],
         ),
+        if (_surcharge case final surcharge?) ...[
+          const SizedBox(height: 10),
+          _paymentLine('Card processing fee', surcharge.processingFeeCents),
+          const SizedBox(height: 4),
+          _paymentLine('Customer pays', surcharge.chargeTotalCents, bold: true),
+        ],
         if (status == InvoicePaymentStatus.pending) ...[
           const SizedBox(height: 8),
           const Text(
@@ -784,6 +801,20 @@ class _InvoiceReviewScreenState extends ConsumerState<InvoiceReviewScreen>
           ),
         ],
       ],
+    );
+  }
+
+  Widget _paymentLine(String label, int cents, {bool bold = false}) {
+    return LabelValueRow(
+      label: Text(label, style: const TextStyle(fontSize: 13, color: AppColors.neutralGrey)),
+      value: Text(
+        formatCents(cents),
+        style: TextStyle(
+          fontSize: 13,
+          fontWeight: bold ? FontWeight.w800 : FontWeight.w600,
+          color: AppColors.textDark,
+        ),
+      ),
     );
   }
 
