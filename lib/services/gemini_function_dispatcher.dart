@@ -16,8 +16,10 @@ import '../models/job_estimate.dart';
 import '../models/job_history_entry.dart';
 import '../models/job_photo.dart';
 import '../models/kept_photo_ref.dart';
+import '../models/invoice_preview.dart';
 import '../models/mock_job.dart';
 import '../providers/auth_provider.dart';
+import '../providers/invoice_provider.dart';
 import '../providers/job_change_orders_provider.dart';
 import '../providers/job_dictations_provider.dart';
 import '../providers/job_estimate_provider.dart';
@@ -29,10 +31,12 @@ import '../routing/app_navigator_key.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../screens/change_orders_screen.dart';
 import '../screens/estimate_screen.dart';
+import '../screens/invoice_review_screen.dart';
 import '../screens/invoice_screen.dart';
 import '../screens/job_history_screen.dart';
 import '../screens/photo_preview_screen.dart';
 import '../screens/photo_viewer_screen.dart';
+import 'b185_flags.dart';
 
 /// Holds the camera state that `open_camera`/`capture_photo`/
 /// `confirm_photo_upload`/`retake_photo` share ACROSS separate Gemini
@@ -1704,10 +1708,70 @@ Future<Map<String, dynamic>> _viewChangeOrders({
   };
 }
 
-Future<Map<String, dynamic>> _viewInvoice({required GeminiNavigationSession navigationSession, required String jobId}) async {
-  final pushed = _pushUnlessAlreadyOnTop(navigationSession, 'view_invoice', InvoiceScreen(jobId: jobId));
+/// B185: the most `view_invoice` waits for `/invoices/preview` before
+/// falling back to the old [InvoiceScreen].
+const Duration kViewInvoicePreviewTimeout = Duration(seconds: 3);
+
+/// B185: sessions with a `view_invoice` preview fetch still running — a
+/// repeat while it runs pushes nothing.
+final Set<GeminiNavigationSession> _viewInvoiceFetchInFlight = {};
+
+/// `view_invoice` — with [kStripePayments] on, opens the real
+/// [InvoiceReviewScreen] (same `/invoices/preview` fetch Job Detail's "View
+/// Full Invoice" does first), falling back to the old [InvoiceScreen] on any
+/// fetch failure or timeout. Same push, guard, name and returned map either
+/// way. The optional parameters exist only for test/b185.
+Future<Map<String, dynamic>> _viewInvoice({
+  required GeminiNavigationSession navigationSession,
+  required String jobId,
+  bool stripePayments = kStripePayments,
+  Future<InvoicePreview> Function({required String jobId}) fetchPreview = fetchInvoicePreview,
+  Duration fetchTimeout = kViewInvoicePreviewTimeout,
+}) async {
+  if (!stripePayments) {
+    final pushed = _pushUnlessAlreadyOnTop(navigationSession, 'view_invoice', InvoiceScreen(jobId: jobId));
+    return {'status': pushed ? 'navigated' : 'already_on_screen', 'job_id': jobId};
+  }
+  // Checked before the fetch, so a repeat never waits on the network.
+  if (navigationSession.topScreenName == 'view_invoice') {
+    debugPrint('VIEW REPEAT WHILE OPEN: "view_invoice" is already the top screen — not pushing a duplicate');
+    return {'status': 'already_on_screen', 'job_id': jobId};
+  }
+  if (_viewInvoiceFetchInFlight.contains(navigationSession)) {
+    debugPrint('VIEW REPEAT WHILE OPEN: "view_invoice" is still opening — not pushing a duplicate');
+    return {'status': 'already_on_screen', 'job_id': jobId};
+  }
+  _viewInvoiceFetchInFlight.add(navigationSession);
+  Widget screen;
+  try {
+    final preview = await fetchPreview(jobId: jobId).timeout(fetchTimeout);
+    debugPrint('VIEW_INVOICE route=review reason=ok');
+    screen = InvoiceReviewScreen(jobId: jobId, preview: preview);
+  } catch (e) {
+    debugPrint('VIEW_INVOICE route=fallback reason=${e is TimeoutException ? 'timeout' : 'fetch_failed'}');
+    screen = InvoiceScreen(jobId: jobId);
+  } finally {
+    _viewInvoiceFetchInFlight.remove(navigationSession);
+  }
+  final pushed = _pushUnlessAlreadyOnTop(navigationSession, 'view_invoice', screen);
   return {'status': pushed ? 'navigated' : 'already_on_screen', 'job_id': jobId};
 }
+
+/// test/b185 entry point for [_viewInvoice].
+@visibleForTesting
+Future<Map<String, dynamic>> viewInvoiceForTesting({
+  required GeminiNavigationSession navigationSession,
+  required String jobId,
+  required bool stripePayments,
+  required Future<InvoicePreview> Function({required String jobId}) fetchPreview,
+  Duration fetchTimeout = kViewInvoicePreviewTimeout,
+}) => _viewInvoice(
+  navigationSession: navigationSession,
+  jobId: jobId,
+  stripePayments: stripePayments,
+  fetchPreview: fetchPreview,
+  fetchTimeout: fetchTimeout,
+);
 
 /// `view_job_history` — the one of the four that needs a lookup first:
 /// [JobHistoryScreen] takes the whole job object (`job_detail_screen.dart`'s

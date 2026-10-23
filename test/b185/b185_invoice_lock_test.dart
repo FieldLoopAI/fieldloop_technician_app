@@ -4,7 +4,6 @@ import 'package:fielloop/models/invoice_adjustment.dart';
 import 'package:fielloop/models/invoice_payment.dart';
 import 'package:fielloop/models/invoice_preview.dart';
 import 'package:fielloop/providers/global_voice_service_provider.dart';
-import 'package:fielloop/providers/invoice_provider.dart';
 import 'package:fielloop/providers/jobs_provider.dart';
 import 'package:fielloop/screens/invoice_review_screen.dart';
 import 'package:flutter/material.dart';
