@@ -24,6 +24,7 @@ import '../models/kept_photo_ref.dart';
 import '../models/job_estimate.dart' show JobEstimate;
 import '../providers/arrival_provider.dart' show arrivalEventProvider;
 import '../providers/global_voice_service_provider.dart';
+import '../providers/invoice_provider.dart' show fetchInvoicePreview;
 import '../providers/job_change_orders_provider.dart';
 import '../providers/job_estimate_provider.dart';
 import '../providers/job_photos_provider.dart';
@@ -79,6 +80,7 @@ import '../services/live_camera_remark_veto.dart';
 import '../services/another_one_capture.dart';
 import '../services/b184_flags.dart';
 import '../services/b185_flags.dart';
+import '../services/invoice_preview_cache.dart';
 import '../services/remark_quick_reply.dart';
 import '../services/close_line_playback.dart';
 import '../services/late_finalize.dart';
@@ -935,6 +937,20 @@ const bool _useCachedConfirmationClips = true;
 /// voice session opens, so `view_estimate`/`view_change_orders` can answer
 /// from already-known state instead of a ~1.1–1.2s fetch.
 const bool _prefetchJobDataForVoice = true;
+
+/// B185: how long after session start the invoice preview prefetch begins.
+const Duration _invoicePreviewPrefetchDelay = Duration(seconds: 2);
+
+/// B185: whether closing the camera for go_back / "go to Job Details" shows
+/// the camera screen (cameraClosing, which pushes the camera host page)
+/// while it releases. Not when only the session-start prewarm is open — no
+/// camera task and the open never confirmed — since nothing was on screen.
+@visibleForTesting
+bool cameraCloseShowsCameraScreen({
+  required bool enabled,
+  required bool cameraTaskActive,
+  required bool cameraOpenConfirmed,
+}) => !enabled || cameraTaskActive || cameraOpenConfirmed;
 
 /// Server-side end-of-speech silence (`realtimeInputConfig.
 /// automaticActivityDetection.silenceDurationMs`). `null` = not sent — the
@@ -4279,6 +4295,20 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       ref.read(jobEstimateProvider(prefetchJobId));
       ref.read(jobChangeOrdersProvider(prefetchJobId));
       debugPrint('VOICE PREFETCH: estimate + change orders loading for job $prefetchJobId');
+    }
+    // B185 — the invoice preview (~5 s on the Lambda), started ~2 s in so it
+    // stays clear of the wake path and mic start, and only for a job whose
+    // estimate is approved. Never awaited; view_invoice uses it if ready.
+    if (kStripePayments && _prefetchJobDataForVoice && prefetchJobId != null) {
+      unawaited(
+        Future<void>.delayed(_invoicePreviewPrefetchDelay, () {
+          try {
+            if (!mounted) return;
+            if (ref.read(jobEstimateProvider(prefetchJobId)).valueOrNull?.isApproved != true) return;
+            invoicePreviewCache.prefetch(prefetchJobId, fetchInvoicePreview);
+          } catch (_) {}
+        }),
+      );
     }
     // Module C — the arrival state "how long have we been here" answers
     // from (Job Detail normally has both loaded already; this is a no-op
@@ -13400,6 +13430,7 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
     if (_screenTask == _ScreenTask.none && !cameraActuallyOpen) return responsePayload;
 
     final closedTask = _screenTask;
+    final wasOpenConfirmed = _cameraOpenConfirmed;
     _cameraOpenConfirmed = false;
     // Still opening: stop waiting on the native open (see
     // [GeminiCameraSession.cancelPendingOpen]) instead of queueing this close
@@ -13409,6 +13440,15 @@ class _GeminiLiveTestScreenState extends ConsumerState<GeminiLiveTestScreen> {
       // Read when the cancelled dispatch returns (asynchronously, after this).
       _cameraOpenCancelIntent = _CameraOpenCancelIntent.goBack;
       _log_('go_back: camera was still opening ($closedTask) — cancelled the pending open, nothing to release yet');
+    } else if (!cameraCloseShowsCameraScreen(
+      enabled: kStripePayments,
+      cameraTaskActive: closedTask != _ScreenTask.none,
+      cameraOpenConfirmed: wasOpenConfirmed,
+    )) {
+      // B185 — only the session-start prewarm is open (nothing on screen):
+      // release it without the cameraClosing state, whose host page flashed.
+      _log_('go_back: camera only prewarmed ($closedTask) — releasing it without showing the camera screen');
+      await _cameraSession.dispose();
     } else {
       // See [_ScreenTask.cameraClosing]: shown BEFORE the release is awaited.
       _log_('go_back: closing camera flow ($closedTask -> ${_ScreenTask.cameraClosing}) — releasing the native camera');

@@ -37,6 +37,7 @@ import '../screens/job_history_screen.dart';
 import '../screens/photo_preview_screen.dart';
 import '../screens/photo_viewer_screen.dart';
 import 'b185_flags.dart';
+import 'invoice_preview_cache.dart';
 
 /// Holds the camera state that `open_camera`/`capture_photo`/
 /// `confirm_photo_upload`/`retake_photo` share ACROSS separate Gemini
@@ -1708,9 +1709,15 @@ Future<Map<String, dynamic>> _viewChangeOrders({
   };
 }
 
-/// B185: the most `view_invoice` waits for `/invoices/preview` before
-/// falling back to the old [InvoiceScreen].
+/// B185 (build 193): the first `view_invoice` fetch timeout. No longer used
+/// by [_viewInvoice] — a real `/invoices/preview` measured ~5 s, so it now
+/// waits [kViewInvoiceFetchTimeout]. Kept only because
+/// test/b185/b185_view_invoice_voice_test.dart asserts its value.
 const Duration kViewInvoicePreviewTimeout = Duration(seconds: 3);
+
+/// B185: the most `view_invoice` waits on a running prefetch or its own
+/// `/invoices/preview` fetch before falling back to the old [InvoiceScreen].
+const Duration kViewInvoiceFetchTimeout = Duration(seconds: 8);
 
 /// B185: sessions with a `view_invoice` preview fetch still running — a
 /// repeat while it runs pushes nothing.
@@ -1720,13 +1727,16 @@ final Set<GeminiNavigationSession> _viewInvoiceFetchInFlight = {};
 /// [InvoiceReviewScreen] (same `/invoices/preview` fetch Job Detail's "View
 /// Full Invoice" does first), falling back to the old [InvoiceScreen] on any
 /// fetch failure or timeout. Same push, guard, name and returned map either
-/// way. The optional parameters exist only for test/b185.
+/// way. The preview comes from, in order: the voice session's fresh
+/// prefetched copy ([invoicePreviewCache]), that prefetch still running, or
+/// a fetch of its own. The optional parameters exist only for test/b185.
 Future<Map<String, dynamic>> _viewInvoice({
   required GeminiNavigationSession navigationSession,
   required String jobId,
   bool stripePayments = kStripePayments,
   Future<InvoicePreview> Function({required String jobId}) fetchPreview = fetchInvoicePreview,
-  Duration fetchTimeout = kViewInvoicePreviewTimeout,
+  Duration fetchTimeout = kViewInvoiceFetchTimeout,
+  InvoicePreviewCache? previewCache,
 }) async {
   if (!stripePayments) {
     final pushed = _pushUnlessAlreadyOnTop(navigationSession, 'view_invoice', InvoiceScreen(jobId: jobId));
@@ -1741,11 +1751,19 @@ Future<Map<String, dynamic>> _viewInvoice({
     debugPrint('VIEW REPEAT WHILE OPEN: "view_invoice" is still opening — not pushing a duplicate');
     return {'status': 'already_on_screen', 'job_id': jobId};
   }
+  final cached = (previewCache ?? invoicePreviewCache).take(jobId);
+  final cachedValue = cached?.value;
+  if (cachedValue != null) {
+    debugPrint('VIEW_INVOICE route=review reason=cache');
+    final pushed =
+        _pushUnlessAlreadyOnTop(navigationSession, 'view_invoice', InvoiceReviewScreen(jobId: jobId, preview: cachedValue));
+    return {'status': pushed ? 'navigated' : 'already_on_screen', 'job_id': jobId};
+  }
   _viewInvoiceFetchInFlight.add(navigationSession);
   Widget screen;
   try {
-    final preview = await fetchPreview(jobId: jobId).timeout(fetchTimeout);
-    debugPrint('VIEW_INVOICE route=review reason=ok');
+    final preview = await (cached?.pending ?? fetchPreview(jobId: jobId)).timeout(fetchTimeout);
+    debugPrint('VIEW_INVOICE route=review reason=${cached != null ? 'prefetch' : 'ok'}');
     screen = InvoiceReviewScreen(jobId: jobId, preview: preview);
   } catch (e) {
     debugPrint('VIEW_INVOICE route=fallback reason=${e is TimeoutException ? 'timeout' : 'fetch_failed'}');
@@ -1764,13 +1782,15 @@ Future<Map<String, dynamic>> viewInvoiceForTesting({
   required String jobId,
   required bool stripePayments,
   required Future<InvoicePreview> Function({required String jobId}) fetchPreview,
-  Duration fetchTimeout = kViewInvoicePreviewTimeout,
+  Duration fetchTimeout = kViewInvoiceFetchTimeout,
+  InvoicePreviewCache? previewCache,
 }) => _viewInvoice(
   navigationSession: navigationSession,
   jobId: jobId,
   stripePayments: stripePayments,
   fetchPreview: fetchPreview,
   fetchTimeout: fetchTimeout,
+  previewCache: previewCache,
 );
 
 /// `view_job_history` — the one of the four that needs a lookup first:
