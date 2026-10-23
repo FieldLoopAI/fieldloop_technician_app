@@ -107,6 +107,15 @@ bool showFixSomethingFirst({required bool enabled, required InvoicePaymentStatus
 bool showInternalFeeSection({required bool enabled, required InvoicePaymentStatus? status}) =>
     !(enabled && isInvoicePaymentFrozen(status));
 
+/// The "Platform Fee (x%)" rate as shown: the real rate to up to 2 decimals
+/// with trailing zeros trimmed (0.0195 -> "1.95", 0.02 -> "2"); flag off
+/// keeps the old 1-decimal text.
+String platformFeeRatePercent({required bool enabled, required double feeRate}) {
+  final percent = feeRate * 100;
+  if (!enabled) return percent.toStringAsFixed(1);
+  return percent.toStringAsFixed(2).replaceFirst(RegExp(r'\.?0+$'), '');
+}
+
 /// "Generate & Send Invoice" can't run once payment started on the latest
 /// invoice (the backend refuses it too).
 bool showGenerateButton({required bool enabled, required InvoicePaymentStatus? status}) =>

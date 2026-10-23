@@ -1150,7 +1150,10 @@ class _FinancialSummaryCard extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 10),
-                  _summarySmallLine('Platform Fee (${(preview.feeRate * 100).toStringAsFixed(1)}%)', preview.feeAmount),
+                  _summarySmallLine(
+                    'Platform Fee (${platformFeeRatePercent(enabled: kStripePayments, feeRate: preview.feeRate)}%)',
+                    preview.feeAmount,
+                  ),
                   const SizedBox(height: 4),
                   _summarySmallLine('Net to Contractor', preview.netToContractor),
                 ],
