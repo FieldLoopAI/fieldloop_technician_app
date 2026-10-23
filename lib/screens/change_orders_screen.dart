@@ -11,9 +11,11 @@ import '../providers/job_runtime_provider.dart';
 import '../providers/job_status_notifications_provider.dart';
 import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
+import '../providers/payment_lock.dart';
 import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
+import '../services/b185_flags.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../theme/design_tokens.dart';
@@ -366,13 +368,14 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                                     'it counts toward the total.'
                                 : 'No change orders were added to this job.',
                             actionLabel: 'Add Change Order',
-                            onAction: editable ? _addChangeOrderManually : null,
+                            onAction: editable && !_moneyLocked ? _addChangeOrderManually : null,
                           ),
                         )
                       else ...[
                         if (editable) ...[
+                          ..._moneyLockReason(),
                           FilledButton.icon(
-                            onPressed: _addChangeOrderManually,
+                            onPressed: _moneyLocked ? null : _addChangeOrderManually,
                             icon: const Icon(Icons.add_rounded, size: 20),
                             label: const Text('Add Change Order'),
                             style: primaryActionButtonStyle,
@@ -451,6 +454,26 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
         Text(label, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: color, letterSpacing: 0.3)),
       ],
     );
+  }
+
+  /// B185 money freeze — see `payment_lock.dart`. Always false with the
+  /// flag off (nothing is read then).
+  bool get _moneyLocked => watchJobMoneyLocked(ref, widget.jobId);
+
+  /// The plain reason above the disabled actions while the payment is
+  /// pending/paid (or its status couldn't be read); nothing otherwise.
+  List<Widget> _moneyLockReason() {
+    if (!kStripePayments) return const [];
+    final reason = jobMoneyLockReason(ref, widget.jobId);
+    if (reason == null) return const [];
+    return [
+      Text(
+        reason,
+        textAlign: TextAlign.center,
+        style: const TextStyle(color: AppColors.neutralGrey, fontSize: 12.5, fontWeight: FontWeight.w600),
+      ),
+      const SizedBox(height: 10),
+    ];
   }
 
   Widget _buildChangeOrderCard(ChangeOrder changeOrder) {
@@ -539,7 +562,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                 label: 'Looks good, send to customer',
                 icon: Icons.check_circle_outline_rounded,
                 isLoading: isSaving,
-                onPressed: () => _saveChangeOrder(changeOrder),
+                onPressed: _moneyLocked ? null : () => _saveChangeOrder(changeOrder),
               )
             else if (!isVoided)
               isVoiding
@@ -549,7 +572,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                       children: [
                         if (changeOrder.isApproved) ...[
                           TextButton(
-                            onPressed: isSaving ? null : () => _startVoiding(changeOrder.id),
+                            onPressed: (isSaving || _moneyLocked) ? null : () => _startVoiding(changeOrder.id),
                             style: TextButton.styleFrom(foregroundColor: AppColors.statusRedText),
                             child: const Row(
                               mainAxisSize: MainAxisSize.min,
@@ -565,7 +588,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                         TextButton(
                           // Was the legacy dictation flow; manual entry until voice
                           // dictation is rebuilt on Gemini Live.
-                          onPressed: _addChangeOrderManually,
+                          onPressed: _moneyLocked ? null : _addChangeOrderManually,
                           child: const Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -640,7 +663,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
               ),
               const SizedBox(width: 4),
               TextButton(
-                onPressed: (isSaving || !canConfirm) ? null : () => _confirmVoid(changeOrder),
+                onPressed: (isSaving || !canConfirm || _moneyLocked) ? null : () => _confirmVoid(changeOrder),
                 style: TextButton.styleFrom(foregroundColor: AppColors.statusRedText),
                 child: isSaving
                     ? const SizedBox(

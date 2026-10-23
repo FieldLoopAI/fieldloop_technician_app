@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/env.dart';
+import 'payment_lock.dart';
 
 /// Saves a change order via the `/change-orders/create` Lambda: the Lambda
 /// itself extracts the dollar amount from the verbatim [description] (same
@@ -24,6 +25,7 @@ import '../config/env.dart';
 /// as-is instead of extracting one from [description] with Groq. Everything
 /// else (pending status, customer approval SMS) is identical either way.
 Future<bool> createChangeOrder({required String jobId, required String description, double? amount}) async {
+  await ensureJobMoneyUnlocked(jobId);
   final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
   if (accessToken == null) {
     throw StateError('No active session — please sign in again.');

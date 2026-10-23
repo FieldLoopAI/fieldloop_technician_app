@@ -132,6 +132,25 @@ bool adjustmentsLocked({
     updatingAdjustments ||
     (enabled && (load != PaymentStatusLoad.loaded || isInvoicePaymentFrozen(status)));
 
+/// Build 185 money freeze for the estimate, change orders and adjustments:
+/// exactly the payment part of [adjustmentsLocked] — locked while the job's
+/// latest invoice is pending or paid, or while that status hasn't loaded.
+/// An expired Checkout session unlocks once the stripe-webhook resets the
+/// invoice to unpaid.
+bool jobMoneyLocked({
+  required bool enabled,
+  required PaymentStatusLoad load,
+  required InvoicePaymentStatus? status,
+}) =>
+    enabled && (load != PaymentStatusLoad.loaded || isInvoicePaymentFrozen(status));
+
+/// Shown with the disabled money actions, and the error a blocked write
+/// throws.
+const String kPaymentLockedMessage = 'Payment started - invoice is locked';
+
+/// A money write refused because the payment status couldn't be read.
+const String kPaymentStatusUncheckedMessage = "Couldn't check the payment status - try again";
+
 /// "Fix something first" (pop back to Job Detail to edit) is hidden once the
 /// invoice is frozen — there is nothing left to fix before sending.
 bool showFixSomethingFirst({required bool enabled, required InvoicePaymentStatus? status}) =>

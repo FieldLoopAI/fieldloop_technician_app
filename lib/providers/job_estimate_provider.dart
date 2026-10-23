@@ -8,6 +8,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../config/env.dart';
 import '../models/job_estimate.dart';
 import 'job_status_notifications_provider.dart';
+import 'payment_lock.dart';
 
 /// The current, most-recent structured estimate for a job. Reads go
 /// straight to `job_estimates` through the technician's own authenticated
@@ -185,7 +186,10 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
     if (!mounted) return;
     debugPrint('ESTIMATE: parseDictation starting for dictation $dictationId (job $jobId)');
     state = const AsyncLoading();
-    final result = await AsyncValue.guard(() => _parse(dictationId));
+    final result = await AsyncValue.guard(() async {
+      await ensureJobMoneyUnlocked(jobId);
+      return _parse(dictationId);
+    });
     if (!mounted) return;
     if (result.hasError) {
       debugPrint('ESTIMATE ERROR (parse): ${result.error}');
@@ -230,6 +234,7 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
   /// failure (the editor shows the error and keeps the technician's input);
   /// on success the new draft becomes [state] immediately.
   Future<void> createManual(List<EstimateLineItem> lineItems) async {
+    await ensureJobMoneyUnlocked(jobId);
     final accessToken = Supabase.instance.client.auth.currentSession?.accessToken;
     if (accessToken == null) {
       throw StateError('No active session — please sign in again.');
@@ -270,6 +275,7 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
     required List<EstimateLineItem> lineItems,
     required double totalAmount,
   }) async {
+    await ensureJobMoneyUnlocked(jobId);
     debugPrint('ESTIMATE: saving edited line items for estimate $estimateId (job $jobId)...');
     await Supabase.instance.client
         .from('job_estimates')
@@ -308,6 +314,7 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
   /// with a message written to be shown directly to the technician — if the
   /// phone number is missing, PDF generation fails, or the SMS send fails.
   Future<String> sendToCustomer(String estimateId, {void Function(String status)? onStatus}) async {
+    await ensureJobMoneyUnlocked(jobId);
     debugPrint('ESTIMATE: looking up customer contact for job $jobId...');
     final jobRow = await Supabase.instance.client
         .from('jobs')
@@ -392,6 +399,7 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
   /// for an approved, not-yet-voided estimate — see
   /// `supabase/migrations/20260821020000_job_estimates_voiding.sql`.
   Future<void> voidEstimate({required String estimateId, required String reason}) async {
+    await ensureJobMoneyUnlocked(jobId);
     debugPrint('ESTIMATE: voiding estimate $estimateId (job $jobId)...');
     final voidedAt = DateTime.now().toUtc();
     await Supabase.instance.client

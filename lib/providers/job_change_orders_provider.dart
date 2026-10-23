@@ -4,6 +4,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/change_order.dart';
 import 'job_status_notifications_provider.dart';
+import 'payment_lock.dart';
 
 /// All `change_orders` rows for a job — pending and approved alike (see
 /// `ChangeOrdersScreen`, the sole reader). Reads go straight through the
@@ -142,6 +143,7 @@ class JobChangeOrdersController extends StateNotifier<AsyncValue<List<ChangeOrde
     required String description,
     required double additionalAmount,
   }) async {
+    await ensureJobMoneyUnlocked(jobId);
     debugPrint('CHANGE ORDER: saving edits for change order $changeOrderId (job $jobId)...');
     await Supabase.instance.client
         .from('change_orders')
@@ -174,6 +176,7 @@ class JobChangeOrdersController extends StateNotifier<AsyncValue<List<ChangeOrde
   /// attempt on an already-voided row, or a void attempt on a 'declined'
   /// row, is rejected at the database level even if somehow triggered.
   Future<void> voidChangeOrder({required String changeOrderId, required String reason}) async {
+    await ensureJobMoneyUnlocked(jobId);
     debugPrint('CHANGE ORDER: voiding change order $changeOrderId (job $jobId)...');
     final voidedAt = DateTime.now().toUtc();
     await Supabase.instance.client

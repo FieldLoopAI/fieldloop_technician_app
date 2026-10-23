@@ -12,9 +12,11 @@ import '../providers/job_runtime_provider.dart';
 import '../providers/job_status_notifications_provider.dart';
 import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
+import '../providers/payment_lock.dart';
 import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
+import '../services/b185_flags.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../theme/design_tokens.dart';
@@ -371,6 +373,26 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
     );
   }
 
+  /// B185 money freeze — see `payment_lock.dart`. Always false with the
+  /// flag off (nothing is read then).
+  bool get _moneyLocked => watchJobMoneyLocked(ref, widget.jobId);
+
+  /// The plain reason under the disabled actions while the payment is
+  /// pending/paid (or its status couldn't be read); nothing otherwise.
+  List<Widget> _moneyLockReason() {
+    if (!kStripePayments) return const [];
+    final reason = jobMoneyLockReason(ref, widget.jobId);
+    if (reason == null) return const [];
+    return [
+      Text(
+        reason,
+        textAlign: TextAlign.center,
+        style: const TextStyle(color: AppColors.neutralGrey, fontSize: 12.5, fontWeight: FontWeight.w600),
+      ),
+      const SizedBox(height: 10),
+    ];
+  }
+
   Widget _buildNoEstimateCard() {
     // Same active-job gate Job Detail uses for its entry points — a finished
     // job viewed from History is read-only. (Voice dictation is removed from
@@ -384,7 +406,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
             ? 'Add the line items for this job. It saves as a draft you can review before sending.'
             : 'No estimate was created for this job.',
         actionLabel: 'Create Estimate',
-        onAction: editable
+        onAction: editable && !_moneyLocked
             ? () => Navigator.of(
                 context,
               ).push(FadeSlidePageRoute(builder: (_) => ManualEstimateScreen(jobId: widget.jobId)))
@@ -465,7 +487,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
               Align(
                 alignment: Alignment.centerLeft,
                 child: TextButton.icon(
-                  onPressed: _addLineItem,
+                  onPressed: _moneyLocked ? null : _addLineItem,
                   icon: const Icon(Icons.add_rounded, size: 18),
                   label: const Text('Add line item'),
                 ),
@@ -505,6 +527,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
           ),
           const SizedBox(height: 10),
         ],
+        ..._moneyLockReason(),
         Stack(
           alignment: Alignment.center,
           children: [
@@ -512,14 +535,14 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
               label: 'Looks good, send to customer',
               icon: Icons.send_rounded,
               isLoading: _sending,
-              onPressed: _savingDraft ? null : () => _sendDraftEstimate(estimate),
+              onPressed: (_savingDraft || _moneyLocked) ? null : () => _sendDraftEstimate(estimate),
             ),
             if (_showConfirmation) const _ConfirmationCheck(),
           ],
         ),
         const SizedBox(height: 10),
         OutlinedButton.icon(
-          onPressed: (_sending || _savingDraft) ? null : () => _saveDraftEdits(estimate),
+          onPressed: (_sending || _savingDraft || _moneyLocked) ? null : () => _saveDraftEdits(estimate),
           icon: _savingDraft
               ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
               : const Icon(Icons.save_outlined, size: 18),
@@ -577,6 +600,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
         // reason) or superseded by a brand-new estimate.
         if (estimate.isApproved && !estimate.isVoided) ...[
           const SizedBox(height: 16),
+          ..._moneyLockReason(),
           isVoiding ? _buildVoidExpansion(estimate) : _buildVoidPrompt(),
         ],
         if (_voidError != null) ...[
@@ -607,7 +631,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
     return Align(
       alignment: Alignment.centerRight,
       child: TextButton(
-        onPressed: _startVoiding,
+        onPressed: _moneyLocked ? null : _startVoiding,
         style: TextButton.styleFrom(foregroundColor: AppColors.statusRedText),
         child: const Row(
           mainAxisSize: MainAxisSize.min,
@@ -667,7 +691,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
               TextButton(onPressed: _voiding ? null : _cancelVoiding, child: const Text('Cancel')),
               const SizedBox(width: 4),
               TextButton(
-                onPressed: (_voiding || !canConfirm) ? null : () => _confirmVoid(estimate),
+                onPressed: (_voiding || !canConfirm || _moneyLocked) ? null : () => _confirmVoid(estimate),
                 style: TextButton.styleFrom(foregroundColor: AppColors.statusRedText),
                 child: _voiding
                     ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
