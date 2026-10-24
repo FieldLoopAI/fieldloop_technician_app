@@ -226,8 +226,10 @@ void main() {
       for (final guarded in [
         'onAction: editable && !_moneyLocked',
         'onPressed: _moneyLocked ? null : _addLineItem',
-        'onPressed: (_savingDraft || _moneyLocked) ? null',
-        'onPressed: (_sending || _savingDraft || _moneyLocked) ? null',
+        'onPressed: (_savingDraft || _moneyLocked || problem != null)',
+        'onPressed: (_sending || _savingDraft || _moneyLocked || problem != null)',
+        'onPressed: locked ? null : () => _removeLineItem(item)',
+        'onPressed: _moneyLocked ? null : _createNewEstimate',
         'onPressed: _moneyLocked ? null : _startVoiding',
         'onPressed: (_voiding || !canConfirm || _moneyLocked) ? null',
       ]) {

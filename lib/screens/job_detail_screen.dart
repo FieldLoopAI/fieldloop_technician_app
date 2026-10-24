@@ -1337,7 +1337,9 @@ class _TabSelector extends ConsumerWidget {
     final changeOrders = ref.watch(jobChangeOrdersProvider(jobId)).valueOrNull ?? const <ChangeOrder>[];
     final adjustments = ref.watch(jobInvoiceAdjustmentsProvider(jobId)).valueOrNull ?? const [];
     final pendingCount = changeOrders.where((co) => co.isPending).length;
-    final invoiceTotal = estimate == null
+    // A voided estimate never counts (the provider already skips voided
+    // rows; this guards the brief window before its re-read lands).
+    final invoiceTotal = estimate == null || estimate.isVoided
         ? null
         : estimate.totalAmount +
               _approvedChangeOrdersTotal(changeOrders) +
@@ -1482,6 +1484,22 @@ class _TabContent extends ConsumerWidget {
                 const Divider(height: 24),
                 _TotalRow(label: 'Estimate total', amount: estimate.totalAmount),
                 const SizedBox(height: 14),
+                // A declined estimate is replaced by a new one, which is
+                // shown from then on (see selectDisplayedEstimate).
+                if (estimate.isDeclined && voiceEligible) ...[
+                  ..._moneyLockReason(ref, job.id),
+                  FilledButton.icon(
+                    onPressed: watchJobMoneyLocked(ref, job.id)
+                        ? null
+                        : () => Navigator.of(
+                            context,
+                          ).push(FadeSlidePageRoute(builder: (_) => ManualEstimateScreen(jobId: job.id))),
+                    icon: const Icon(Icons.add_rounded, size: 20),
+                    label: const Text('Create a new estimate'),
+                    style: primaryActionButtonStyle,
+                  ),
+                  const SizedBox(height: 10),
+                ],
                 OutlinedButton(
                   onPressed: () => Navigator.of(
                     context,
@@ -1561,7 +1579,7 @@ class _TabContent extends ConsumerWidget {
         final changeOrders = ref.watch(jobChangeOrdersProvider(job.id)).valueOrNull ?? const <ChangeOrder>[];
         final adjustments = ref.watch(jobInvoiceAdjustmentsProvider(job.id)).valueOrNull ?? const [];
         final total =
-            (estimate?.totalAmount ?? 0) +
+            (estimate == null || estimate.isVoided ? 0 : estimate.totalAmount) +
             _approvedChangeOrdersTotal(changeOrders) +
             adjustments.fold<double>(0, (sum, a) => sum + a.amount);
         return _SectionCard(

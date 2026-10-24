@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -90,6 +91,12 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
   String? _editingEstimateId;
   final List<EditableLineItem> _editableItems = [];
 
+  // The saved line each editable row was seeded from (identity-keyed), so a
+  // save keeps its quantity/unit price while its amount is unchanged; and
+  // the rows' text as last saved, for the unsaved-changes warning.
+  final Map<EditableLineItem, EstimateLineItem> _originalLines = Map.identity();
+  List<String> _savedSnapshot = const [];
+
   // Void — same in-card-expansion pattern as ChangeOrdersScreen's
   // `_voidReasonControllers` (see that screen's doc comment for why this is
   // deliberately not a modal dialog: an AlertDialog here raced the realtime
@@ -123,48 +130,163 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
     for (final item in _editableItems) {
       item.dispose();
     }
-    _editableItems
-      ..clear()
-      ..addAll(
-        estimate.lineItems.isEmpty
-            ? [EditableLineItem()]
-            : estimate.lineItems.map(
-                (item) => EditableLineItem(description: item.description, amount: item.amount),
-              ),
-      );
+    _editableItems.clear();
+    _originalLines.clear();
+    if (estimate.lineItems.isEmpty) {
+      _editableItems.add(EditableLineItem());
+    } else {
+      for (final line in estimate.lineItems) {
+        final row = EditableLineItem(description: line.description, amount: line.amount);
+        _editableItems.add(row);
+        _originalLines[row] = line;
+      }
+    }
     _editingEstimateId = estimate.id;
+    _savedSnapshot = _snapshot();
   }
 
-  double get _editableTotal => _editableItems.fold<double>(0, (sum, item) => sum + item.amount);
+  /// The live total, in whole cents (a value that isn't a finite number
+  /// counts as $0 here; [_checkDraft] reports it).
+  double get _editableTotal =>
+      _editableItems.fold<int>(0, (sum, item) => sum + (_toCents(item.amount) ?? 0)) / 100;
 
   void _addLineItem() => setState(() => _editableItems.add(EditableLineItem()));
 
   void _removeLineItem(EditableLineItem item) {
     setState(() => _editableItems.remove(item));
+    _originalLines.remove(item);
     item.dispose();
   }
 
-  /// Feature 1.3 + Feature 2 — saves any edits, then sends the finalized
-  /// estimate to the customer over SMS (see
+  List<String> _snapshot() => [
+    for (final row in _editableItems) '${row.descriptionController.text}\u0000${row.amountController.text}',
+  ];
+
+  /// The draft editor has edits that haven't been saved yet.
+  bool get _draftDirty => !listEquals(_snapshot(), _savedSnapshot);
+
+  /// Checks the editor's rows before a save or send. A completely blank row
+  /// is skipped; any other row needs a description and an amount above $0
+  /// and below $1,000,000. Amounts and the total are rounded to cents. A row
+  /// keeps its saved quantity/unit price while its amount is unchanged; an
+  /// edited or new row becomes 1 × its amount.
+  _DraftCheck _checkDraft() {
+    final rows = <EditableLineItem>[];
+    final items = <EstimateLineItem>[];
+    var totalCents = 0;
+    for (final row in _editableItems) {
+      final description = row.descriptionController.text.trim();
+      final amountText = row.amountController.text.trim();
+      if (description.isEmpty && amountText.isEmpty) continue;
+      if (description.isEmpty) return const _DraftCheck.problem('Add a description for every line.');
+      if (amountText.isEmpty) return const _DraftCheck.problem('Add an amount for every line.');
+      final cents = _toCents(double.tryParse(amountText));
+      if (cents == null || cents <= 0 || cents >= _maxLineCents) {
+        return const _DraftCheck.problem(
+          'Each line amount must be more than \$0.00 and less than \$1,000,000.00.',
+        );
+      }
+      final amount = cents / 100;
+      final original = _originalLines[row];
+      final unchanged = original != null && _toCents(original.amount) == cents;
+      rows.add(row);
+      items.add(
+        EstimateLineItem(
+          description: description,
+          amount: amount,
+          quantity: unchanged ? original.quantity : 1,
+          unitPrice: unchanged ? original.unitPrice : amount,
+        ),
+      );
+      totalCents += cents;
+    }
+    if (items.isEmpty) return const _DraftCheck.problem('Add at least one line item before saving.');
+    if (totalCents <= 0) return const _DraftCheck.problem('The estimate total must be more than \$0.00.');
+    return _DraftCheck(rows: rows, items: items, total: totalCents / 100);
+  }
+
+  /// A line item amount must stay below $1,000,000.00.
+  static const _maxLineCents = 100000000;
+
+  static int? _toCents(double? value) => value == null || !value.isFinite ? null : (value * 100).round();
+
+  /// After a successful save: the saved lines become the rows' originals and
+  /// the editor is no longer "unsaved".
+  void _markSaved(_DraftCheck check) {
+    for (var i = 0; i < check.rows.length; i++) {
+      _originalLines[check.rows[i]] = check.items[i];
+    }
+    _savedSnapshot = _snapshot();
+  }
+
+  /// "3 × $50.00" under a row whose saved line has a quantity above 1, while
+  /// its amount is unchanged (an edited amount saves as 1 × the new amount).
+  String? _quantityHint(EditableLineItem row) {
+    final original = _originalLines[row];
+    final quantity = original?.quantity;
+    final unitPrice = original?.unitPrice;
+    if (original == null || quantity == null || unitPrice == null || quantity <= 1) return null;
+    if (_toCents(double.tryParse(row.amountController.text.trim())) != _toCents(original.amount)) return null;
+    return quantityHintText(quantity, unitPrice);
+  }
+
+  Future<bool> _confirmSend(double total) async {
+    final send = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Send estimate?'),
+        content: Text('Send this estimate of \$${total.toStringAsFixed(2)} to the customer?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dialogContext).pop(false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.of(dialogContext).pop(true), child: const Text('Send')),
+        ],
+      ),
+    );
+    return send ?? false;
+  }
+
+  /// Same pattern as ManualEstimateScreen's discard warning.
+  Future<bool> _confirmDiscard() async {
+    final discard = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Discard your changes?'),
+        content: const Text("Your edits to this estimate won't be saved."),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dialogContext).pop(false), child: const Text('Keep editing')),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            style: TextButton.styleFrom(foregroundColor: AppColors.error),
+            child: const Text('Discard'),
+          ),
+        ],
+      ),
+    );
+    return discard ?? false;
+  }
+
+  /// Feature 1.3 + Feature 2 — after the technician confirms, saves any
+  /// edits, then sends the finalized estimate to the customer over SMS (see
   /// [JobEstimateController.saveLineItems]/[JobEstimateController.sendToCustomer]
   /// for the actual backend calls). Any failure (missing phone, SMS
   /// failure, save failure) surfaces inline via [_sendError] rather than
   /// silently leaving/marking the estimate sent.
   Future<void> _sendDraftEstimate(JobEstimate estimate) async {
+    final check = _checkDraft();
+    if (check.problem != null) {
+      setState(() => _sendError = check.problem);
+      return;
+    }
+    if (!await _confirmSend(check.total) || !mounted) return;
     setState(() {
       _sending = true;
       _sendingStatus = 'Saving edits…';
       _sendError = null;
     });
     try {
-      final items = _editableItems
-          .map((e) => EstimateLineItem(description: e.descriptionController.text.trim(), amount: e.amount))
-          .where((item) => item.description.isNotEmpty)
-          .toList();
-      final total = items.fold<double>(0, (sum, item) => sum + item.amount);
-
       final notifier = ref.read(jobEstimateProvider(widget.jobId).notifier);
-      await notifier.saveLineItems(estimateId: estimate.id, lineItems: items, totalAmount: total);
+      await notifier.saveLineItems(estimateId: estimate.id, lineItems: check.items, totalAmount: check.total);
+      _markSaved(check);
       final customerName = await notifier.sendToCustomer(
         estimate.id,
         onStatus: (status) {
@@ -232,11 +354,10 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
       setState(() {
         _voiding = false;
         _voidReasonController = null;
-        _showConfirmation = true;
-        _confirmationMessage = 'Estimate voided';
       });
-      await Future.delayed(const Duration(milliseconds: 1600));
-      if (mounted && _confirmationMessage == 'Estimate voided') setState(() => _showConfirmation = false);
+      // A snackbar, not the in-card confirmation: once voided the estimate
+      // is no longer the one shown (see selectDisplayedEstimate).
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Estimate voided')));
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -263,85 +384,101 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
   Widget build(BuildContext context) {
     final job = ref.watch(jobByIdProvider(widget.jobId));
     final estimateAsync = ref.watch(jobEstimateProvider(widget.jobId));
+    final parsing = ref.watch(estimateParsingProvider(widget.jobId));
     ref.listen<JobStatusNotification?>(
       jobStatusNotificationProvider(widget.jobId),
       (previous, next) => _handleStatusNotification(next),
     );
+    final guardEdits =
+        (estimateAsync.valueOrNull?.isDraft ?? false) &&
+        _editingEstimateId == estimateAsync.valueOrNull?.id &&
+        _draftDirty &&
+        !_sending &&
+        !_savingDraft;
 
-    return Scaffold(
-      backgroundColor: AppColors.background,
-      appBar: AppBar(
-        title: Text(job != null ? 'Estimate · ${job.jobIdPublic}' : 'Estimate'),
-        backgroundColor: AppColors.surface,
-        foregroundColor: AppColors.textDark,
-        elevation: 0,
-        actions: const [
-          Padding(padding: EdgeInsets.only(right: 14), child: Center(child: VoicePhaseIndicator())),
-        ],
-      ),
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final horizontalPadding = responsiveGutter(constraints.maxWidth, min: 20);
+    return PopScope(
+      canPop: !guardEdits,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        if (await _confirmDiscard() && context.mounted) Navigator.of(context).pop();
+      },
+      child: Scaffold(
+        backgroundColor: AppColors.background,
+        appBar: AppBar(
+          title: Text(job != null ? 'Estimate · ${job.jobIdPublic}' : 'Estimate'),
+          backgroundColor: AppColors.surface,
+          foregroundColor: AppColors.textDark,
+          elevation: 0,
+          actions: const [
+            Padding(padding: EdgeInsets.only(right: 14), child: Center(child: VoicePhaseIndicator())),
+          ],
+        ),
+        body: SafeArea(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final horizontalPadding = responsiveGutter(constraints.maxWidth, min: 20);
 
-            return SingleChildScrollView(
-              padding: EdgeInsets.fromLTRB(horizontalPadding, 20, horizontalPadding, 32),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  if (_activeNotification != null)
-                    StatusNotificationBanner(
-                      notification: _activeNotification!,
-                      onDismiss: () => setState(() => _activeNotification = null),
+              return SingleChildScrollView(
+                padding: EdgeInsets.fromLTRB(horizontalPadding, 20, horizontalPadding, 32),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (_activeNotification != null)
+                      StatusNotificationBanner(
+                        notification: _activeNotification!,
+                        onDismiss: () => setState(() => _activeNotification = null),
+                      ),
+                    const Text(
+                      'Itemized Estimate',
+                      style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: AppColors.textDark),
                     ),
-                  const Text(
-                    'Itemized Estimate',
-                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: AppColors.textDark),
-                  ),
-                  const SizedBox(height: 4),
-                  const Text(
-                    'One proposal for this job — no pricing tiers.',
-                    style: TextStyle(fontSize: 13, color: AppColors.neutralGrey),
-                  ),
-                  const SizedBox(height: 20),
-                  estimateAsync.when(
-                    loading: _buildLoadingCard,
-                    error: (error, stackTrace) => _buildErrorCard(error),
-                    data: (estimate) {
-                      if (estimate == null) return _buildNoEstimateCard();
-                      debugPrint(
-                        'ESTIMATE SCREEN: rendering with id=${estimate.id} status="${estimate.status}" '
-                        'isDraft=${estimate.isDraft} isVoided=${estimate.isVoided} '
-                        'createdAt=${estimate.createdAt}',
-                      );
-                      if (estimate.isDraft) return _buildDraftReview(estimate);
-                      return _buildFinalized(estimate);
-                    },
-                  ),
-                ],
-              ),
-            );
-          },
+                    const SizedBox(height: 4),
+                    const Text(
+                      'One proposal for this job — no pricing tiers.',
+                      style: TextStyle(fontSize: 13, color: AppColors.neutralGrey),
+                    ),
+                    const SizedBox(height: 20),
+                    estimateAsync.when(
+                      loading: () => _buildLoadingCard(parsing: parsing),
+                      error: (error, stackTrace) => _buildErrorCard(error),
+                      data: (estimate) {
+                        if (estimate == null) return _buildNoEstimateCard();
+                        debugPrint(
+                          'ESTIMATE SCREEN: rendering with id=${estimate.id} status="${estimate.status}" '
+                          'isDraft=${estimate.isDraft} isVoided=${estimate.isVoided} '
+                          'createdAt=${estimate.createdAt}',
+                        );
+                        if (estimate.isDraft) return _buildDraftReview(estimate);
+                        return _buildFinalized(estimate);
+                      },
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildLoadingCard() {
+  /// [parsing]: a voice dictation is being parsed (see
+  /// [estimateParsingProvider]); otherwise the estimate is just loading.
+  Widget _buildLoadingCard({required bool parsing}) {
     return _estimateCard(
-      const Padding(
-        padding: EdgeInsets.symmetric(vertical: 20),
+      Padding(
+        padding: const EdgeInsets.symmetric(vertical: 20),
         child: Column(
           children: [
-            SizedBox(
+            const SizedBox(
               width: 26,
               height: 26,
               child: CircularProgressIndicator(strokeWidth: 3, color: AppColors.primaryGreen),
             ),
-            SizedBox(height: 14),
+            const SizedBox(height: 14),
             Text(
-              'Parsing your dictated estimate…',
-              style: TextStyle(fontSize: 13, color: AppColors.neutralGrey, fontWeight: FontWeight.w600),
+              parsing ? 'Parsing your dictated estimate…' : 'Loading your estimate…',
+              style: const TextStyle(fontSize: 13, color: AppColors.neutralGrey, fontWeight: FontWeight.w600),
             ),
           ],
         ),
@@ -418,12 +555,9 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
   /// Saves the draft's line-item edits WITHOUT sending — the manual edit
   /// path for an existing draft, however it was created (dictated or typed).
   Future<void> _saveDraftEdits(JobEstimate estimate) async {
-    final items = _editableItems
-        .map((e) => EstimateLineItem(description: e.descriptionController.text.trim(), amount: e.amount))
-        .where((item) => item.description.isNotEmpty)
-        .toList();
-    if (items.isEmpty) {
-      setState(() => _sendError = 'Add at least one line item with a description before saving.');
+    final check = _checkDraft();
+    if (check.problem != null) {
+      setState(() => _sendError = check.problem);
       return;
     }
     setState(() {
@@ -431,11 +565,11 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
       _sendError = null;
     });
     try {
-      final total = items.fold<double>(0, (sum, item) => sum + item.amount);
       await ref
           .read(jobEstimateProvider(widget.jobId).notifier)
-          .saveLineItems(estimateId: estimate.id, lineItems: items, totalAmount: total);
+          .saveLineItems(estimateId: estimate.id, lineItems: check.items, totalAmount: check.total);
       if (!mounted) return;
+      _markSaved(check);
       setState(() => _savingDraft = false);
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Estimate changes saved.')));
     } catch (e) {
@@ -454,6 +588,8 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
   /// only way forward (Feature 2).
   Widget _buildDraftReview(JobEstimate estimate) {
     _seedEditableItems(estimate);
+    final locked = _moneyLocked;
+    final problem = _checkDraft().problem;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -477,12 +613,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
           Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              for (final item in _editableItems)
-                EditableLineItemRow(
-                  item: item,
-                  onChanged: () => setState(() {}),
-                  onDelete: () => _removeLineItem(item),
-                ),
+              for (final item in _editableItems) _buildEditableRow(item, locked: locked),
               const SizedBox(height: 6),
               Align(
                 alignment: Alignment.centerLeft,
@@ -507,7 +638,15 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
           ),
         ),
         const SizedBox(height: 20),
-        if (_sendError != null) ...[
+        if (problem != null && !locked) ...[
+          Text(
+            problem,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: AppColors.statusRedText, fontSize: 13, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 10),
+        ],
+        if (_sendError != null && _sendError != problem) ...[
           Text(_sendError!, style: const TextStyle(color: AppColors.statusRedText, fontSize: 13, fontWeight: FontWeight.w600)),
           const SizedBox(height: 10),
         ],
@@ -535,14 +674,18 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
               label: 'Looks good, send to customer',
               icon: Icons.send_rounded,
               isLoading: _sending,
-              onPressed: (_savingDraft || _moneyLocked) ? null : () => _sendDraftEstimate(estimate),
+              onPressed: (_savingDraft || _moneyLocked || problem != null)
+                  ? null
+                  : () => _sendDraftEstimate(estimate),
             ),
             if (_showConfirmation) const _ConfirmationCheck(),
           ],
         ),
         const SizedBox(height: 10),
         OutlinedButton.icon(
-          onPressed: (_sending || _savingDraft || _moneyLocked) ? null : () => _saveDraftEdits(estimate),
+          onPressed: (_sending || _savingDraft || _moneyLocked || problem != null)
+              ? null
+              : () => _saveDraftEdits(estimate),
           icon: _savingDraft
               ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
               : const Icon(Icons.save_outlined, size: 18),
@@ -552,6 +695,47 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
       ],
     );
   }
+
+  /// One draft row: the shared [EditableLineItemRow] (without its own small
+  /// delete button) plus a full 48dp remove target, and the read-only
+  /// "3 × $50.00" hint. While the payment lock is on the row is read-only:
+  /// its fields take no taps or focus and remove is disabled.
+  Widget _buildEditableRow(EditableLineItem item, {required bool locked}) {
+    final hint = _quantityHint(item);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: ExcludeFocus(
+                excluding: locked,
+                child: AbsorbPointer(
+                  absorbing: locked,
+                  child: EditableLineItemRow(item: item, onChanged: () => setState(() {})),
+                ),
+              ),
+            ),
+            IconButton(
+              onPressed: locked ? null : () => _removeLineItem(item),
+              tooltip: 'Remove line item',
+              constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+              icon: const Icon(Icons.close_rounded, size: 22, color: AppColors.neutralGrey),
+            ),
+          ],
+        ),
+        if (hint != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Text(hint, style: const TextStyle(fontSize: 12, color: AppColors.neutralGrey)),
+          ),
+      ],
+    );
+  }
+
+  void _createNewEstimate() => Navigator.of(
+    context,
+  ).push(FadeSlidePageRoute(builder: (_) => ManualEstimateScreen(jobId: widget.jobId)));
 
   /// A non-draft (`'sent'`, `'approved'`, `'declined'`, ...) estimate.
   /// [estimate]'s own real `status`/`isVoided` drive everything shown here —
@@ -602,6 +786,26 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
           const SizedBox(height: 16),
           ..._moneyLockReason(),
           isVoiding ? _buildVoidExpansion(estimate) : _buildVoidPrompt(),
+        ],
+        // A declined estimate is replaced by a new one: the new draft is
+        // shown from then on (see selectDisplayedEstimate).
+        if (estimate.isDeclined &&
+            !estimate.isVoided &&
+            activeJobStatuses.contains(ref.watch(jobRuntimeProvider(widget.jobId)).status)) ...[
+          const SizedBox(height: 16),
+          const Text(
+            'The customer declined this estimate. Create a new one to send a revised price.',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 12.5, color: AppColors.neutralGrey),
+          ),
+          const SizedBox(height: 10),
+          ..._moneyLockReason(),
+          FilledButton.icon(
+            onPressed: _moneyLocked ? null : _createNewEstimate,
+            icon: const Icon(Icons.add_rounded, size: 20),
+            label: const Text('Create a new estimate'),
+            style: primaryActionButtonStyle,
+          ),
         ],
         if (_voidError != null) ...[
           const SizedBox(height: 10),
@@ -666,7 +870,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
         children: [
           const Text(
             'This closes it out as a historical record — it cannot be edited or voided again '
-            'afterward. If more work is needed, dictate a brand-new estimate instead.',
+            'afterward. If more work is needed, tap Create Estimate once it is voided to make a new one.',
             style: TextStyle(fontSize: 12, color: AppColors.neutralGrey),
           ),
           const SizedBox(height: 10),
@@ -878,19 +1082,49 @@ class _LineItemRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final quantity = item.quantity;
+    final unitPrice = item.unitPrice;
+    final hint = quantity != null && unitPrice != null && quantity > 1 ? quantityHintText(quantity, unitPrice) : null;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Expanded(
-            child: Text(item.description, style: const TextStyle(fontSize: 14, color: AppColors.textDark)),
+          Row(
+            children: [
+              Expanded(
+                child: Text(item.description, style: const TextStyle(fontSize: 14, color: AppColors.textDark)),
+              ),
+              Text(
+                '\$${item.amount.toStringAsFixed(2)}',
+                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.textDark),
+              ),
+            ],
           ),
-          Text(
-            '\$${item.amount.toStringAsFixed(2)}',
-            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.textDark),
-          ),
+          if (hint != null) Text(hint, style: const TextStyle(fontSize: 12, color: AppColors.neutralGrey)),
         ],
       ),
     );
   }
+}
+
+/// "3 × $50.00" — a line's quantity and unit price, shown read-only under
+/// lines with a quantity above 1.
+String quantityHintText(double quantity, double unitPrice) {
+  final qty = quantity == quantity.roundToDouble() ? quantity.toInt().toString() : '$quantity';
+  return '$qty × \$${unitPrice.toStringAsFixed(2)}';
+}
+
+/// The result of `_EstimateScreenState._checkDraft`: the lines to save (and
+/// the rows they came from) with their cents-rounded total, or the
+/// [problem] to show instead.
+class _DraftCheck {
+  const _DraftCheck({required this.rows, required this.items, required this.total}) : problem = null;
+
+  const _DraftCheck.problem(String this.problem) : rows = const [], items = const [], total = 0;
+
+  final List<EditableLineItem> rows;
+  final List<EstimateLineItem> items;
+  final double total;
+  final String? problem;
 }

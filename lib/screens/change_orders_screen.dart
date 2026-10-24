@@ -321,7 +321,11 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                     .where((co) => !co.isPending && !co.isApproved && !co.isDeclined)
                     .toList();
 
-                final estimateTotal = estimateAsync.valueOrNull?.totalAmount ?? 0;
+                // A voided estimate never counts either (the provider
+                // already skips voided rows; this guards the moment before
+                // its re-read lands).
+                final shownEstimate = estimateAsync.valueOrNull;
+                final estimateTotal = shownEstimate == null || shownEstimate.isVoided ? 0.0 : shownEstimate.totalAmount;
                 // A voided change order is still technically status ==
                 // 'approved' (voiding doesn't change status — see
                 // JobChangeOrdersController.voidChangeOrder), so it still

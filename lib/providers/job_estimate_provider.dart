@@ -21,6 +21,11 @@ import 'payment_lock.dart';
 /// one continuous transition — existing estimate (or none) -> parsing the
 /// new dictation -> the new estimate landing — instead of juggling two
 /// separate providers that could disagree about what's "current".
+/// True while [JobEstimateController.parseDictation] runs for the job, so
+/// the Estimate screen's loading card only says "Parsing your dictated
+/// estimate…" when a dictation is actually being parsed.
+final estimateParsingProvider = StateProvider.family<bool, String>((ref, jobId) => false);
+
 final jobEstimateProvider =
     StateNotifierProvider.family<JobEstimateController, AsyncValue<JobEstimate?>, String>(
       (ref, jobId) => JobEstimateController(ref, jobId),
@@ -103,25 +108,10 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
   }
 
   /// A job can accumulate more than one `job_estimates` row over time (e.g.
-  /// a second `prepare_estimate` dictation later in the job) — but which
-  /// one the Estimate screen shows is chosen by STATUS PROGRESS, not just
-  /// recency: a customer-facing decision (`'sent'`/`'approved'`/
-  /// `'declined'`) must never be silently superseded by a newer, unrelated
-  /// `'draft'` dictation — that would make an already-approved estimate
-  /// invisible on screen (and, worse, editable-looking again, since the
-  /// screen would think the newer draft is "the" estimate) the moment a
-  /// technician dictates a fresh one for any reason.
-  ///
-  /// Selection order:
-  ///  1. The most recent row whose status is `'sent'`, `'approved'`, or
-  ///     `'declined'` — if any exist at all, one of these always wins,
-  ///     regardless of whether a newer draft also exists.
-  ///  2. Otherwise, the most recent `'draft'` row.
-  ///
-  /// This can't be expressed as a single `order()`/`limit(1)` query (SQL
-  /// `order by` can't express "any of these statuses, ranked above
-  /// everything else, then most recent within that"), so this fetches every
-  /// `job_estimates` row for the job and selects in Dart instead.
+  /// a replacement after a void or a decline) — this fetches every row,
+  /// most recent first, and picks the one to show with
+  /// [selectDisplayedEstimate] (the rule can't be expressed as a single
+  /// `order()`/`limit(1)` query).
   Future<JobEstimate?> _fetchLatest() async {
     debugPrint('ESTIMATE: fetching all job_estimates rows for job $jobId (selecting by status priority)...');
     final rows = await Supabase.instance.client
@@ -129,43 +119,15 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
         .select()
         .eq('job_id', jobId)
         .order('created_at', ascending: false);
-    if (rows.isEmpty) {
-      debugPrint('ESTIMATE: no job_estimates rows at all for job $jobId');
-      return null;
-    }
-
-    // Already most-recent-first, per the order() above.
     final estimates = rows.map((row) => JobEstimate.fromJson(row)).toList();
-    final mostRecentOverall = estimates.first;
-
-    final decided = estimates.where((e) => _statusPriority.contains(e.status)).toList();
-    if (decided.isNotEmpty) {
-      final selected = decided.first; // most recent among sent/approved/declined
-      if (selected.id != mostRecentOverall.id) {
-        debugPrint(
-          'ESTIMATE: selected ${selected.status} row ${selected.id} (created ${selected.createdAt}) over '
-          'newer ${mostRecentOverall.status} row ${mostRecentOverall.id} (created '
-          '${mostRecentOverall.createdAt}) for job $jobId — a customer-facing decision is never '
-          'superseded by a newer draft',
-        );
-      } else {
-        debugPrint('ESTIMATE: selected ${selected.status} row ${selected.id} for job $jobId (also the most recent row)');
-      }
-      return selected;
-    }
-
+    final selected = selectDisplayedEstimate(estimates);
     debugPrint(
-      'ESTIMATE: no sent/approved/declined row exists for job $jobId — falling back to most recent row '
-      '${mostRecentOverall.id} (status=${mostRecentOverall.status})',
+      'ESTIMATE: ${estimates.length} row(s) for job $jobId '
+      '(${estimates.where((e) => e.isVoided).length} voided) — showing '
+      '${selected == null ? 'none' : '${selected.status} row ${selected.id}'}',
     );
-    return mostRecentOverall;
+    return selected;
   }
-
-  /// Statuses that represent a customer-facing decision already made on an
-  /// estimate — see [_fetchLatest]. Order within this set doesn't matter;
-  /// [_fetchLatest] ranks by `created_at` among whichever of these are
-  /// present, not by position in this set.
-  static const _statusPriority = {'sent', 'approved', 'declined'};
 
   /// Re-fetches from `job_estimates` directly — separate from
   /// [parseDictation] so the Estimate screen can offer a plain retry after a
@@ -186,10 +148,12 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
     if (!mounted) return;
     debugPrint('ESTIMATE: parseDictation starting for dictation $dictationId (job $jobId)');
     state = const AsyncLoading();
+    final parsing = ref.read(estimateParsingProvider(jobId).notifier)..state = true;
     final result = await AsyncValue.guard(() async {
       await ensureJobMoneyUnlocked(jobId);
       return _parse(dictationId);
     });
+    parsing.state = false;
     if (!mounted) return;
     if (result.hasError) {
       debugPrint('ESTIMATE ERROR (parse): ${result.error}');
@@ -398,6 +362,10 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
   /// RLS backs this up independently of `EstimateScreen` only offering Void
   /// for an approved, not-yet-voided estimate — see
   /// `supabase/migrations/20260821020000_job_estimates_voiding.sql`.
+  ///
+  /// Then re-reads the rows: a voided estimate is never the one shown (see
+  /// [selectDisplayedEstimate]), so the screen moves on to a newer estimate,
+  /// or to "No estimate yet" and its Create Estimate action.
   Future<void> voidEstimate({required String estimateId, required String reason}) async {
     await ensureJobMoneyUnlocked(jobId);
     debugPrint('ESTIMATE: voiding estimate $estimateId (job $jobId)...');
@@ -412,5 +380,33 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
     if (current != null && current.id == estimateId) {
       state = AsyncData(current.copyWith(voidedAt: voidedAt, voidReason: reason));
     }
+    await _load();
   }
 }
+
+/// Which of a job's `job_estimates` rows ([newestFirst], ordered by
+/// `created_at` descending) the app shows — and so what Job Details, the
+/// change-order running total, voice `view_estimate` and the invoice
+/// prefetch read:
+///  1. Voided rows are ignored: a closed-out estimate is history, never
+///     "the" estimate. No row left -> null ("No estimate yet").
+///  2. The most recent `'sent'`/`'approved'`/`'declined'` row wins over a
+///     newer `'draft'` — a customer-facing decision is never silently
+///     superseded by an unrelated new dictation (that would make an
+///     approved estimate invisible, and editable-looking again).
+///  3. Except a declined one: a draft created after the decline is its
+///     replacement (the "Create a new estimate" action), so that draft wins.
+///  4. Otherwise, the most recent row.
+JobEstimate? selectDisplayedEstimate(List<JobEstimate> newestFirst) {
+  final live = newestFirst.where((e) => !e.isVoided).toList();
+  if (live.isEmpty) return null;
+  final decided = live.where((e) => _decidedStatuses.contains(e.status)).toList();
+  if (decided.isEmpty) return live.first;
+  final selected = decided.first;
+  if (selected.isDeclined && live.first.id != selected.id) return live.first;
+  return selected;
+}
+
+/// Statuses that represent a customer-facing decision already made on an
+/// estimate — see [selectDisplayedEstimate].
+const _decidedStatuses = {'sent', 'approved', 'declined'};
