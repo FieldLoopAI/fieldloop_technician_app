@@ -358,7 +358,7 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                       const SizedBox(height: 20),
                       _RunningTotalCard(estimateTotal: estimateTotal, approvedTotal: approvedTotal, runningTotal: runningTotal),
                       const SizedBox(height: 24),
-                      if (changeOrders.isEmpty)
+                      if (changeOrders.isEmpty) ...[
                         _card(
                           EmptyStateActions(
                             icon: Icons.post_add_rounded,
@@ -370,8 +370,12 @@ class _ChangeOrdersScreenState extends ConsumerState<ChangeOrdersScreen>
                             actionLabel: 'Add Change Order',
                             onAction: editable && !_moneyLocked ? _addChangeOrderManually : null,
                           ),
-                        )
-                      else ...[
+                        ),
+                        if (editable && _moneyLockReason().isNotEmpty) ...[
+                          const SizedBox(height: 10),
+                          ..._moneyLockReason(),
+                        ],
+                      ] else ...[
                         if (editable) ...[
                           ..._moneyLockReason(),
                           FilledButton.icon(

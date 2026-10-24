@@ -4,6 +4,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/job_estimate.dart';
 import '../providers/job_estimate_provider.dart';
 import '../providers/jobs_provider.dart';
+import '../providers/payment_lock.dart';
+import '../services/b185_flags.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../widgets/app_components.dart';
@@ -47,6 +49,26 @@ class _ManualEstimateScreenState extends ConsumerState<ManualEstimateScreen> {
   /// Save stays disabled until every line has a description, a quantity
   /// above 0 and a valid price, and the estimate adds up to more than $0.
   bool get _valid => _lines.every((line) => line.isComplete) && _total > 0;
+
+  /// B185 money freeze — see `payment_lock.dart`. Always false with the
+  /// flag off (nothing is read then).
+  bool get _moneyLocked => watchJobMoneyLocked(ref, widget.jobId);
+
+  /// The plain reason at the top of the form while the payment is
+  /// pending/paid (or its status couldn't be read); nothing otherwise.
+  List<Widget> _moneyLockReason() {
+    if (!kStripePayments) return const [];
+    final reason = jobMoneyLockReason(ref, widget.jobId);
+    if (reason == null) return const [];
+    return [
+      Text(
+        reason,
+        textAlign: TextAlign.center,
+        style: const TextStyle(color: AppColors.neutralGrey, fontSize: 12.5, fontWeight: FontWeight.w600),
+      ),
+      const SizedBox(height: 10),
+    ];
+  }
 
   void _addLine() => setState(() => _lines.add(_LineDraft()));
 
@@ -139,7 +161,7 @@ class _ManualEstimateScreenState extends ConsumerState<ManualEstimateScreen> {
         bottomNavigationBar: StickyActionBar(
           saveLabel: 'Save Estimate',
           saving: _saving,
-          onSave: _valid ? _save : null,
+          onSave: _valid && !_moneyLocked ? _save : null,
           onCancel: _cancel,
           summary: LabelValueRow(
             label: const Text(
@@ -162,6 +184,7 @@ class _ManualEstimateScreenState extends ConsumerState<ManualEstimateScreen> {
                 child: ListView(
                   padding: EdgeInsets.fromLTRB(horizontalPadding, 16, horizontalPadding, 24),
                   children: [
+                    ..._moneyLockReason(),
                     const Text(
                       'Add each piece of work with its quantity and unit price. It saves as a draft you can '
                       'review before sending.',

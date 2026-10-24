@@ -4,6 +4,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/change_order_provider.dart';
 import '../providers/job_change_orders_provider.dart';
 import '../providers/jobs_provider.dart';
+import '../providers/payment_lock.dart';
+import '../services/b185_flags.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../widgets/app_components.dart';
@@ -60,6 +62,26 @@ class _ManualChangeOrderScreenState extends ConsumerState<ManualChangeOrderScree
 
   bool get _dirty =>
       _description.text.trim().isNotEmpty || _flatAmount.text.trim().isNotEmpty || _unitPrice.text.trim().isNotEmpty;
+
+  /// B185 money freeze — see `payment_lock.dart`. Always false with the
+  /// flag off (nothing is read then).
+  bool get _moneyLocked => watchJobMoneyLocked(ref, widget.jobId);
+
+  /// The plain reason at the top of the form while the payment is
+  /// pending/paid (or its status couldn't be read); nothing otherwise.
+  List<Widget> _moneyLockReason() {
+    if (!kStripePayments) return const [];
+    final reason = jobMoneyLockReason(ref, widget.jobId);
+    if (reason == null) return const [];
+    return [
+      Text(
+        reason,
+        textAlign: TextAlign.center,
+        style: const TextStyle(color: AppColors.neutralGrey, fontSize: 12.5, fontWeight: FontWeight.w600),
+      ),
+      const SizedBox(height: 10),
+    ];
+  }
 
   Future<void> _save() async {
     if (!(_formKey.currentState?.validate() ?? false)) return;
@@ -147,7 +169,7 @@ class _ManualChangeOrderScreenState extends ConsumerState<ManualChangeOrderScree
         bottomNavigationBar: StickyActionBar(
           saveLabel: 'Save & Request Approval',
           saving: _saving,
-          onSave: _valid ? _save : null,
+          onSave: _valid && !_moneyLocked ? _save : null,
           onCancel: _cancel,
           summary: LabelValueRow(
             label: const Text(
@@ -170,6 +192,7 @@ class _ManualChangeOrderScreenState extends ConsumerState<ManualChangeOrderScree
                 child: ListView(
                   padding: EdgeInsets.fromLTRB(horizontalPadding, 16, horizontalPadding, 24),
                   children: [
+                    ..._moneyLockReason(),
                     const Text(
                       'Describe the additional work and its price. It is saved as pending, and the customer is '
                       'texted to approve it before it counts toward the total.',

@@ -25,6 +25,7 @@ import '../providers/job_photos_provider.dart';
 import '../providers/job_runtime_provider.dart';
 import '../providers/job_voice_commands.dart';
 import '../providers/jobs_provider.dart';
+import '../providers/payment_lock.dart';
 import '../providers/permission_providers.dart';
 import '../providers/safe_ref_disposal.dart';
 import '../providers/visit_provider.dart';
@@ -1461,7 +1462,7 @@ class _TabContent extends ConsumerWidget {
             children: [
               if (estimateAsync.isLoading && estimate == null)
                 const _TabLoading()
-              else if (estimate == null)
+              else if (estimate == null) ...[
                 EmptyStateActions(
                   icon: Icons.receipt_long_rounded,
                   title: 'No estimate yet',
@@ -1469,13 +1470,14 @@ class _TabContent extends ConsumerWidget {
                       ? 'Add the line items for this job. It saves as a draft you can review before sending.'
                       : 'No estimate was created for this job.',
                   actionLabel: 'Create Estimate',
-                  onAction: voiceEligible
+                  onAction: voiceEligible && !watchJobMoneyLocked(ref, job.id)
                       ? () => Navigator.of(
                           context,
                         ).push(FadeSlidePageRoute(builder: (_) => ManualEstimateScreen(jobId: job.id)))
                       : null,
-                )
-              else ...[
+                ),
+                if (voiceEligible) ..._moneyLockReason(ref, job.id, above: false),
+              ] else ...[
                 for (final item in estimate.lineItems) _LineItemRow(description: item.description, amount: item.amount),
                 const Divider(height: 24),
                 _TotalRow(label: 'Estimate total', amount: estimate.totalAmount),
@@ -1499,6 +1501,8 @@ class _TabContent extends ConsumerWidget {
         final changeOrdersAsync = ref.watch(jobChangeOrdersProvider(job.id));
         final changeOrders = changeOrdersAsync.valueOrNull ?? const <ChangeOrder>[];
         final approvedTotal = _approvedChangeOrdersTotal(changeOrders);
+        // B185 money freeze — read only when the add actions are offered.
+        final moneyLocked = voiceEligible && watchJobMoneyLocked(ref, job.id);
         void addChangeOrder() => Navigator.of(
           context,
         ).push(FadeSlidePageRoute(builder: (_) => ManualChangeOrderScreen(jobId: job.id)));
@@ -1508,7 +1512,7 @@ class _TabContent extends ConsumerWidget {
             children: [
               if (changeOrdersAsync.isLoading && changeOrdersAsync.valueOrNull == null)
                 const _TabLoading()
-              else if (changeOrders.isEmpty)
+              else if (changeOrders.isEmpty) ...[
                 EmptyStateActions(
                   icon: Icons.post_add_rounded,
                   title: 'No change orders yet',
@@ -1517,9 +1521,10 @@ class _TabContent extends ConsumerWidget {
                             'toward the total.'
                       : 'No change orders were added to this job.',
                   actionLabel: 'Add Change Order',
-                  onAction: voiceEligible ? addChangeOrder : null,
-                )
-              else ...[
+                  onAction: voiceEligible && !moneyLocked ? addChangeOrder : null,
+                ),
+                if (voiceEligible) ..._moneyLockReason(ref, job.id, above: false),
+              ] else ...[
                 for (var i = 0; i < changeOrders.length; i++) ...[
                   if (i > 0) const SizedBox(height: AppSpacing.xs),
                   _ChangeOrderRow(changeOrder: changeOrders[i]),
@@ -1528,8 +1533,9 @@ class _TabContent extends ConsumerWidget {
                 _TotalRow(label: 'Approved additional work', amount: approvedTotal),
                 const SizedBox(height: 14),
                 if (voiceEligible) ...[
+                  ..._moneyLockReason(ref, job.id),
                   FilledButton.icon(
-                    onPressed: addChangeOrder,
+                    onPressed: moneyLocked ? null : addChangeOrder,
                     icon: const Icon(Icons.add_rounded, size: 20),
                     label: const Text('Add Change Order'),
                     style: primaryActionButtonStyle,
@@ -1663,6 +1669,33 @@ class _TabContent extends ConsumerWidget {
     }
   }
 }
+
+/// B185 money freeze — see `payment_lock.dart`. The same plain reason line
+/// EstimateScreen/ChangeOrdersScreen show with their disabled money actions
+/// ([above] the button, or under an empty state's own button); nothing while
+/// the status is loading or the job is unlocked.
+List<Widget> _moneyLockReason(WidgetRef ref, String jobId, {bool above = true}) {
+  if (!kStripePayments) return const [];
+  final reason = jobMoneyLockReason(ref, jobId);
+  if (reason == null) return const [];
+  final text = Text(
+    reason,
+    textAlign: TextAlign.center,
+    style: const TextStyle(color: AppColors.neutralGrey, fontSize: 12.5, fontWeight: FontWeight.w600),
+  );
+  return above ? [text, const SizedBox(height: 10)] : [const SizedBox(height: 10), text];
+}
+
+/// The Estimate or Change Orders tab body on its own, for widget tests.
+@visibleForTesting
+Widget jobDetailMoneyTabForTesting({required MockJob job, required bool changeOrders, required bool voiceEligible}) =>
+    _TabContent(
+      tab: changeOrders ? _DetailTab.changeOrders : _DetailTab.estimate,
+      job: job,
+      estimateStatus: EstimateStatus.draft,
+      invoiceStatus: InvoiceStatus.notYetInvoiced,
+      voiceEligible: voiceEligible,
+    );
 
 class _SectionCard extends StatelessWidget {
   const _SectionCard({required this.child});
