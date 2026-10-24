@@ -8,7 +8,7 @@ const s3 = new S3Client({});
 
 exports.handler = async (event) => {
   try {
-    await requireTechnician(event);
+    const technician = await requireTechnician(event);
     const { estimateId } = JSON.parse(event.body);
     const supabase = await getSupabaseClient();
 
@@ -17,6 +17,18 @@ exports.handler = async (event) => {
       .select('*, jobs(*, customers(*), contractors(*, contractor_compliance(*)))')
       .eq('id', estimateId).single();
     if (error) throw error;
+
+    // Same ownership rule as parse-estimate-dictation's manual path.
+    if (!estimate.jobs || estimate.jobs.lead_technician_id !== technician.id) {
+      return {
+        statusCode: 403,
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({
+          error: 'This technician is not assigned to this job',
+          message: 'You can only create estimates for jobs assigned to you.',
+        }),
+      };
+    }
 
     const contractor = estimate.jobs.contractors;
     const customer = estimate.jobs.customers;
