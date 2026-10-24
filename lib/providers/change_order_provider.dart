@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/env.dart';
+import '../services/server_error_message.dart';
 import 'payment_lock.dart';
 
 /// Saves a change order via the `/change-orders/create` Lambda: the Lambda
@@ -38,7 +39,8 @@ Future<bool> createChangeOrder({required String jobId, required String descripti
     body: jsonEncode({'jobId': jobId, 'description': description, 'amount': ?amount}),
   );
   if (response.statusCode != 200) {
-    throw StateError('Saving the change order failed (${response.statusCode}): ${response.body}');
+    debugPrint('CHANGE ORDER ERROR (create): ${response.statusCode} ${response.body}');
+    throw StateError(friendlyServerError(response.body));
   }
 
   final decoded = jsonDecode(response.body) as Map<String, dynamic>;

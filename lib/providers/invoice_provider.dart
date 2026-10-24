@@ -9,6 +9,7 @@ import '../config/env.dart';
 import '../models/invoice_adjustment.dart';
 import '../models/invoice_payment.dart';
 import '../models/invoice_preview.dart';
+import '../services/server_error_message.dart';
 
 /// Fetches a read-only preview of what a job's invoice would look like via
 /// the `/invoices/preview` Lambda — the estimate, every change order (split
@@ -107,7 +108,7 @@ Future<void> sendInvoiceSms({required String invoiceId, required String pdfUrl})
   );
   if (response.statusCode != 200) {
     debugPrint('INVOICE ERROR (send-sms): ${response.statusCode} ${response.body}');
-    throw StateError('Sending the invoice failed (${response.statusCode}): ${response.body}');
+    throw StateError(friendlyServerError(response.body, sms: true));
   }
   debugPrint('INVOICE: SMS send succeeded for invoice $invoiceId');
 }

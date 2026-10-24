@@ -18,6 +18,7 @@ import '../providers/safe_ref_disposal.dart';
 import '../providers/voice_command_registry_provider.dart';
 import '../routing/fade_slide_page_route.dart';
 import '../services/b185_flags.dart';
+import '../services/server_error_message.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../theme/design_tokens.dart';
@@ -308,7 +309,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
       setState(() {
         _sending = false;
         _sendingStatus = null;
-        _sendError = e is StateError ? e.message : e.toString();
+        _sendError = friendlyErrorText(e);
       });
     }
   }
@@ -576,7 +577,7 @@ class _EstimateScreenState extends ConsumerState<EstimateScreen>
       if (!mounted) return;
       setState(() {
         _savingDraft = false;
-        _sendError = e is StateError ? e.message : e.toString();
+        _sendError = friendlyErrorText(e);
       });
     }
   }

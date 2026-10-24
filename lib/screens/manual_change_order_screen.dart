@@ -6,6 +6,7 @@ import '../providers/job_change_orders_provider.dart';
 import '../providers/jobs_provider.dart';
 import '../providers/payment_lock.dart';
 import '../services/b185_flags.dart';
+import '../services/server_error_message.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../widgets/app_components.dart';
@@ -119,7 +120,7 @@ class _ManualChangeOrderScreenState extends ConsumerState<ManualChangeOrderScree
       if (!mounted) return;
       setState(() {
         _saving = false;
-        _error = e is StateError ? e.message : e.toString();
+        _error = friendlyErrorText(e);
       });
     }
   }

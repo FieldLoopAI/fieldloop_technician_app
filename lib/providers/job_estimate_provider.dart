@@ -7,6 +7,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/env.dart';
 import '../models/job_estimate.dart';
+import '../services/server_error_message.dart';
 import 'job_status_notifications_provider.dart';
 import 'payment_lock.dart';
 
@@ -311,7 +312,7 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
     );
     if (pdfResponse.statusCode != 200) {
       debugPrint('ESTIMATE ERROR (generate-pdf): ${pdfResponse.statusCode} ${pdfResponse.body}');
-      throw StateError('Generating the estimate PDF failed (${pdfResponse.statusCode}): ${pdfResponse.body}');
+      throw StateError(friendlyServerError(pdfResponse.body));
     }
     final pdfDecoded = jsonDecode(pdfResponse.body) as Map<String, dynamic>;
     final pdfUrl = pdfDecoded['pdfUrl'] as String?;
@@ -336,7 +337,7 @@ class JobEstimateController extends StateNotifier<AsyncValue<JobEstimate?>> {
     );
     if (response.statusCode != 200) {
       debugPrint('ESTIMATE ERROR (send): ${response.statusCode} ${response.body}');
-      throw StateError('Sending the estimate failed (${response.statusCode}): ${response.body}');
+      throw StateError(friendlyServerError(response.body, sms: true));
     }
     debugPrint('ESTIMATE: SMS send succeeded for estimate $estimateId');
 
