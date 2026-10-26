@@ -33,8 +33,8 @@ begin;
 -- ============================ FILL IN ============================
 create temp table _t_params on commit drop as
 select
-  '00000000-0000-0000-0000-000000000000'::uuid as auth_user_id, -- <<< FILL IN technicians.auth_user_id
-  '00000000-0000-0000-0000-000000000000'::uuid as job_id;       -- <<< FILL IN a job led by that technician, payment_locked = false
+  '98195467-e35a-4a48-a9eb-3d172a775b12'::uuid as auth_user_id, -- <<< FILL IN technicians.auth_user_id
+  '312cebd6-f18d-4f77-9507-d80f24649b9d'::uuid as job_id;       -- <<< FILL IN a job led by that technician, payment_locked = false
 -- =================================================================
 
 create temp table _t_results (at timestamptz default clock_timestamp(), test text, result text, detail text)
